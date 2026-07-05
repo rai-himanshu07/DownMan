@@ -1,4 +1,6 @@
-# DownMan
+<p align="center">
+  <img src="branding/logo.png" alt="DownMan" width="200">
+</p>
 
 A modern, low‑footprint **download manager for Linux**, built on the
 [aria2](https://aria2.github.io/) engine — a fast, click‑to‑grab download experience with a custom UI,
