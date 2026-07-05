@@ -7,6 +7,8 @@ A modern, low‑footprint **download manager for Linux**, built on the
 torrent/magnet support, smart media capture, and companion browser extensions.
 
 > Personal project. Target platform: Ubuntu 26.04 / GNOME 50 (x86_64).
+>
+> **Note:** Much of this codebase was generated with a mix of AI coding agents, under human direction and review.
 
 ---
 
