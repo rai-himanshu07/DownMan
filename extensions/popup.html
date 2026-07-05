@@ -1,0 +1,42 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body { width: 280px; margin: 0; font: 13px Inter, system-ui; background: #0b0d17; color: #e2e8f0; }
+      header { padding: 12px 14px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid rgba(255,255,255,.06); }
+      .dot { width: 8px; height: 8px; border-radius: 50%; background: #6ee63a; }
+      .body { padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
+      button { background: #0a74f0; color: #fff; border: 0; border-radius: 8px; padding: 8px; cursor: pointer; font-weight: 600; }
+      ul { margin: 0; padding: 0; list-style: none; max-height: 160px; overflow: auto; }
+      li { padding: 6px 8px; border-radius: 6px; cursor: pointer; font-size: 12px; word-break: break-all; }
+      li:hover { background: rgba(255,255,255,.06); }
+      .row { display: flex; gap: 6px; }
+      .q { flex: 1; background: rgba(255,255,255,.06); }
+      .q:hover { background: rgba(255,255,255,.12); }
+      .label { font-size: 11px; color: #64748b; margin: 4px 0 2px; }
+    </style>
+  </head>
+  <body>
+    <header><span class="dot" id="dot"></span><b>DownMan</b><span id="st" style="margin-left:auto;color:#64748b">…</span></header>
+    <div class="body">
+      <div class="label">Capture video from this page</div>
+      <div class="row">
+        <button class="q" data-f="best">Best</button>
+        <button class="q" data-f="1080">1080p</button>
+        <button class="q" data-f="720">720p</button>
+        <button class="q" data-f="audio">Audio</button>
+      </div>
+      <button id="choose" style="background:linear-gradient(135deg,#1f93ff,#f04ec0)">Choose exact quality…</button>
+      <button id="grabsite" style="background:rgba(255,255,255,.08)">Grab files from this page…</button>
+      <label class="label" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:2px"><input type="checkbox" id="intercept" /> Auto-capture downloads from browser</label>
+      <div class="label" id="flabel" style="display:none">Available qualities</div>
+      <ul id="formats"></ul>
+      <div class="label" id="dlabel" style="display:none">Downloads</div>
+      <ul id="downloads"></ul>
+      <div class="label" id="mlabel" style="display:none">Detected streams</div>
+      <ul id="media"></ul>
+    </div>
+    <script src="popup.js"></script>
+  </body>
+</html>

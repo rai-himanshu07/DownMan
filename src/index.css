@@ -1,0 +1,231 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --dm-radius: 14px;
+  color-scheme: dark;
+  --ink-900: 11 13 23;
+  --ink-850: 14 17 32;
+  --ink-800: 17 20 33;
+  --ink-700: 22 26 44;
+  --ink-600: 30 35 56;
+  --ink-500: 42 48 80;
+  --slate-100: 241 245 249;
+  --slate-200: 226 232 240;
+  --slate-300: 203 213 225;
+  --slate-400: 148 163 184;
+  --slate-500: 100 116 139;
+  --slate-600: 71 85 105;
+  --slate-700: 51 65 85;
+  --dm-bg-image: radial-gradient(
+      1200px 600px at 10% -10%,
+      rgba(31, 147, 255, 0.18),
+      transparent 60%
+    ),
+    radial-gradient(900px 500px at 90% 0%, rgba(240, 78, 192, 0.12), transparent 55%);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  @apply bg-ink-900 text-slate-200 font-sans antialiased;
+  background-image: var(--dm-bg-image);
+  overflow: hidden;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  @apply bg-ink-500 rounded-full;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+select option {
+  background: #0b0d17;
+  color: #e2e8f0;
+}
+
+@layer components {
+  .glass {
+    @apply bg-ink-800/60 backdrop-blur-xl border border-white/5;
+  }
+  .card {
+    @apply glass rounded-xl2 shadow-card;
+  }
+  .btn {
+    @apply inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-sm font-medium
+      transition-all duration-150 select-none;
+  }
+  .btn-primary {
+    @apply btn text-white shadow-glow;
+    background: var(--dm-accent, #0a74f0);
+  }
+  .btn-primary:hover {
+    filter: brightness(1.1);
+  }
+  .btn-ghost {
+    @apply btn bg-white/5 hover:bg-white/10 text-slate-200;
+  }
+  .btn-danger {
+    @apply btn bg-rose-600/80 hover:bg-rose-500 text-white;
+  }
+  .chip {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium
+      bg-white/5 border border-white/10;
+  }
+  .nav-item {
+    @apply flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-slate-400
+      hover:text-white hover:bg-white/5 transition-colors cursor-pointer;
+  }
+  .nav-item.active {
+    @apply text-white;
+    background: color-mix(in srgb, var(--dm-accent, #0a74f0) 16%, transparent);
+    border: 1px solid color-mix(in srgb, var(--dm-accent, #0a74f0) 30%, transparent);
+    box-shadow: 0 0 16px -4px color-mix(in srgb, var(--dm-accent, #0a74f0) 45%, transparent);
+  }
+  .dm-compact .nav-item {
+    @apply py-1.5;
+  }
+  .dm-compact .card {
+    padding: 0.85rem;
+  }
+}
+
+.progress-shimmer::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.18),
+    transparent
+  );
+  transform: translateX(-100%);
+  animation: shimmer 1.6s infinite;
+}
+
+/* --- ReactBits-inspired flourishes (pure CSS, no GPU) --- */
+@keyframes dm-shine {
+  0% { background-position: 200% center; }
+  100% { background-position: -200% center; }
+}
+.shiny-text {
+  background: linear-gradient(110deg, #cbd5e1 35%, #ffffff 50%, #cbd5e1 65%);
+  background-size: 200% auto;
+  background-clip: text;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  animation: dm-shine 5s linear infinite;
+}
+.dm-glow {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--dm-accent, #0a74f0) 35%, transparent),
+    0 0 20px -6px color-mix(in srgb, var(--dm-accent, #0a74f0) 55%, transparent);
+  border-color: color-mix(in srgb, var(--dm-accent, #0a74f0) 30%, transparent) !important;
+}
+@keyframes dm-stagger-in {
+  from { opacity: 0; transform: translateY(7px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.dm-stagger > * { animation: dm-stagger-in 0.34s ease-out both; }
+.dm-stagger > *:nth-child(1) { animation-delay: 0ms; }
+.dm-stagger > *:nth-child(2) { animation-delay: 30ms; }
+.dm-stagger > *:nth-child(3) { animation-delay: 60ms; }
+.dm-stagger > *:nth-child(4) { animation-delay: 90ms; }
+.dm-stagger > *:nth-child(5) { animation-delay: 120ms; }
+.dm-stagger > *:nth-child(6) { animation-delay: 150ms; }
+.dm-stagger > *:nth-child(7) { animation-delay: 180ms; }
+.dm-stagger > *:nth-child(8) { animation-delay: 210ms; }
+
+/* --- Opt-in animated aurora background (CSS compositing, sits behind content) --- */
+.dm-aurora { background: #05060d; }
+.dm-aurora-blob {
+  position: absolute;
+  width: 65vw;
+  height: 65vw;
+  border-radius: 50%;
+  filter: blur(90px);
+  opacity: 0.55;
+  will-change: transform;
+}
+.dm-aurora-1 {
+  top: -20%;
+  left: -12%;
+  background: radial-gradient(circle at center, var(--dm-accent, #0a74f0), transparent 62%);
+  animation: dm-float1 20s ease-in-out infinite;
+}
+.dm-aurora-2 {
+  top: -15%;
+  right: -12%;
+  background: radial-gradient(circle at center, #cf2ea0, transparent 62%);
+  animation: dm-float2 26s ease-in-out infinite;
+}
+.dm-aurora-3 {
+  bottom: -25%;
+  left: 25%;
+  background: radial-gradient(circle at center, var(--dm-accent, #0a74f0), transparent 62%);
+  animation: dm-float3 32s ease-in-out infinite;
+}
+@keyframes dm-float1 { 0%, 100% { transform: translate(0, 0) scale(1); } 50% { transform: translate(12vw, 10vh) scale(1.15); } }
+@keyframes dm-float2 { 0%, 100% { transform: translate(0, 0) scale(1); } 50% { transform: translate(-10vw, 12vh) scale(1.1); } }
+@keyframes dm-float3 { 0%, 100% { transform: translate(0, 0) scale(1); } 50% { transform: translate(8vw, -10vh) scale(1.2); } }
+
+/* --- Light mode: flip the ink (surfaces) + slate (text) scales and dark overlays --- */
+.dm-light {
+  color-scheme: light;
+  --dm-bg-image: radial-gradient(1200px 600px at 10% -10%, rgba(31, 147, 255, 0.10), transparent 60%), radial-gradient(900px 500px at 90% 0%, rgba(240, 78, 192, 0.08), transparent 55%);
+  --ink-900: 244 246 250;
+  --ink-850: 240 242 247;
+  --ink-800: 255 255 255;
+  --ink-700: 237 240 245;
+  --ink-600: 224 228 236;
+  --ink-500: 200 206 217;
+  --slate-100: 15 23 42;
+  --slate-200: 30 41 59;
+  --slate-300: 51 65 85;
+  --slate-400: 71 85 105;
+  --slate-500: 100 116 139;
+  --slate-600: 148 163 184;
+  --slate-700: 71 85 105;
+}
+.dm-light .text-white { color: #1e293b; }
+.dm-light .border-white\/5 { border-color: rgba(15, 23, 42, 0.09); }
+.dm-light .border-white\/10 { border-color: rgba(15, 23, 42, 0.13); }
+.dm-light .border-white\/40 { border-color: rgba(15, 23, 42, 0.28); }
+.dm-light .bg-white\/5 { background-color: rgba(15, 23, 42, 0.045); }
+.dm-light .bg-white\/10 { background-color: rgba(15, 23, 42, 0.07); }
+.dm-light .bg-white\/\[0\.03\] { background-color: rgba(15, 23, 42, 0.035); }
+.dm-light .hover\:bg-white\/5:hover { background-color: rgba(15, 23, 42, 0.05); }
+.dm-light .hover\:bg-white\/10:hover { background-color: rgba(15, 23, 42, 0.08); }
+.dm-light .hover\:border-white\/10:hover { border-color: rgba(15, 23, 42, 0.13); }
+.dm-light .divide-white\/5 > :not([hidden]) ~ :not([hidden]) { border-color: rgba(15, 23, 42, 0.07); }
+.dm-light .glass { border-color: rgba(15, 23, 42, 0.09); }
+.dm-light .card { box-shadow: 0 10px 30px -14px rgba(15, 23, 42, 0.18); }
+.dm-light .chip { background-color: rgba(15, 23, 42, 0.05); border-color: rgba(15, 23, 42, 0.1); }
+.dm-light .btn-ghost { background-color: rgba(15, 23, 42, 0.05); }
+.dm-light .btn-ghost:hover { background-color: rgba(15, 23, 42, 0.09); }
+.dm-light .dm-aurora { background: #eef1f6; }
+.dm-light select option { background: #ffffff; color: #1e293b; }
+/* Accent-tint text tuned for dark bg washes out on white — deepen it */
+.dm-light .shiny-text { background-image: linear-gradient(110deg, #475569 35%, #0f172a 50%, #475569 65%); }
+.dm-light .text-aurora-300 { color: #0b5cd0; }
+.dm-light .text-magenta-400 { color: #cf2ea0; }
+/* Solid accent buttons must keep white text (the global text-white flip darkened them) */
+.dm-light .btn-primary, .dm-light .btn-danger { color: #ffffff; }

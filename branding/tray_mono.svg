@@ -1,0 +1,9 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- hollow D (outline ring) -->
+  <path fill-rule="evenodd" clip-rule="evenodd" fill="#ffffff"
+    d="M28 26 H116 C190 26 236 74 236 128 C236 182 190 230 116 230 H28 Z
+       M58 60 H116 C164 60 204 90 204 128 C204 166 164 196 116 196 H58 Z"/>
+  <!-- down arrow inside the counter -->
+  <path fill="#ffffff"
+    d="M108 82 H142 V132 H168 L125 180 L82 132 H108 Z"/>
+</svg>

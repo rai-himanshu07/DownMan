@@ -1,0 +1,51 @@
+{
+  "name": "downman",
+  "private": true,
+  "version": "0.1.2",
+  "type": "module",
+  "description": "DownMan — a modern aria2-powered download manager for Linux",
+  "license": "SEE LICENSE IN LICENSE",
+  "author": "Himanshu Rai (https://github.com/rai-himanshu07)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rai-himanshu07/DownMan.git"
+  },
+  "homepage": "https://github.com/rai-himanshu07/DownMan#readme",
+  "bugs": {
+    "url": "https://github.com/rai-himanshu07/DownMan/issues"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "app": "tauri dev",
+    "app:build": "bash scripts/build_extension.sh && tauri build",
+    "checksums": "bash scripts/checksums.sh",
+    "build:ext": "bash scripts/build_extension.sh",
+    "sign:ext": "bash scripts/sign_extension.sh",
+    "release": "bash scripts/build_extension.sh && tauri build && bash scripts/checksums.sh"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.1.1",
+    "@tauri-apps/plugin-dialog": "^2.0.1",
+    "@tauri-apps/plugin-notification": "^2.0.1",
+    "@tauri-apps/plugin-opener": "^2.2.5",
+    "clsx": "^2.1.1",
+    "framer-motion": "^11.11.17",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "zustand": "^5.0.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.1.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.15",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11"
+  }
+}
