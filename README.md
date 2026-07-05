@@ -56,7 +56,7 @@ That's it! The installer automatically pulls in the two helper tools DownMan nee
 ## Highlights
 
 - **aria2 engine** — HTTP/FTP, **torrent**, **magnet**, multi‑connection (16 splits/server).
-- **Custom UI** — Tauri 2 + React; dark/light "aurora" design system, ~80–150 MB RAM (system WebView, no Chromium bundle).
+- **Custom UI** — Tauri 2 + React; dark/light "aurora" design system, ~200–250 MB RAM (system WebView, no Chromium bundle).
 - **Smart media capture** — extension sniffs streams in the background and surfaces a single
   on‑demand pill (no per‑thumbnail clutter). HLS/DASH are merged to `.mp4` via ffmpeg.
 - **Site video capture** — page URLs from 1800+ sites are resolved by **yt‑dlp**
