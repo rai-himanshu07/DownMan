@@ -8,7 +8,7 @@ torrent/magnet support, smart media capture, and companion browser extensions.
 
 > Personal project. Target platform: Ubuntu 26.04 / GNOME 50 (x86_64).
 >
-> **Note:** Much of this codebase was generated with a mix of AI coding agents, under human direction and review.
+> **Note:** Built with heavy use of AI coding agents — architecture, feature decisions, testing, and review are human (mine).
 
 ---
 
