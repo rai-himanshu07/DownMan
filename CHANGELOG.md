@@ -30,7 +30,7 @@ extension share one version line; the extension's 0.1.0–0.1.1 builds were pre�
 - **Organization** — automatic sorting into Video / Audio / Images / Documents / Archives,
   editable categories, duplicate detection, per‑download on‑complete actions, archive
   auto‑extract, and optional ClamAV scanning.
-- **Linux‑native niceties** — a system tray with live speed/count and a speed‑limit toggle,
+- **Linux desktop integration** — a system tray with live speed/count and a speed‑limit toggle,
   dock/launcher progress (Unity LauncherEntry), a sleep inhibitor while downloading, a
   clipboard link watcher, and metered‑connection auto‑pause.
 - **Interface** — Tauri 2 + React “aurora” UI, light/dark themes, drag‑and‑drop, keyboard
