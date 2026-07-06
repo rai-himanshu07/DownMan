@@ -59,7 +59,7 @@ export default function AboutView() {
     setCopying(true);
     const text = [
       `DownMan v0.1.2`,
-      `License: PolyForm Noncommercial 1.0.0 (see LICENSE)`,
+      `License: MIT (see LICENSE)`,
       `Engine: aria2`,
       `Download folder: ${diag.dir}`,
       `Bridge: ${diag.bridgeRunning ? "running" : "offline"} at ${diag.bridgeUrl}`,
@@ -99,7 +99,7 @@ export default function AboutView() {
         {diag ? (
           <div className="space-y-1.5 text-sm text-slate-400 font-mono text-xs">
             <DiagRow label="Version" value="0.1.2 · Linux" />
-            <DiagRow label="License" value="PolyForm Noncommercial 1.0.0" />
+            <DiagRow label="License" value="MIT" />
             <DiagRow label="Download folder" value={diag.dir} />
             <DiagRow label="Bridge" value={`${diag.bridgeRunning ? "running" : "offline"} — ${diag.bridgeUrl}`} />
             <DiagRow label="Bridge last seen"
@@ -152,9 +152,9 @@ export default function AboutView() {
       <div className="card p-5 space-y-2">
         <h3 className="font-semibold">License</h3>
         <p className="text-sm text-slate-400">
-          DownMan is released under the <b className="text-slate-300">PolyForm Noncommercial License 1.0.0</b> —
-          free for any noncommercial use (personal, education, nonprofits, research), provided
-          <span className="text-slate-300"> “as is”</span> with no warranty. Commercial use isn’t permitted.
+          DownMan is released under the <b className="text-slate-300">MIT License</b> —
+          free to use, modify, and distribute, including commercially, provided
+          <span className="text-slate-300"> “as is”</span> with no warranty.
           You alone remain responsible for the terms of service of the sites you access and the copyright
           of any content you download.
         </p>

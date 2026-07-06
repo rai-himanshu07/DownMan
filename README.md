@@ -143,10 +143,9 @@ DownMan/
 
 ## License
 
-DownMan is released under the **[PolyForm Noncommercial License 1.0.0](LICENSE)** — **free for any
-noncommercial use** (personal, education, nonprofits, research, government), provided *as is* with no
-warranty. **Commercial use — including selling it or using it in a commercial product or service — is
-not permitted**; contact the author for commercial licensing.
+DownMan is released under the **[MIT License](LICENSE)** — free to use, modify, and distribute,
+including in commercial products, provided *as is* with no warranty. Just keep the copyright and
+license notice.
 
 You remain solely responsible for how you use it — including compliance with the terms of service of any
 site you access, the copyright and licensing of any content you download, and the laws of your

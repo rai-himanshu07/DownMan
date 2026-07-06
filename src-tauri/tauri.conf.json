@@ -31,7 +31,7 @@
     "active": true,
     "publisher": "Himanshu Rai",
     "homepage": "https://github.com/rai-himanshu07/DownMan",
-    "license": "PolyForm-Noncommercial-1.0.0",
+    "license": "MIT",
     "copyright": "Copyright © 2026 Himanshu Rai",
     "category": "Utility",
     "targets": ["appimage", "deb"],

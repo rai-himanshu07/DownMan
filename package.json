@@ -4,7 +4,7 @@
   "version": "0.1.2",
   "type": "module",
   "description": "DownMan — a modern aria2-powered download manager for Linux",
-  "license": "SEE LICENSE IN LICENSE",
+  "license": "MIT",
   "author": "Himanshu Rai (https://github.com/rai-himanshu07)",
   "repository": {
     "type": "git",

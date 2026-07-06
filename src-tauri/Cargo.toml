@@ -3,7 +3,7 @@ name = "downman"
 version = "0.1.2"
 description = "DownMan — a modern aria2-powered download manager"
 authors = ["Himanshu Rai"]
-license-file = "../LICENSE"
+license = "MIT"
 repository = "https://github.com/rai-himanshu07/DownMan"
 edition = "2021"
 
