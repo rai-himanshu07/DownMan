@@ -7,30 +7,25 @@ import { useStore } from "../store";
 import { I } from "./icons";
 import clsx from "clsx";
 import ImportModal from "./ImportModal";
+import { PAPER_BG, SIGNAL_ACCENT, SIGNAL_BG } from "../lib/theme";
 
 type CatRow = { name: string; extsText: string; folder: string };
 type QRow = { id: string; name: string; maxActive: string; speed: string; start: string; stop: string; onDone: string; running: boolean };
 
 const ACCENTS = [
-  { name: "Aurora", v: "#0a74f0" },
-  { name: "Violet", v: "#7c5cff" },
-  { name: "Grape", v: "#a855f7" },
-  { name: "Magenta", v: "#cf2ea0" },
-  { name: "Rose", v: "#f43f5e" },
-  { name: "Amber", v: "#f59e0b" },
-  { name: "Emerald", v: "#10b981" },
-  { name: "Cyan", v: "#06b6d4" },
-  { name: "Lime", v: "#6ee63a" },
+  { name: "Signal", v: SIGNAL_ACCENT },
+  { name: "Telemetry", v: "#62ded5" },
+  { name: "Copper", v: "#ef9f52" },
+  { name: "Coral", v: "#f27367" },
+  { name: "Mint", v: "#78dba4" },
+  { name: "Ice", v: "#8dcbd6" },
 ];
 
-const AURORA_BG =
-  "radial-gradient(1200px 600px at 10% -10%, rgba(31,147,255,0.18), transparent 60%), radial-gradient(900px 500px at 90% 0%, rgba(240,78,192,0.12), transparent 55%)";
 const THEMES = [
-  { name: "Aurora", accent: "#0a74f0", bg: AURORA_BG },
-  { name: "Midnight", accent: "#6366f1", bg: "radial-gradient(1200px 600px at 10% -10%, rgba(99,102,241,0.20), transparent 60%), radial-gradient(900px 500px at 90% 0%, rgba(56,189,248,0.10), transparent 55%)" },
-  { name: "Sunset", accent: "#f97316", bg: "radial-gradient(1200px 600px at 10% -10%, rgba(249,115,22,0.18), transparent 60%), radial-gradient(900px 500px at 90% 0%, rgba(244,63,94,0.12), transparent 55%)" },
-  { name: "Forest", accent: "#10b981", bg: "radial-gradient(1200px 600px at 10% -10%, rgba(16,185,129,0.18), transparent 60%), radial-gradient(900px 500px at 90% 0%, rgba(34,197,94,0.10), transparent 55%)" },
-  { name: "Grape", accent: "#a855f7", bg: "radial-gradient(1200px 600px at 10% -10%, rgba(168,85,247,0.20), transparent 60%), radial-gradient(900px 500px at 90% 0%, rgba(236,72,153,0.12), transparent 55%)" },
+  { name: "Signal", accent: SIGNAL_ACCENT, bg: SIGNAL_BG },
+  { name: "Telemetry", accent: "#62ded5", bg: "linear-gradient(rgba(98,222,213,0.026) 1px, transparent 1px), linear-gradient(90deg, rgba(98,222,213,0.026) 1px, transparent 1px), linear-gradient(180deg, #0b0d0d 0%, #0d1616 100%)" },
+  { name: "Foundry", accent: "#ef9f52", bg: "repeating-linear-gradient(135deg, rgba(239,159,82,0.022) 0 1px, transparent 1px 14px), linear-gradient(180deg, #100e0c 0%, #17120e 100%)" },
+  { name: "Relay", accent: "#8dcbd6", bg: "repeating-linear-gradient(90deg, rgba(141,203,214,0.024) 0 1px, transparent 1px 32px), linear-gradient(180deg, #0b0e0f 0%, #101719 100%)" },
 ];
 
 const TABS: [string, string][] = [
@@ -50,7 +45,7 @@ export default function SettingsView() {
   const [maxDl, setMaxDl] = useState("5");
   const [speed, setSpeed] = useState(localStorage.getItem("dm-speed") || "0");
   const [accent, setAccent] = useState(localStorage.getItem("dm-accent") || ACCENTS[0].v);
-  const [theme, setTheme] = useState(localStorage.getItem("dm-theme") || "Aurora");
+  const [theme, setTheme] = useState(localStorage.getItem("dm-theme") || "Signal");
   const [light, setLight] = useState(localStorage.getItem("dm-light") === "on");
   const [organize, setOrganize] = useState(localStorage.getItem("dm-organize") !== "off");
   const [tab, setTab] = useState("general");
@@ -160,14 +155,19 @@ export default function SettingsView() {
     setAccent(t.accent);
     localStorage.setItem("dm-theme", t.name);
     localStorage.setItem("dm-accent", t.accent);
-    localStorage.setItem("dm-bg", t.bg);
+    const bg = light ? PAPER_BG : t.bg;
+    localStorage.setItem("dm-bg", bg);
     document.documentElement.style.setProperty("--dm-accent", t.accent);
-    document.documentElement.style.setProperty("--dm-bg-image", t.bg);
+    document.documentElement.style.setProperty("--dm-bg-image", bg);
   }
   function applyLight(on: boolean) {
     setLight(on);
     localStorage.setItem("dm-light", on ? "on" : "off");
     document.documentElement.classList.toggle("dm-light", on);
+    const selected = THEMES.find((t) => t.name === theme) || THEMES[0];
+    const bg = on ? PAPER_BG : selected.bg;
+    localStorage.setItem("dm-bg", bg);
+    document.documentElement.style.setProperty("--dm-bg-image", bg);
   }
   function applyDensity(d: string) {
     setDensity(d);
@@ -298,11 +298,11 @@ export default function SettingsView() {
   }
 
   return (
-    <div className="max-w-2xl">
-      <div className="flex flex-wrap gap-1 mb-4 border-b border-white/5">
+    <div className="settings-console max-w-3xl">
+      <div className="flex flex-wrap gap-1 mb-4 border-b border-white/10">
         {TABS.map(([id, label]) => (
           <button key={id} onClick={() => setTab(id)}
-            className={clsx("px-3 py-2 text-sm whitespace-nowrap border-b-2 -mb-px", tab === id ? "border-aurora-400 text-white" : "border-transparent text-slate-500 hover:text-slate-300")}>
+            className={clsx("px-3 py-2 text-[11px] font-mono uppercase whitespace-nowrap border-b-2 -mb-px", tab === id ? "border-aurora-400 text-white" : "border-transparent text-slate-500 hover:text-slate-300")}>
             {label}
           </button>
         ))}
@@ -317,7 +317,7 @@ export default function SettingsView() {
           <div className="flex flex-wrap gap-2 mt-1.5">
             {THEMES.map((t) => (
               <button key={t.name} onClick={() => applyTheme(t)}
-                className={`px-3 py-1.5 rounded-lg text-sm border transition-colors ${theme === t.name ? "border-white/40 text-white" : "border-white/5 text-slate-400 hover:text-slate-200"}`}
+                className={`px-3 py-1.5 rounded-sm text-xs font-mono uppercase border transition-colors ${theme === t.name ? "border-white/40 text-white" : "border-white/10 text-slate-400 hover:text-slate-200"}`}
                 style={{ background: `${t.accent}22` }}>
                 {t.name}
               </button>
@@ -329,7 +329,7 @@ export default function SettingsView() {
           <div className="flex gap-3 mt-1.5">
             {ACCENTS.map((a) => (
               <button key={a.v} title={a.name} onClick={() => applyAccent(a.v)}
-                className={`w-9 h-9 rounded-full border-2 ${accent === a.v ? "border-white" : "border-transparent"}`} style={{ background: a.v }} />
+                className={`w-8 h-8 rounded-sm border-2 ${accent === a.v ? "border-white" : "border-transparent"}`} style={{ background: a.v }} />
             ))}
           </div>
         </div>
@@ -345,7 +345,7 @@ export default function SettingsView() {
         </label>
         <label className="flex items-center gap-2 text-sm text-slate-400">
           <input type="checkbox" checked={liveBg} onChange={(e) => { if (e.target.checked) setConfirmBg(true); else setLiveBg(false); }} />
-          Animated background <span className="text-[11px] text-amber-400/80">· uses GPU</span>
+          Live scan field <span className="text-[11px] text-amber-400/80">· subtle motion</span>
         </label>      </div>
 
       <div className="card p-5">
@@ -669,21 +669,26 @@ export default function SettingsView() {
                   </button>
                   <p className="text-[10px] text-slate-600">Opens the signed add-on; Firefox prompts to add it.</p>
                 </div>
-              ) : (
+              ) : extPaths?.xpiExists ? (
                 <>
                   <ol className="list-decimal ml-4 text-xs text-slate-500 space-y-1">
                     <li>Open <code className="bg-ink-700/60 px-1 rounded">about:debugging#/runtime/this-firefox</code></li>
                     <li>Click <b className="text-slate-300">Load Temporary Add-on</b></li>
-                    <li>Select <code className="bg-ink-700/60 px-1 rounded">manifest.json</code> inside the folder below</li>
+                    <li>Select <code className="bg-ink-700/60 px-1 rounded">DownMan.xpi</code> from the extension folder</li>
                   </ol>
                   {extPaths && (
                     <button className="btn-ghost !py-1 !px-2.5 text-xs w-full mt-1"
-                      onClick={() => { navigator.clipboard.writeText(extPaths.dir).catch(() => {}); }}>
-                      Copy folder path
+                      onClick={() => api.revealPath(extPaths.xpi).catch(() => {})}>
+                      Show Firefox package
                     </button>
                   )}
-                  <p className="text-[10px] text-slate-600">Unsigned build — temporary add-on only. Run <code className="bg-ink-700/60 px-1 rounded">npm run sign:ext</code> for a permanent install.</p>
+                  <p className="text-[10px] text-slate-600">Unsigned package — Firefox removes temporary add-ons on restart. A Mozilla-signed XPI is required for permanent installation.</p>
                 </>
+              ) : (
+                <div className="space-y-2">
+                  <p className="text-xs text-amber-300">The Firefox package is missing from this build.</p>
+                  <p className="text-[10px] text-slate-600">Rebuild the browser extension package, then reopen DownMan.</p>
+                </div>
               )}
             </div>
           </div>
@@ -751,8 +756,8 @@ export default function SettingsView() {
       {confirmBg && (
         <div className="fixed inset-0 z-[80] grid place-items-center bg-black/60 backdrop-blur-sm animate-fade-up" onClick={() => setConfirmBg(false)}>
           <div className="card w-[440px] max-w-[92vw] p-6" onClick={(e) => e.stopPropagation()}>
-            <h2 className="text-lg font-semibold mb-1">Enable animated background?</h2>
-            <p className="text-sm text-slate-400 mb-4">This renders a live background on your GPU. It looks great, but it <b className="text-amber-300">uses more CPU/GPU and battery</b> and keeps drawing while the app is open. You can turn it off anytime.</p>
+            <h2 className="text-lg font-semibold mb-1">Enable live scan field?</h2>
+            <p className="text-sm text-slate-400 mb-4">This adds a restrained moving scan line and data lanes behind the interface. It keeps animating while the app is open and may use a little more power.</p>
             <div className="flex justify-end gap-2">
               <button className="btn-ghost" onClick={() => setConfirmBg(false)}>Cancel</button>
               <button className="btn-primary" onClick={() => { setLiveBg(true); setConfirmBg(false); }}>Enable anyway</button>

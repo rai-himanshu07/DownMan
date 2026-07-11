@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { type ReactElement, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Aria2Task, api } from "../lib/api";
 import { fmtBytes } from "../lib/format";
@@ -291,7 +291,7 @@ function FileTree({ t }: { t: Aria2Task }) {
     api.setSelectedFiles(t.gid, list || index).catch(() => {});
   }
 
-  function renderNode(node: FileTreeNode, depth: number, path: string): JSX.Element {
+  function renderNode(node: FileTreeNode, depth: number, path: string): ReactElement {
     const kids = [...node.children.values()];
     const folders = kids.filter((c) => c.children.size > 0).sort((a, b) => a.name.localeCompare(b.name));
     const files = kids.filter((c) => c.children.size === 0).sort((a, b) => a.name.localeCompare(b.name));

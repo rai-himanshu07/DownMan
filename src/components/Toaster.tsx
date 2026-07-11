@@ -1,7 +1,8 @@
+import type { ReactElement } from "react";
 import { useToasts, ToastKind } from "../lib/toast";
 import { I } from "./icons";
 
-const KIND: Record<ToastKind, { border: string; icon: string; Icon: (p: { className?: string }) => JSX.Element }> = {
+const KIND: Record<ToastKind, { border: string; icon: string; Icon: (p: { className?: string }) => ReactElement }> = {
   success: { border: "border-lime-500/30", icon: "text-lime-400", Icon: I.Done },
   error: { border: "border-rose-500/40", icon: "text-rose-400", Icon: I.Close },
   info: { border: "border-aurora-500/30", icon: "text-aurora-300", Icon: I.More },

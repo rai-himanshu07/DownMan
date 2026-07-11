@@ -1,6 +1,6 @@
 # ADR‑0005: Smart media capture UX
 
-- **Status:** Accepted
+- **Status:** Superseded in 0.1.3
 - **Date:** 2026-06-29
 - **Deciders:** Project owner
 
@@ -33,3 +33,10 @@ No per‑element overlays are ever injected.
 - Positive: pages stay clean; the feature is invisible until it's useful; one obvious action.
 - Negative: stream picking is currently "first/most‑recent"; quality/variant selection for HLS/DASH
   is a follow‑up. Detection relies on URL/extension heuristics and may miss obfuscated streams.
+
+## Update (2026‑07‑11)
+
+The visible badge, floating pill, and popup stream list were superseded by a single per‑media
+**Download** control. Network detection remains internal as a frame‑scoped fallback for blob/MSE
+players; YouTube alone exposes an explicit quality menu. This preserves passive detection without
+maintaining a second capture workflow.

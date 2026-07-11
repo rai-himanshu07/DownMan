@@ -56,24 +56,32 @@ Zustand stores it; cards re‑render with progress, speed, and ETA.
 When a task reaches `complete`, the store calls `organize(gid)` once. Rust reads the file path via
 `aria2.tellStatus`, then moves it into a category subfolder (rename, with copy fallback across mounts).
 
-## Smart media capture
+## Per-media downloads
 
 ```mermaid
 sequenceDiagram
-    participant Net as Page network
+    participant Media as Video/audio element
+    participant CS as Extension content script
     participant BG as Extension background
-    participant Pill as Floating pill
     participant App as DownMan bridge
 
-    Net->>BG: webRequest (.m3u8/.mpd/.mp4/audio)
-    BG->>BG: dedupe per tab, set badge count
-    BG->>Pill: show only if ≥1 stream (auto-hide 6s)
-    Pill->>App: POST /add (chosen stream)
-    App->>App: HLS/DASH → ffmpeg -c copy → .mp4
+    BG->>BG: Passively record media requests per tab/frame
+    Media->>CS: Hover/play reveals one Download control
+    CS->>BG: Direct URL or media post/page URL
+    alt Direct file
+        BG->>App: POST /add (file URL)
+    else Known extractor site
+        BG->>App: POST /add (post/page URL)
+    else Blob/MSE player
+        BG->>BG: Select newest frame-scoped stream/file
+        BG->>App: POST /add (detected media fallback)
+    end
+    App->>App: Route to aria2 or yt-dlp; merge HLS/DASH via ffmpeg
 ```
 
-The key UX rule: **passive detection, single entry point.** No overlay buttons on thumbnails — just a
-badge count and one on‑demand pill. See [ADR‑0005](adr/0005-smart-media-capture.md).
+The key UX rule is **one action on the media the user chose**. There is no separate stream pill,
+badge, or popup list; passive network detection is only an implementation fallback. YouTube also
+offers an explicit quality segment on that same control. See [ADR‑0005](adr/0005-smart-media-capture.md).
 
 ## Rust core surface (`src-tauri/src`)
 

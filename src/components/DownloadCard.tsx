@@ -123,8 +123,8 @@ export default function DownloadCard({ t }: { t: Aria2Task }) {
           </>,
           document.body
         )}
-      <div className="relative mt-3 h-2 rounded-full bg-ink-600 overflow-hidden">
-        <div className={`absolute inset-y-0 left-0 rounded-full ${t.status === "complete" ? "bg-lime-500" : "bg-gradient-to-r from-aurora-500 to-magenta-500"} ${active && "progress-shimmer"}`} style={{ width: `${pct}%` }} />
+      <div className="dm-progress-track relative mt-3 h-2 overflow-hidden">
+        <div className={`absolute inset-y-0 left-0 ${t.status === "complete" ? "bg-lime-500" : "dm-progress-active"} ${active && "progress-shimmer"}`} style={{ width: `${pct}%` }} />
       </div>
       <div className="flex items-center justify-between mt-2 text-xs text-slate-500">
         <span>{fmtBytes(done)} / {fmtBytes(total)} · {pct.toFixed(0)}%</span>

@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
+import { useDialogFocus } from "../lib/useDialogFocus";
 
 /** First-run onboarding panel — shown once after install.
  *  Covers the essentials: download folder, extension setup, theme.
@@ -17,6 +18,10 @@ export default function FirstRunPanel({ onDismiss }: { onDismiss: () => void }) 
     localStorage.setItem("dm-onboarded", "1");
     onDismiss();
   }
+
+  const dialogRef = useDialogFocus<HTMLDivElement>(dismiss);
+  const primaryRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => { primaryRef.current?.focus(); }, [step]);
 
   const steps = [
     {
@@ -50,7 +55,7 @@ export default function FirstRunPanel({ onDismiss }: { onDismiss: () => void }) 
             <p className="font-medium text-slate-300">Chromium (Chrome/Brave/Edge)</p>
             <p>Go to <code className="bg-ink-700/60 px-1 rounded">chrome://extensions</code> → enable Developer mode → Load unpacked → select the <code className="bg-ink-700/60 px-1 rounded">extensions/</code> folder.</p>
             <p className="font-medium text-slate-300 mt-2">Firefox</p>
-            <p>Go to <code className="bg-ink-700/60 px-1 rounded">about:debugging#/runtime/this-firefox</code> → Load Temporary Add-on → select <code className="bg-ink-700/60 px-1 rounded">extensions/manifest.json</code>.</p>
+            <p>Finish in <b className="text-slate-300">Settings → Browser</b>. DownMan shows the included signed XPI for permanent installation, or the unsigned XPI for temporary testing.</p>
           </div>
           <p className="text-xs text-slate-600">You can skip this and install later via Settings → Browser.</p>
         </div>
@@ -62,7 +67,7 @@ export default function FirstRunPanel({ onDismiss }: { onDismiss: () => void }) 
         <div className="space-y-3 text-sm text-slate-400">
           <p>Some features use more CPU or network. DownMan always asks before enabling them:</p>
           <ul className="list-disc ml-5 space-y-1 text-xs text-slate-500">
-            <li><b className="text-slate-300">Animated background</b> — renders on the GPU; looks great, uses more power.</li>
+            <li><b className="text-slate-300">Live scan field</b> — adds subtle motion behind the interface and uses more power.</li>
             <li><b className="text-slate-300">Site video capture</b> (yt-dlp) — invokes ffmpeg and may download large media.</li>
             <li><b className="text-slate-300">Browser cookies for media</b> — lets yt-dlp access age-gated or logged-in content.</li>
           </ul>
@@ -77,22 +82,22 @@ export default function FirstRunPanel({ onDismiss }: { onDismiss: () => void }) 
 
   return (
     <div className="fixed inset-0 z-[90] grid place-items-center bg-black/70 backdrop-blur-sm animate-fade-up">
-      <div className="card w-[520px] max-w-[95vw] p-6">
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="first-run-title" tabIndex={-1} className="card w-[520px] max-w-[95vw] p-6">
         <div className="flex items-center gap-2 mb-5">
           {steps.map((_, i) => (
             <div key={i} className={`h-1 flex-1 rounded-full ${i <= step ? "bg-aurora-500" : "bg-ink-500"}`} />
           ))}
         </div>
-        <h2 className="text-lg font-semibold mb-3">{current.title}</h2>
+        <h2 id="first-run-title" className="text-lg font-semibold mb-3">{current.title}</h2>
         <div className="min-h-[120px]">{current.body}</div>
         <div className="flex justify-between items-center mt-6">
           <button className="btn-ghost text-xs" onClick={dismiss}>Skip setup</button>
           <div className="flex gap-2">
             {step > 0 && <button className="btn-ghost" onClick={() => setStep((s) => s - 1)}>Back</button>}
             {isLast ? (
-              <button className="btn-primary" onClick={dismiss}>Get started</button>
+              <button ref={primaryRef} data-dialog-autofocus className="btn-primary" onClick={dismiss}>Get started</button>
             ) : (
-              <button className="btn-primary" onClick={() => setStep((s) => s + 1)}>Next</button>
+              <button ref={primaryRef} data-dialog-autofocus className="btn-primary" onClick={() => setStep((s) => s + 1)}>Next</button>
             )}
           </div>
         </div>

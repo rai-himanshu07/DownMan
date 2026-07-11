@@ -2,8 +2,9 @@ mod aria2;
 
 use aria2::{Aria2, Snapshot};
 use once_cell::sync::{Lazy, OnceCell};
-use rand::Rng;
+use rand::RngExt;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader};
@@ -20,6 +21,8 @@ static APP: OnceCell<tauri::AppHandle> = OnceCell::new();
 static PENDING: OnceCell<Mutex<Vec<Value>>> = OnceCell::new();
 /// Persisted history of completed downloads (survives restart).
 static HISTORY: OnceCell<Mutex<Vec<Value>>> = OnceCell::new();
+/// Lifetime aggregates survive history/list cleanup and only reset explicitly.
+static LIFETIME_STATS: OnceCell<Mutex<LifetimeStatsState>> = OnceCell::new();
 /// gids the user gave an explicit save folder — skip auto-organize for them.
 static NO_ORGANIZE: OnceCell<Mutex<HashSet<String>>> = OnceCell::new();
 /// Full target paths reserved by in-flight downloads (collision avoidance).
@@ -92,6 +95,186 @@ fn retries() -> &'static Mutex<HashMap<String, u32>> {
 
 fn history() -> &'static Mutex<Vec<Value>> {
     HISTORY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+struct StatBucket {
+    count: u64,
+    bytes: u64,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+struct LifetimeStatsState {
+    completed_count: u64,
+    completed_bytes: u64,
+    by_category: HashMap<String, StatBucket>,
+    by_day: HashMap<String, StatBucket>,
+    seen: HashSet<String>,
+}
+
+fn lifetime_stats_state() -> &'static Mutex<LifetimeStatsState> {
+    LIFETIME_STATS.get_or_init(|| Mutex::new(LifetimeStatsState::default()))
+}
+
+fn lifetime_stats_file() -> std::path::PathBuf {
+    state_dir().join(".downman-lifetime-stats.json")
+}
+
+fn save_lifetime_stats() {
+    std::fs::create_dir_all(state_dir()).ok();
+    if let Ok(stats) = lifetime_stats_state().lock() {
+        if let Ok(s) = serde_json::to_string(&*stats) {
+            let _ = std::fs::write(lifetime_stats_file(), s);
+        }
+    }
+}
+
+fn record_lifetime_entry(
+    stats: &mut LifetimeStatsState,
+    gid: &str,
+    bytes: u64,
+    category: &str,
+    completed_at_ms: u64,
+) -> bool {
+    if gid.is_empty() || !stats.seen.insert(gid.to_string()) {
+        return false;
+    }
+    stats.completed_count = stats.completed_count.saturating_add(1);
+    stats.completed_bytes = stats.completed_bytes.saturating_add(bytes);
+    let category_bucket = stats.by_category.entry(category.to_string()).or_default();
+    category_bucket.count = category_bucket.count.saturating_add(1);
+    category_bucket.bytes = category_bucket.bytes.saturating_add(bytes);
+    let day = (completed_at_ms / 86_400_000).to_string();
+    let day_bucket = stats.by_day.entry(day).or_default();
+    day_bucket.count = day_bucket.count.saturating_add(1);
+    day_bucket.bytes = day_bucket.bytes.saturating_add(bytes);
+    true
+}
+
+fn completion_category(rec: &Value) -> String {
+    if rec.get("dmKind").and_then(|v| v.as_str()) == Some("site") {
+        return "Video".to_string();
+    }
+    if rec.get("bittorrent").is_some() {
+        return "Torrents".to_string();
+    }
+    category_of(&task_name(rec)).0
+}
+
+fn record_lifetime_completion(rec: &Value) {
+    let gid = rec.get("gid").and_then(|v| v.as_str()).unwrap_or("");
+    let bytes = rec.get("totalLength").and_then(|v| v.as_str())
+        .and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let completed_at = rec.get("completedAt").and_then(|v| v.as_u64())
+        .unwrap_or_else(|| now_ms() as u64);
+    let category = completion_category(rec);
+    let changed = lifetime_stats_state().lock()
+        .map(|mut stats| record_lifetime_entry(&mut stats, gid, bytes, &category, completed_at))
+        .unwrap_or(false);
+    if changed {
+        save_lifetime_stats();
+    }
+}
+
+fn load_lifetime_stats() {
+    if let Ok(s) = std::fs::read_to_string(lifetime_stats_file()) {
+        if let Ok(saved) = serde_json::from_str::<LifetimeStatsState>(&s) {
+            if let Ok(mut stats) = lifetime_stats_state().lock() {
+                *stats = saved;
+            }
+            return;
+        }
+    }
+    let existing = history().lock().map(|h| h.clone()).unwrap_or_default();
+    let mut seeded = LifetimeStatsState::default();
+    for rec in &existing {
+        let gid = rec.get("gid").and_then(|v| v.as_str()).unwrap_or("");
+        let bytes = rec.get("totalLength").and_then(|v| v.as_str())
+            .and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        let completed_at = rec.get("completedAt").and_then(|v| v.as_u64()).unwrap_or(0);
+        let category = completion_category(rec);
+        record_lifetime_entry(&mut seeded, gid, bytes, &category, completed_at);
+    }
+    if let Ok(mut stats) = lifetime_stats_state().lock() {
+        *stats = seeded;
+    }
+    save_lifetime_stats();
+}
+
+fn lifetime_stats_value(stats: &LifetimeStatsState, now_ms_value: u64) -> Value {
+    let current_day = now_ms_value / 86_400_000;
+    let first_day = current_day.saturating_sub(6);
+    let mut last7 = StatBucket::default();
+    for (day, bucket) in &stats.by_day {
+        if day.parse::<u64>().map(|d| d >= first_day && d <= current_day).unwrap_or(false) {
+            last7.count = last7.count.saturating_add(bucket.count);
+            last7.bytes = last7.bytes.saturating_add(bucket.bytes);
+        }
+    }
+    let mut categories: Vec<Value> = stats.by_category.iter()
+        .map(|(category, bucket)| json!({
+            "category": category,
+            "count": bucket.count,
+            "bytes": bucket.bytes,
+        }))
+        .collect();
+    categories.sort_by(|a, b| {
+        b.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0)
+            .cmp(&a.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0))
+    });
+    json!({
+        "completedCount": stats.completed_count,
+        "completedBytes": stats.completed_bytes,
+        "last7Count": last7.count,
+        "last7Bytes": last7.bytes,
+        "byCategory": categories,
+    })
+}
+
+fn collect_completed_gids(records: &[Value], out: &mut HashSet<String>) {
+    for rec in records {
+        if rec.get("status").and_then(|v| v.as_str()) == Some("complete") {
+            if let Some(gid) = rec.get("gid").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
+                out.insert(gid.to_string());
+            }
+        }
+    }
+}
+
+#[tauri::command]
+fn lifetime_stats() -> Value {
+    lifetime_stats_state().lock()
+        .map(|stats| lifetime_stats_value(&stats, now_ms() as u64))
+        .unwrap_or_else(|_| lifetime_stats_value(&LifetimeStatsState::default(), now_ms() as u64))
+}
+
+#[tauri::command]
+async fn reset_lifetime_stats() -> Value {
+    let mut known_completed: HashSet<String> = HashSet::new();
+    if let Ok(records) = history().lock() {
+        collect_completed_gids(&records, &mut known_completed);
+    }
+    if let Some(c) = ARIA2.get() {
+        if let Ok(stopped) = c.tell_stopped().await {
+            if let Some(records) = stopped.as_array() {
+                collect_completed_gids(records, &mut known_completed);
+            }
+        }
+    }
+    if let Ok(jobs) = site_jobs().lock() {
+        collect_completed_gids(&jobs, &mut known_completed);
+    }
+    if let Ok(mut stats) = lifetime_stats_state().lock() {
+        stats.completed_count = 0;
+        stats.completed_bytes = 0;
+        stats.by_category.clear();
+        stats.by_day.clear();
+        stats.seen.extend(known_completed);
+    }
+    save_lifetime_stats();
+    lifetime_stats()
 }
 
 fn no_organize() -> &'static Mutex<HashSet<String>> {
@@ -544,6 +727,7 @@ fn run_on_done(action: &str) {
 }
 
 fn record_history(rec: Value) {
+    record_lifetime_completion(&rec);
     if let Ok(mut h) = history().lock() {
         let gid = rec.get("gid").and_then(|g| g.as_str()).unwrap_or("").to_string();
         if !gid.is_empty() && !h.iter().any(|x| x.get("gid").and_then(|g| g.as_str()) == Some(gid.as_str())) {
@@ -1199,7 +1383,7 @@ fn is_stream_manifest(url: &str) -> bool {
 fn is_known_ytdlp_host(url: &str) -> bool {
     let host = host_of(url).to_lowercase();
     const SITES: &[&str] = &[
-        "youtube.com", "youtu.be", "vimeo.com", "dailymotion.com", "tiktok.com",
+        "youtube.com", "youtube-nocookie.com", "youtu.be", "vimeo.com", "dailymotion.com", "tiktok.com",
         "instagram.com", "twitter.com", "x.com", "facebook.com", "fb.watch",
         "twitch.tv", "soundcloud.com", "bandcamp.com", "reddit.com", "streamable.com",
         "bilibili.com", "nicovideo.jp", "ok.ru", "rutube.ru", "vk.com", "odysee.com",
@@ -1963,9 +2147,9 @@ fn client() -> Result<&'static Aria2, String> {
 }
 
 fn random_secret() -> String {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..32)
-        .map(|_| char::from(rng.gen_range(b'a'..=b'z')))
+        .map(|_| char::from(rng.random_range(b'a'..=b'z')))
         .collect()
 }
 
@@ -3308,6 +3492,7 @@ fn which(bin: &str) -> Option<String> {
     None
 }
 
+#[cfg(not(target_os = "linux"))]
 fn fmt_speed(b: u64) -> String {
     if b >= 1024 * 1024 {
         format!("{:.1} MiB", b as f64 / (1024.0 * 1024.0))
@@ -3449,6 +3634,7 @@ fn start_metered_watch() {
 /// the Unity LauncherEntry DBus protocol, and a sleep inhibitor while busy.
 fn start_telemetry() {
     std::thread::spawn(|| {
+        #[cfg(not(target_os = "linux"))]
         let mut last_tip = String::new();
         let mut last_dock = (false, -1i64);
         let has_gdbus = which("gdbus").is_some();
@@ -3458,25 +3644,31 @@ fn start_telemetry() {
             let Some(c) = ARIA2.get() else { continue };
             let Ok(stat) = tauri::async_runtime::block_on(c.global_stat()) else { continue };
             let num = |k: &str| stat.get(k).and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            #[cfg(not(target_os = "linux"))]
             let speed = num("downloadSpeed");
             let site_active = site_jobs().lock()
                 .map(|j| j.iter().filter(|x| x.get("status").and_then(|s| s.as_str()) == Some("active")).count() as u64)
                 .unwrap_or(0);
             let busy = num("numActive") + site_active;
 
-            // Tray tooltip: live speed at a glance.
-            let tip = if busy > 0 {
-                format!("DownMan — ↓ {}/s · {} active", fmt_speed(speed), busy)
-            } else {
-                "DownMan — idle".to_string()
-            };
-            if tip != last_tip {
-                if let Some(app) = APP.get() {
-                    if let Some(tray) = app.tray_by_id("downman-tray") {
-                        let _ = tray.set_tooltip(Some(tip.as_str()));
+            // Some Linux AppIndicator hosts intermittently repaint menu labels with
+            // no foreground color when the tooltip changes while the menu is open.
+            // Keep the stable startup tooltip there; other platforms retain telemetry.
+            #[cfg(not(target_os = "linux"))]
+            {
+                let tip = if busy > 0 {
+                    format!("DownMan — ↓ {}/s · {} active", fmt_speed(speed), busy)
+                } else {
+                    "DownMan — idle".to_string()
+                };
+                if tip != last_tip {
+                    if let Some(app) = APP.get() {
+                        if let Some(tray) = app.tray_by_id("downman-tray") {
+                            let _ = tray.set_tooltip(Some(tip.as_str()));
+                        }
                     }
+                    last_tip = tip;
                 }
-                last_tip = tip;
             }
 
             // Dock/launcher progress bar (GNOME/KDE honor the Unity protocol).
@@ -4241,9 +4433,9 @@ fn set_auto_extract(enable: bool) {
 
 fn remote_token() -> &'static str {
     REMOTE_TOKEN.get_or_init(|| {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         (0..32)
-            .map(|_| b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[rng.gen_range(0..62)] as char)
+            .map(|_| b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[rng.random_range(0..62)] as char)
             .collect()
     })
 }
@@ -4465,6 +4657,7 @@ pub fn run() {
             load_history();
             load_rules();
             load_categories();
+            load_lifetime_stats();
             load_queues();
             load_qmember();
             load_grabbed();
@@ -4591,6 +4784,8 @@ pub fn run() {
             quit_app,
             set_history_limit,
             export_history,
+            lifetime_stats,
+            reset_lifetime_stats,
             set_on_complete,
             set_download_on_complete,
             verify_checksum,
@@ -4768,6 +4963,7 @@ mod tests {
     #[test]
     fn ytdlp_hosts() {
         assert!(is_known_ytdlp_host("https://www.youtube.com/watch?v=1"));
+        assert!(is_known_ytdlp_host("https://www.youtube-nocookie.com/embed/1"));
         assert!(is_known_ytdlp_host("https://youtu.be/1"));
         assert!(is_known_ytdlp_host("https://old.reddit.com/r/videos/1"));
         assert!(!is_known_ytdlp_host("https://example.com/watch"));
@@ -4779,5 +4975,55 @@ mod tests {
         assert_eq!(ytdlp_out_stem("My Video.mp4"), "My Video");
         assert_eq!(ytdlp_out_stem("a/b%c.webm"), "abc");
         assert_eq!(ytdlp_out_stem(""), "video");
+    }
+
+    #[test]
+    fn lifetime_stats_count_each_gid_once() {
+        let mut stats = LifetimeStatsState::default();
+        assert!(record_lifetime_entry(&mut stats, "gid-1", 512, "Archives", 86_400_000));
+        assert!(!record_lifetime_entry(&mut stats, "gid-1", 512, "Archives", 86_400_000));
+        assert_eq!(stats.completed_count, 1);
+        assert_eq!(stats.completed_bytes, 512);
+        assert_eq!(stats.by_category.get("Archives").map(|b| b.count), Some(1));
+    }
+
+    #[test]
+    fn lifetime_reset_keeps_dedupe_markers() {
+        let mut stats = LifetimeStatsState::default();
+        record_lifetime_entry(&mut stats, "old-gid", 1024, "Video", 86_400_000);
+        stats.completed_count = 0;
+        stats.completed_bytes = 0;
+        stats.by_category.clear();
+        stats.by_day.clear();
+        assert!(!record_lifetime_entry(&mut stats, "old-gid", 1024, "Video", 86_400_000));
+        assert!(record_lifetime_entry(&mut stats, "new-gid", 2048, "Video", 172_800_000));
+        assert_eq!(stats.completed_count, 1);
+        assert_eq!(stats.completed_bytes, 2048);
+    }
+
+    #[test]
+    fn reset_collects_completed_gids_outside_history() {
+        let records = vec![
+            json!({ "gid": "done", "status": "complete" }),
+            json!({ "gid": "failed", "status": "error" }),
+            json!({ "gid": "", "status": "complete" }),
+        ];
+        let mut gids = HashSet::new();
+        collect_completed_gids(&records, &mut gids);
+        assert_eq!(gids, HashSet::from(["done".to_string()]));
+    }
+
+    #[test]
+    fn lifetime_value_reports_last_seven_days_and_categories() {
+        let mut stats = LifetimeStatsState::default();
+        let now = 10 * 86_400_000;
+        record_lifetime_entry(&mut stats, "old", 100, "Documents", 2 * 86_400_000);
+        record_lifetime_entry(&mut stats, "recent", 400, "Video", 9 * 86_400_000);
+        let value = lifetime_stats_value(&stats, now);
+        assert_eq!(value["completedCount"], json!(2));
+        assert_eq!(value["completedBytes"], json!(500));
+        assert_eq!(value["last7Count"], json!(1));
+        assert_eq!(value["last7Bytes"], json!(400));
+        assert_eq!(value["byCategory"][0]["category"], json!("Video"));
     }
 }

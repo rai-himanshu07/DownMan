@@ -135,9 +135,9 @@ export default function DownloadTable({ rows }: { rows: Aria2Task[] }) {
                   <td className="px-3 py-2 whitespace-nowrap text-slate-400 tabular-nums">{total ? fmtBytes(total) : "—"}</td>
                   <td className="px-3 py-2 whitespace-nowrap">
                     <div className="flex items-center gap-2">
-                      <div className="w-16 h-1.5 rounded-full bg-ink-600 overflow-hidden shrink-0">
+                      <div className="dm-progress-track w-16 h-1.5 overflow-hidden shrink-0">
                         <div
-                          className={clsx("h-full rounded-full", completed ? "bg-lime-500" : t.status === "error" ? "bg-rose-500" : "bg-gradient-to-r from-aurora-500 to-magenta-500")}
+                          className={clsx("h-full", completed ? "bg-lime-500" : t.status === "error" ? "bg-rose-500" : "dm-progress-active")}
                           style={{ width: `${pct}%` }}
                         />
                       </div>

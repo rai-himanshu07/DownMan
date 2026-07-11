@@ -1,5 +1,6 @@
-// DownMan Connector — background service worker
-// Intercepts downloads, sniffs media streams, badges the active tab.
+// DownMan Connector — background service worker.
+// Intercepts downloads and keeps detected media as an invisible fallback for
+// per-media buttons on blob/MSE players.
 
 const DEFAULT_ENDPOINT = "http://127.0.0.1:6802";
 // Adaptive manifests are always interesting.
@@ -23,7 +24,7 @@ const JUNK_NAME_RE = /\/(failure|success|open|close|no_input|notification|click|
 const JUNK_HOST_RE = /(gstatic\.com|google\.com\/recaptcha|fonts\.|doubleclick|googlesyndication)/i;
 const MIN_FILE = 1024 * 1024; // ignore progressive media smaller than 1 MB
 const MIN_TAKEOVER = 8 * 1024 * 1024; // hand large files to DownMan
-const mediaByTab = new Map(); // tabId -> Map(url -> {url,type,size})
+const mediaByTab = new Map(); // tabId -> Map(url -> {url,type,size,contentType,frameId,seen})
 
 function header(headers, name) {
   const h = headers && headers.find((x) => x.name.toLowerCase() === name);
@@ -110,6 +111,19 @@ async function sendStream(url, referer = "") {
   return post({ kind: "stream", uris: [url], options: { referer, cookies: await cookiesPref() } });
 }
 
+async function sendDetectedOrSite(tabId, frameId, url, referer = "") {
+  const detected = [...(mediaByTab.get(tabId)?.values() || [])];
+  const newest = (items) => items.sort((a, b) => (b.seen || 0) - (a.seen || 0))[0];
+  const sameFrame = detected.filter((item) => item.frameId === frameId);
+  const candidates = sameFrame.length ? sameFrame : detected;
+  const candidate = newest(candidates.filter((item) => item.type === "stream"))
+    || newest(candidates.filter((item) => /^video\//i.test(item.contentType || "")))
+    || newest(candidates.filter((item) => !/^audio\//i.test(item.contentType || "")));
+  if (!candidate) return sendSite(url, "best", referer);
+  if (candidate.type === "stream") return sendStream(candidate.url, referer);
+  return send([candidate.url], referer ? { referer } : {});
+}
+
 // Ask the app for the real, per-video quality list (yt-dlp -J under the hood).
 async function fetchFormats(url, referer = "") {
   const base = await endpoint();
@@ -150,7 +164,6 @@ chrome.webRequest.onBeforeRequest.addListener(
   (d) => {
     if (d.type === "main_frame" && d.tabId >= 0) {
       mediaByTab.delete(d.tabId);
-      chrome.action.setBadgeText({ tabId: d.tabId, text: "" });
     }
   },
   { urls: ["<all_urls>"], types: ["main_frame"] }
@@ -174,12 +187,8 @@ chrome.webRequest.onHeadersReceived.addListener(
     }
 
     const m = mediaByTab.get(d.tabId) || new Map();
-    m.set(d.url, { url: d.url, type: isStream ? "stream" : "file", size: clen });
+    m.set(d.url, { url: d.url, type: isStream ? "stream" : "file", size: clen, contentType: ctype, frameId: d.frameId, seen: Date.now() });
     mediaByTab.set(d.tabId, m);
-    const n = m.size;
-    chrome.action.setBadgeText({ tabId: d.tabId, text: n ? String(n) : "" });
-    chrome.action.setBadgeBackgroundColor({ tabId: d.tabId, color: "#f04ec0" });
-    chrome.tabs.sendMessage(d.tabId, { dm: "media", count: n }).catch(() => {});
   },
   { urls: ["<all_urls>"] },
   ["responseHeaders"]
@@ -187,18 +196,17 @@ chrome.webRequest.onHeadersReceived.addListener(
 
 chrome.tabs.onRemoved.addListener((id) => mediaByTab.delete(id));
 
-chrome.runtime.onMessage.addListener((msg, _s, reply) => {
-  if (msg.dm === "list") reply([...(mediaByTab.get(msg.tabId)?.values() || [])]);
-  if (msg.dm === "grab") sendStream(msg.url, msg.referer).then(() => reply({ ok: true })).catch((e) => reply({ ok: false, error: String(e) }));
+chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   if (msg.dm === "file") send([msg.url], msg.referer ? { referer: msg.referer } : {}).then(() => reply({ ok: true })).catch((e) => reply({ ok: false, error: String(e) }));
   if (msg.dm === "site") sendSite(msg.url, msg.format, msg.referer, msg.title, msg.quality).then(() => reply({ ok: true })).catch((e) => reply({ ok: false, error: String(e) }));
+  if (msg.dm === "media-download") sendDetectedOrSite(sender.tab?.id ?? -1, sender.frameId ?? 0, msg.url, msg.referer).then(() => reply({ ok: true })).catch((e) => reply({ ok: false, error: String(e) }));
   if (msg.dm === "formats") fetchFormats(msg.url, msg.referer).then((d) => reply({ ok: true, ...d })).catch((e) => reply({ ok: false, error: String(e) }));
   return true;
 });
 
 chrome.runtime.onInstalled.addListener(() => {
+  chrome.action.setBadgeText({ text: "" });
   chrome.contextMenus.removeAll(() => {
-    chrome.contextMenus.create({ id: "dm-page", title: "Capture video from this page (DownMan)", contexts: ["page", "video", "audio"] });
     chrome.contextMenus.create({ id: "dm-grab", title: "Grab files from this page (DownMan)", contexts: ["page"] });
     chrome.contextMenus.create({ id: "dm-link", title: "Download with DownMan", contexts: ["link", "image", "video", "audio"] });
   });
@@ -222,12 +230,6 @@ function resolveCtxUrl(tab, info, cb) {
 }
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
-  if (info.menuItemId === "dm-page") {
-    resolveCtxUrl(tab, info, (u) => {
-      sendSite(u || info.pageUrl || info.srcUrl, "best", info.pageUrl).catch(() => {});
-    });
-    return;
-  }
   if (info.menuItemId === "dm-grab") {
     grabPage(info.pageUrl || info.srcUrl).catch(() => {});
     return;
@@ -239,7 +241,7 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
     resolveCtxUrl(tab, info, (u, kind) => {
       if (!u) { sendSite(info.pageUrl, "best", info.pageUrl).catch(() => {}); return; }
       if (kind === "file") send([u], info.pageUrl ? { referer: info.pageUrl } : {}).catch(() => {});
-      else sendSite(u, "best", u).catch(() => {});
+      else sendSite(u, "best", info.pageUrl || u).catch(() => {});
     });
     return;
   }

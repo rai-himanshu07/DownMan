@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "DownMan Connector",
-  "version": "0.1.2",
-  "description": "Send downloads to DownMan and capture video/audio streams smartly.",
+  "version": "0.1.3",
+  "description": "Send downloads to DownMan with one-click per-media controls.",
   "permissions": ["downloads", "contextMenus", "storage", "webRequest", "tabs", "notifications"],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js" },

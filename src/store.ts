@@ -2,6 +2,9 @@ import { create } from "zustand";
 import { api, Aria2Task, PendingItem, Snapshot, taskName, CategoryDef, Queue } from "./lib/api";
 import { toast } from "./lib/toast";
 import { playDing } from "./lib/sound";
+import { migrateTheme } from "./lib/theme";
+
+migrateTheme();
 
 export type View = "all" | "active" | "unfinished" | "completed" | "media" | "sitegrab" | "torrents" | "settings" | "stats" | "about";
 export type Category = "video" | "audio" | "image" | "doc" | "archive" | "torrent" | "other";

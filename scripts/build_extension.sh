@@ -21,6 +21,17 @@ FILES=(background.js content.js options.html options.js popup.html popup.js
 cd "$EXT_DIR"
 rm -f DownMan.zip DownMan.xpi
 
+# Keep a signed Firefox package only when it matches the source manifest. This
+# prevents a newer app bundle from silently embedding a stale signed extension.
+if [[ -f DownMan-signed.xpi ]]; then
+  source_version="$(python3 -c 'import json; print(json.load(open("manifest.json"))["version"])')"
+  signed_version="$(python3 -c 'import json, zipfile; print(json.loads(zipfile.ZipFile("DownMan-signed.xpi").read("manifest.json"))["version"])' 2>/dev/null || true)"
+  if [[ "$signed_version" != "$source_version" ]]; then
+    echo "Removing stale DownMan-signed.xpi (${signed_version:-invalid}; expected $source_version)."
+    rm -f DownMan-signed.xpi
+  fi
+fi
+
 # Chrome/Chromium: source manifest as-is (service_worker background).
 zip -q DownMan.zip manifest.json "${FILES[@]}"
 

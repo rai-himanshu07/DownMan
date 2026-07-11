@@ -58,3 +58,6 @@ encrypted and circumventing it violates the DMCA. yt‑dlp refuses such sites an
 - **Routing is now evidence‑based** (`decide_route`): on top of the `kind`/extension rules above, an
   ambiguous URL is settled by a content‑type `HEAD` probe (media → aria2, page/stream → yt‑dlp), and a
   yt‑dlp “Unsupported URL” on a real file falls back to aria2.
+- **The 0.1.3 browser UX uses one per‑media Download control.** Direct URLs bypass format probing,
+  known extractor sites use their post/page URL, and ordinary blob/MSE players fall back to
+  frame‑scoped network detections. Exact quality selection is explicit and limited to YouTube.

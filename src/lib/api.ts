@@ -109,6 +109,14 @@ export interface Fmt {
   size: number;
 }
 
+export interface LifetimeStats {
+  completedCount: number;
+  completedBytes: number;
+  last7Count: number;
+  last7Bytes: number;
+  byCategory: { category: string; count: number; bytes: number }[];
+}
+
 export const api = {
   add: (uris: string[], options: Record<string, unknown> = {}) =>
     invoke<string>("add_download", { uris, options }),
@@ -120,6 +128,8 @@ export const api = {
   organize: (gid: string) => invoke<string>("organize", { gid }),
   grabHls: (url: string, name: string) => invoke("grab_hls", { url, name }),
   snapshot: () => invoke<Snapshot>("snapshot"),
+  lifetimeStats: () => invoke<LifetimeStats>("lifetime_stats"),
+  resetLifetimeStats: () => invoke<LifetimeStats>("reset_lifetime_stats"),
   setGlobal: (options: Record<string, string>) =>
     invoke("set_global_option", { options }),
   grabSite: (url: string, format = "best", referer?: string, cookies?: string, subs?: boolean, sponsorblock?: boolean) =>

@@ -3,6 +3,7 @@ import { api, Fmt } from "../lib/api";
 import { toast } from "../lib/toast";
 import { useStore, taskUrl } from "../store";
 import { I } from "./icons";
+import { useDialogFocus } from "../lib/useDialogFocus";
 import PreDownloadSheet from "./PreDownloadSheet";
 
 interface Link { url: string; host: string; type: string }
@@ -37,6 +38,7 @@ function extractLinks(text: string): Link[] {
 }
 
 export default function AddModal({ onClose }: { onClose: () => void }) {
+    const dialogRef = useDialogFocus<HTMLDivElement>(onClose);
   const [text, setText] = useState("");
   const [unchecked, setUnchecked] = useState<Set<string>>(new Set());
   const [showAdv, setShowAdv] = useState(false);
@@ -181,11 +183,12 @@ export default function AddModal({ onClose }: { onClose: () => void }) {
 
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-black/50 backdrop-blur-sm animate-fade-up" onClick={onClose}>
-      <div className="card w-[640px] max-w-[94vw] max-h-[88vh] overflow-auto p-6" onClick={(e) => e.stopPropagation()}>
-        <h2 className="text-lg font-semibold mb-1">Add downloads</h2>
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="add-downloads-title" tabIndex={-1} className="card w-[640px] max-w-[94vw] max-h-[88vh] overflow-auto p-6" onClick={(e) => e.stopPropagation()}>
+        <h2 id="add-downloads-title" className="text-lg font-semibold mb-1">Add downloads</h2>
         <p className="text-sm text-slate-500 mb-4">Paste links or any text — DownMan finds every HTTP/FTP link, magnet, and torrent, and removes duplicates.</p>
         <textarea
           autoFocus
+          data-dialog-autofocus
           value={text}
           onChange={(e) => setText(e.target.value)}
           placeholder="Paste URLs or a whole page of text…"
@@ -218,7 +221,8 @@ export default function AddModal({ onClose }: { onClose: () => void }) {
         {valid.length >= 2 && valid.every((l) => /^(https?|ftp):/i.test(l.url)) && (
           <label className="mt-2 flex items-center gap-2 text-xs text-slate-400">
             <input type="checkbox" checked={mirrors} onChange={(e) => setMirrors(e.target.checked)} />
-            These {valid.length} links are <b className="text-slate-300">mirrors of one file</b> (download from all at once)
+            Treat these {valid.length} links as <b className="text-slate-300">mirrors of the same file</b>
+            <span className="text-slate-600"> — only enable this when every URL serves identical content</span>
           </label>
         )}
 

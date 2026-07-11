@@ -8,7 +8,7 @@ import SettingsView from "./components/SettingsView";
 import StatsView from "./components/StatsView";
 import AboutView from "./components/AboutView";
 import FirstRunPanel from "./components/FirstRunPanel";
-import AuroraBackground from "./components/AuroraBackground";
+import SignalBackground from "./components/SignalBackground";
 import ConfirmDownload from "./components/ConfirmDownload";
 import SiteGrabber from "./components/SiteGrabber";
 import Toaster from "./components/Toaster";
@@ -16,6 +16,7 @@ import ErrorBoundary from "./components/ErrorBoundary";
 import { useStore, metaOf, markOrganized, categoryNameOf, queueOf, taskUrl } from "./store";
 import { api } from "./lib/api";
 import { toast as pushToast } from "./lib/toast";
+import { SIGNAL_ACCENT } from "./lib/theme";
 import { I } from "./components/icons";
 
 const DOWNLOADABLE =
@@ -55,7 +56,7 @@ function FilterSelect({ value, onChange, options }: { value: string; onChange: (
 }
 
 export default function App() {
-  const { tasks, pending, view, query, poll, categories, categoryFilter, loadCategories, listMode, queueFilter, queueMap, queues, statusFilter, typeFilter, setStatusFilter, setTypeFilter, liveBg, grabbed, grabRequest, selected, setSelected, clearSelected } = useStore();  const [adding, setAdding] = useState(false);
+  const { tasks, pending, view, query, poll, connected, categories, categoryFilter, loadCategories, listMode, queueFilter, queueMap, queues, statusFilter, typeFilter, setStatusFilter, setTypeFilter, liveBg, grabbed, grabRequest, selected, setSelected, clearSelected } = useStore();  const [adding, setAdding] = useState(false);
   const [grabbing, setGrabbing] = useState(false);
   const [grabUrl, setGrabUrl] = useState("");
   const [dragging, setDragging] = useState(false);
@@ -129,7 +130,7 @@ export default function App() {
     api.setPowerBlock(localStorage.getItem("dm-awake") !== "off").catch(() => {});
     api.setSpeedLimitState(speed !== "0", speed !== "0" ? `${speed}K` : "").catch(() => {});
     if (localStorage.getItem("dm-remote") === "on") api.setRemote(true).catch(() => {});
-    document.documentElement.style.setProperty("--dm-accent", localStorage.getItem("dm-accent") || "#0a74f0");
+    document.documentElement.style.setProperty("--dm-accent", localStorage.getItem("dm-accent") || SIGNAL_ACCENT);
     const dmBg = localStorage.getItem("dm-bg");
     if (dmBg) document.documentElement.style.setProperty("--dm-bg-image", dmBg);
     document.documentElement.classList.toggle("dm-compact", localStorage.getItem("dm-density") === "compact");
@@ -324,7 +325,7 @@ export default function App() {
       }}
       onDrop={(e) => { if (dragTimer.current) window.clearTimeout(dragTimer.current); onDrop(e); }}
     >
-      {liveBg && <AuroraBackground />}
+      {liveBg && <SignalBackground />}
       <Sidebar />
       <main className="relative z-10 flex-1 flex flex-col min-w-0">
         <TopBar onAdd={() => setAdding(true)} onGrab={() => { setGrabUrl(""); setGrabbing(true); }} />
@@ -393,19 +394,28 @@ export default function App() {
               </div>
             )
           ) : (
-            <div className="h-full grid place-items-center text-center px-6">
-              <div className="max-w-md animate-fade-up">
-                <div className="grid place-items-center w-14 h-14 rounded-2xl bg-aurora-600/20 text-aurora-300 mx-auto mb-4"><I.Logo /></div>
-                <h2 className="text-xl font-semibold text-white">No downloads yet</h2>
-                <p className="mt-2 text-sm text-slate-400">Multi-connection downloads with torrents, magnets, and smart video capture — here's how to start.</p>
-                <div className="flex items-center justify-center gap-2 mt-5">
+            <div className="h-full grid place-items-center px-6">
+              <div className="w-full max-w-2xl animate-fade-up">
+                <div className="flex items-end gap-5 pb-4 border-b border-white/10">
+                  <div className="text-[64px] leading-[0.8] font-mono font-semibold text-aurora-400">00</div>
+                  <div className="pb-0.5">
+                    <div className="text-[10px] font-mono uppercase text-slate-600">Transfer queue</div>
+                    <h2 className="mt-1 text-xl font-semibold text-white">Ledger is clear</h2>
+                    <p className="mt-1 text-sm text-slate-400">No active, queued, or archived transfers in this view.</p>
+                  </div>
+                  <div className="ml-auto hidden sm:block text-right font-mono text-[10px] text-slate-600">
+                    <div>{connected ? "ARIA2 // READY" : "ARIA2 // SYNCING"}</div>
+                    <div>{connected ? "RPC // 6810" : "WAIT // RETRY"}</div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 mt-5">
                   <button className="btn-primary" onClick={() => setAdding(true)}><I.Plus className="w-4 h-4" /> New download</button>
                   <button className="btn-ghost" onClick={() => { setGrabUrl(""); setGrabbing(true); }}><I.Globe className="w-4 h-4" /> Grab a site</button>
                 </div>
-                <div className="mt-6 grid gap-2.5 text-left text-xs text-slate-500">
-                  <div className="flex items-start gap-2"><span className="text-aurora-300 font-semibold">1</span><span>Press <b className="text-slate-300">New</b> (or <kbd className="px-1.5 py-0.5 rounded bg-white/10 text-slate-300 text-[10px]">n</kbd>), drag a link onto the window, or copy a link — DownMan offers to grab it.</span></div>
-                  <div className="flex items-start gap-2"><span className="text-aurora-300 font-semibold">2</span><span>Install the browser extension to send downloads and capture videos straight from your browser.</span></div>
-                  <div className="flex items-start gap-2"><span className="text-aurora-300 font-semibold">3</span><span>Finished files auto-sort into <b className="text-slate-300">Video / Audio / Documents / …</b>; tweak folders in <b className="text-slate-300">Settings</b>.</span></div>
+                <div className="mt-7 grid grid-cols-3 border border-white/10 text-xs text-slate-500">
+                  <div className="p-3 border-r border-white/10"><span className="block mb-2 font-mono text-aurora-300">01 / ADD</span>Paste a URL, magnet link, or local torrent.</div>
+                  <div className="p-3 border-r border-white/10"><span className="block mb-2 font-mono text-magenta-400">02 / ROUTE</span>The browser connector sends media here.</div>
+                  <div className="p-3"><span className="block mb-2 font-mono text-amber-300">03 / FILE</span>Completed transfers sort by category.</div>
                 </div>
               </div>
             </div>

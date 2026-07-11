@@ -46,7 +46,7 @@ That's it! The installer automatically pulls in the two helper tools DownMan nee
   <img src="docs/screenshots/main.png" alt="DownMan — downloads view" width="840">
 </p>
 <p align="center">
-  <img src="docs/screenshots/capture.png" alt="In-page video capture" width="415">
+  <img src="docs/screenshots/capture.png" alt="Add downloads dialog" width="415">
   &nbsp;
   <img src="docs/screenshots/settings.png" alt="Settings" width="415">
 </p>
@@ -57,10 +57,10 @@ That's it! The installer automatically pulls in the two helper tools DownMan nee
 
 - **aria2 engine** — HTTP/FTP, **torrent**, **magnet**, multi‑connection (16 splits/server).
 - **Custom UI** — Tauri 2 + React; dark/light "aurora" design system, ~200–250 MB RAM (system WebView, no Chromium bundle).
-- **Smart media capture** — extension sniffs streams in the background and surfaces a single
-  on‑demand pill (no per‑thumbnail clutter). HLS/DASH are merged to `.mp4` via ffmpeg.
+- **One-click media downloads** — a Download button appears on the media you point at; stream
+  detection stays in the background as a fallback for blob/MSE players. HLS/DASH are merged to `.mp4` via ffmpeg.
 - **Site video capture** — page URLs from 1800+ sites are resolved by **yt‑dlp**
-  with a quality picker (best/1080p/720p/audio) and optional browser cookies. DRM sites are not supported.
+  with optional browser cookies; YouTube also offers an explicit quality picker. DRM sites are not supported.
 - **Auto‑organization** — completed files sorted into `Video / Audio / Images / Documents / Archives / Other`.
 - **Browser bridge** — Chromium + Firefox MV3 extensions talk to the app over a local HTTP endpoint.
 - **Queue control** — pause/resume per item, pause‑all/resume‑all, global speed cap.
@@ -89,12 +89,12 @@ The app writes downloads to `~/Downloads/DownMan/`.
 npm run app:build -- --bundles deb appimage   # → src-tauri/target/release/bundle/{deb,appimage}/
 
 # .deb — pulls in aria2 + ffmpeg automatically:
-sudo apt install ./src-tauri/target/release/bundle/deb/downman_0.1.2_amd64.deb
+sudo apt install ./src-tauri/target/release/bundle/deb/downman_0.1.3_amd64.deb
 
 # AppImage — portable, but install its two runtime tools yourself first:
 sudo apt install aria2 ffmpeg
-chmod +x ./src-tauri/target/release/bundle/appimage/downman_0.1.2_amd64.AppImage
-./src-tauri/target/release/bundle/appimage/downman_0.1.2_amd64.AppImage
+chmod +x ./src-tauri/target/release/bundle/appimage/downman_0.1.3_amd64.AppImage
+./src-tauri/target/release/bundle/appimage/downman_0.1.3_amd64.AppImage
 ```
 
 > **AppImage note:** the AppImage bundles the app + the WebKit/GTK runtime, but **not** `aria2`/`ffmpeg`
@@ -109,8 +109,13 @@ chmod +x ./src-tauri/target/release/bundle/appimage/downman_0.1.2_amd64.AppImage
 
 ## Install the browser extension
 
-- **Chromium** (Chrome/Brave/Edge): `chrome://extensions` → enable *Developer mode* → *Load unpacked* → select `extensions/`.
-- **Firefox**: `about:debugging#/runtime/this-firefox` → *Load Temporary Add‑on* → select `extensions/manifest.json`.
+Run `npm run build:ext`, then:
+
+- **Chromium** (Chrome/Brave/Edge): extract `extensions/DownMan.zip`, open `chrome://extensions`,
+  enable *Developer mode*, choose *Load unpacked*, and select the extracted folder.
+- **Firefox (temporary/development)**: open `about:debugging#/runtime/this-firefox`, choose
+  *Load Temporary Add‑on*, and select `extensions/DownMan.xpi`. Permanent Firefox installation
+  requires an AMO-signed XPI.
 
 The extension defaults to the app endpoint `http://127.0.0.1:6802` (configurable in its options page).
 

@@ -19,7 +19,7 @@ See [`0000-template.md`](0000-template.md). Status is one of:
 | 0002 | [Download engine: aria2 via JSON‑RPC](0002-download-engine-aria2.md) | Accepted |
 | 0003 | [Frontend stack](0003-frontend-stack.md)                          | Accepted |
 | 0004 | [Browser↔app bridge over local HTTP](0004-browser-bridge.md)       | Accepted |
-| 0005 | [Smart media capture UX](0005-smart-media-capture.md)             | Accepted |
+| 0005 | [Smart media capture UX](0005-smart-media-capture.md)             | Superseded in 0.1.3 |
 | 0006 | [File organization by category](0006-file-organization.md)        | Accepted |
 | 0007 | [HLS/DASH capture via ffmpeg](0007-hls-dash-ffmpeg.md)            | Accepted |
 | 0008 | [Release build profile (no LTO)](0008-release-build-profile.md)   | Accepted |

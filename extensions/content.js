@@ -1,7 +1,5 @@
-// DownMan content script.
-//   1) A per-<video> "⤓ Download" button that appears on hover — targets the exact
-//      video you point at (not the whole page), with a dynamic real-quality menu.
-//   2) A secondary floating pill (top frame only) for sniffed background streams.
+// DownMan content script: a per-media Download button that targets the exact
+// video or audio under the pointer. YouTube also gets an explicit quality menu.
 
 const Z = 2147483647;
 const TOP = window.top === window;
@@ -32,7 +30,7 @@ function rt(msg, cb) {
 }
 
 /* ============================ per-video button ============================ */
-let btn, menu, target = null, hideT = null, menuOpen = false, prefetching = null, suppressed = null;
+let btn, menu, target = null, hideT = null, menuOpen = false, suppressed = null;
 let curTitle = ""; // title of the last-rendered format list (sent with the pick)
 // Cache the (slow) yt-dlp format lookups so re-opening the menu is instant.
 const fmtCache = new Map(); // url -> { formats, title, ts }
@@ -53,9 +51,6 @@ function worthy(v) {
   if (v.closest && v.closest("a[href]")) return false;
   return true;
 }
-
-// A direct src worth grabbing as-is: an http(s) URL that looks like a real media file.
-const MEDIA_SRC_RE = /\.(mp4|m4v|webm|mkv|mov|m4a|mp3|aac|flac|ogg|wav|opus|ts)(\?|$)/i;
 
 // Any directly-downloadable file (video OR image) — gifs/images/progressive video
 // should go straight to aria2 rather than through yt-dlp.
@@ -100,12 +95,17 @@ function build() {
   // never blocks the player's own controls on an embed we can't escape.
   const lbl = el("span", "display:inline-flex;align-items:center;gap:6px", '<span style="font-size:15px;line-height:1">⤓</span> Download');
   lbl.className = "dm-lbl";
+  const quality = el("span", "display:none;padding-left:7px;border-left:1px solid rgba(255,255,255,.4);font-size:11px;line-height:1", "Quality ▾");
+  quality.className = "dm-quality";
+  quality.title = "Choose YouTube quality";
+  quality.onclick = (e) => { e.stopPropagation(); e.preventDefault(); openMenu(); };
   const x = el("span", "padding-left:7px;border-left:1px solid rgba(255,255,255,.4);opacity:.9;font-size:13px;line-height:1", "✕");
   x.title = "Hide (lets you use the player's controls)";
   x.onclick = (e) => { e.stopPropagation(); e.preventDefault(); dismissBtn(); };
   btn.appendChild(lbl);
+  btn.appendChild(quality);
   btn.appendChild(x);
-  btn.onmouseenter = () => { clearTimeout(hideT); prefetchFormats(); };
+  btn.onmouseenter = () => clearTimeout(hideT);
   btn.onmouseleave = scheduleHide;
   btn.onclick = onClick;
 
@@ -130,6 +130,8 @@ function showFor(v) {
   target = v;
   menu.style.display = "none";
   setLabel('<span style="font-size:15px;line-height:1">⤓</span> Download');
+  const quality = btn.querySelector(".dm-quality");
+  if (quality) quality.style.display = supportsExactQuality(scoped()) ? "inline-flex" : "none";
   btn.style.display = "flex";
   const r = v.getBoundingClientRect();
   const bh = btn.offsetHeight || 34;
@@ -187,17 +189,52 @@ function bestSiteUrl(m) {
     const post = m.closest("[permalink]");
     const pl = post && post.getAttribute("permalink");
     if (pl) { try { return new URL(pl, location.origin).href; } catch (_) { /* ignore */ } }
+    const status = statusUrlFor(m);
+    if (status) return status;
     const a = m.closest("a[href]");
     if (a && /^https?:/i.test(a.href) && a.href !== location.href && !/\/media\?url=/i.test(a.href)) return a.href;
   }
   return location.href;
 }
 
+function statusUrlFor(node) {
+  const article = node && node.closest && node.closest("article, [data-testid='tweet']");
+  const status = article && article.querySelector("a[href*='/status/']");
+  return status && /^https?:/i.test(status.href) ? status.href : null;
+}
+
 // Resolve the best download target for a right-clicked media element.
 function resolveMediaUrl(m) {
   const file = directFileFor(m);
   if (file) return { kind: "file", url: file };
+  const src = (m && (m.currentSrc || m.src)) || "";
+  if (/^https?:/i.test(src)) return { kind: "file", url: src };
   return { kind: "site", url: m && TOP ? bestSiteUrl(m) : location.href };
+}
+
+function supportsExactQuality(url) {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host === "youtu.be" || host === "youtube.com" || host.endsWith(".youtube.com")
+      || host === "youtube-nocookie.com" || host.endsWith(".youtube-nocookie.com");
+  } catch (_) {
+    return false;
+  }
+}
+
+function supportsSiteDownload(url) {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    const sites = [
+      "youtube.com", "youtube-nocookie.com", "youtu.be", "vimeo.com", "dailymotion.com", "tiktok.com",
+      "instagram.com", "twitter.com", "x.com", "facebook.com", "fb.watch",
+      "twitch.tv", "soundcloud.com", "bandcamp.com", "reddit.com", "streamable.com",
+      "bilibili.com", "nicovideo.jp", "ok.ru", "rutube.ru", "vk.com", "odysee.com",
+    ];
+    return sites.some((site) => host === site || host.endsWith("." + site));
+  } catch (_) {
+    return false;
+  }
 }
 
 // Remember what the user right-clicked so the context-menu handler can resolve a
@@ -219,6 +256,7 @@ document.addEventListener(
       const post = t.closest("[permalink]");
       const pl = post && post.getAttribute("permalink");
       if (pl) { try { url = new URL(pl, location.origin).href; } catch (_) { /* ignore */ } }
+      if (!url) url = statusUrlFor(t);
       // A media-viewer link in the click ancestry (e.g. Reddit's /media?url=…).
       const a = t.closest("a[href]");
       if (a) {
@@ -238,16 +276,15 @@ document.addEventListener(
 function onClick() {
   const v = target;
   if (!v) return;
-  const s = v.currentSrc || v.src || "";
-  // Only the media's OWN direct file is a safe fast-path (aria2). A nearby wrapper
-  // link may be a gif *reference* for a video whose real download is an mp4 — those
-  // go through yt-dlp on the permalink via openMenu().
-  if (/^https?:/i.test(s) && DIRECT_FILE_RE.test(s)) {
-    setLabel("Sending…");
-    rt({ dm: "file", url: s, referer: location.href }, done);
-    return;
+  const resolved = resolveMediaUrl(v);
+  setLabel("Sending…");
+  if (resolved.kind === "file") {
+    rt({ dm: "file", url: resolved.url, referer: location.href }, done);
+  } else if (!supportsSiteDownload(resolved.url)) {
+    rt({ dm: "media-download", url: resolved.url, referer: location.href }, done);
+  } else {
+    rt({ dm: "site", url: resolved.url, format: "best", referer: location.href }, done);
   }
-  openMenu();
 }
 
 function openMenu() {
@@ -348,24 +385,6 @@ function onDocDown(e) {
 function onKeyDown(e) {
   if (e.key === "Escape") closeMenu();
 }
-// Warm the format cache when the user hovers the Download button (a clear intent
-// signal) so the first click opens instantly instead of waiting on yt-dlp.
-function prefetchFormats() {
-  const v = target;
-  if (!v) return;
-  const src = v.currentSrc || v.src || "";
-  if (/^https?:/i.test(src) && !/^blob:/i.test(src) && MEDIA_SRC_RE.test(src)) return; // direct file needs no lookup
-  const url = scoped();
-  const cached = fmtCache.get(url);
-  if (cached && Date.now() - cached.ts < FMT_TTL) return;
-  if (prefetching === url) return;
-  prefetching = url;
-  rt({ dm: "formats", url, referer: location.href }, (res) => {
-    prefetching = null;
-    if (res && res.ok) fmtCache.set(url, { formats: res.formats || [], title: res.title || "", ts: Date.now() });
-  });
-}
-
 // Hover detection (delegated; cheap) + keep the button glued while scrolling.
 function isMedia(t) {
   return t && (t.tagName === "VIDEO" || t.tagName === "AUDIO");
@@ -421,33 +440,6 @@ window.addEventListener(
   },
   true
 );
-
-/* ===================== secondary pill (top frame only) ==================== */
-let pill;
-function ensurePill() {
-  if (pill) return;
-  pill = el(
-    "div",
-    "position:fixed;right:18px;bottom:18px;z-index:" + Z +
-      ";backdrop-filter:blur(12px);background:rgba(17,20,33,.85);color:#fff;border:1px solid rgba(255,255,255,.1);" +
-      "border-radius:999px;padding:8px 14px;font:600 13px Inter,system-ui;box-shadow:0 8px 30px -8px rgba(31,147,255,.6);" +
-      "cursor:pointer;display:none;gap:8px;align-items:center",
-    '<span style="color:#f04ec0">●</span> DownMan: <span id="dm-n">0</span> streams'
-  );
-  pill.onclick = () =>
-    rt({ dm: "list", tabId: -1 }, (items) => {
-      if (Array.isArray(items) && items[0]) rt({ dm: "grab", url: items[0].url, referer: location.href });
-    });
-  document.body.appendChild(pill);
-}
-chrome.runtime.onMessage.addListener((m) => {
-  if (m.dm !== "media" || !TOP) return;
-  ensurePill();
-  pill.querySelector("#dm-n").textContent = m.count;
-  pill.style.display = "flex";
-  clearTimeout(window.__dmT);
-  window.__dmT = setTimeout(() => (pill.style.display = "none"), 6000);
-});
 
 // Collect every sizeable image + direct image link on the page (the "grab all" feature).
 function scanImages() {
