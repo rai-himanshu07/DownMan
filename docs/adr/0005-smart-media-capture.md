@@ -38,5 +38,6 @@ No per‑element overlays are ever injected.
 
 The visible badge, floating pill, and popup stream list were superseded by a single per‑media
 **Download** control. Network detection remains internal as a frame‑scoped fallback for blob/MSE
-players; YouTube alone exposes an explicit quality menu. This preserves passive detection without
-maintaining a second capture workflow.
+players; some sites expose an explicit quality menu. This preserves passive detection without
+maintaining a second capture workflow. The first frame-scoped newest-response implementation was
+subsequently superseded by the intent/candidate resolver in [ADR-0013](0013-host-agnostic-media-resolver.md).

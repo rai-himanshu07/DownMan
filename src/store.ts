@@ -10,6 +10,8 @@ export type View = "all" | "active" | "unfinished" | "completed" | "media" | "si
 export type Category = "video" | "audio" | "image" | "doc" | "archive" | "torrent" | "other";
 
 const organized = new Set<string>();
+const statusOverrides = new Map<string, { status: Aria2Task["status"]; expiresAt: number }>();
+const replacingGids = new Set<string>();
 
 // Track which failed downloads we've already surfaced so each failure toasts once.
 const toastedErrors = new Set<string>();
@@ -32,7 +34,7 @@ function surfaceErrors(tasks: Aria2Task[]) {
     toast.error(
       `Download failed: ${taskName(t)}`,
       t.errorMessage || undefined,
-      url ? { label: "Retry", run: () => { api.add([url]).catch(() => {}); } } : undefined,
+      url ? { label: "Retry", run: () => { useStore.getState().retryTask(t.gid).catch(() => {}); } } : undefined,
     );
   }
 }
@@ -117,6 +119,9 @@ interface State {
   toggleSelected: (gid: string) => void;
   setSelected: (gids: string[]) => void;
   clearSelected: () => void;
+  pauseTask: (gid: string) => Promise<void>;
+  resumeTask: (gid: string) => Promise<void>;
+  retryTask: (gid: string, cookies?: string) => Promise<void>;
   poll: () => Promise<void>;
 }
 
@@ -165,6 +170,56 @@ export const useStore = create<State>((set) => ({
   }),
   setSelected: (gids) => set({ selected: new Set(gids) }),
   clearSelected: () => set({ selected: new Set<string>() }),
+  pauseTask: async (gid) => {
+    let previous: Aria2Task["status"] | undefined;
+    statusOverrides.set(gid, { status: "paused", expiresAt: Date.now() + 5000 });
+    set((state) => ({
+      tasks: state.tasks.map((task) => {
+        if (task.gid !== gid) return task;
+        previous = task.status;
+        return { ...task, status: "paused", downloadSpeed: "0" };
+      }),
+    }));
+    try {
+      await api.pause(gid);
+    } catch (error) {
+      statusOverrides.delete(gid);
+      if (previous) set((state) => ({ tasks: state.tasks.map((task) => task.gid === gid ? { ...task, status: previous as Aria2Task["status"] } : task) }));
+      throw error;
+    }
+  },
+  resumeTask: async (gid) => {
+    let previous: Aria2Task["status"] | undefined;
+    statusOverrides.set(gid, { status: "active", expiresAt: Date.now() + 5000 });
+    set((state) => ({
+      tasks: state.tasks.map((task) => {
+        if (task.gid !== gid) return task;
+        previous = task.status;
+        return { ...task, status: "active" };
+      }),
+    }));
+    try {
+      await api.resume(gid);
+    } catch (error) {
+      statusOverrides.delete(gid);
+      if (previous) set((state) => ({ tasks: state.tasks.map((task) => task.gid === gid ? { ...task, status: previous as Aria2Task["status"] } : task) }));
+      throw error;
+    }
+  },
+  retryTask: async (gid, cookies) => {
+    const previous = useStore.getState().tasks.find((task) => task.gid === gid);
+    if (!previous) return;
+    replacingGids.add(gid);
+    set((state) => ({ tasks: state.tasks.filter((task) => task.gid !== gid) }));
+    try {
+      await api.retryDownload(gid, cookies);
+      await useStore.getState().poll();
+    } catch (error) {
+      replacingGids.delete(gid);
+      set((state) => ({ tasks: state.tasks.some((task) => task.gid === gid) ? state.tasks : [...state.tasks, previous] }));
+      throw error;
+    }
+  },
   poll: async () => {
     try {
       const s = await api.snapshot();
@@ -172,9 +227,20 @@ export const useStore = create<State>((set) => ({
       const histGids = new Set(history.map((h) => h.gid));
       // History is the source of truth for completed items; drop live duplicates.
       const live = [...s.active, ...s.waiting, ...(s.site ?? []), ...s.stopped].filter((t) => !histGids.has(t.gid));
-      const allTasks = [...live, ...history];
+      const now = Date.now();
+      const allTasks = [...live, ...history].filter((task) => !replacingGids.has(task.gid)).map((task) => {
+        const override = statusOverrides.get(task.gid);
+        if (!override) return task;
+        if (task.status === override.status || override.expiresAt <= now) {
+          statusOverrides.delete(task.gid);
+          return task;
+        }
+        return { ...task, status: override.status, downloadSpeed: override.status === "paused" ? "0" : task.downloadSpeed };
+      });
       surfaceErrors(allTasks);
       surfaceCompletions(allTasks);
+      const present = new Set(allTasks.map((task) => task.gid));
+      for (const gid of [...replacingGids]) if (!present.has(gid)) replacingGids.delete(gid);
       set({
         tasks: allTasks,
         pending: s.pending ?? [],

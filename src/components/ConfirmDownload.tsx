@@ -16,7 +16,8 @@ export default function ConfirmDownload({ item, onDone }: { item: PendingItem; o
   const [remember, setRemember] = useState(false);
   const [busy, setBusy] = useState(false);
   const cats = useStore((s) => s.categories);
-  const isSite = item.kind === "site" || item.kind === "stream";
+  const isSite = item.kind === "site" || item.kind === "stream" || item.kind === "media";
+  const isBrowserLocal = item.kind === "browser-local";
 
   useEffect(() => {
     api.info().then((i) => setBase(i.dir)).catch(() => {});
@@ -48,7 +49,8 @@ export default function ConfirmDownload({ item, onDone }: { item: PendingItem; o
       }
     }
     try {
-      const gid = await api.confirmPending(item.id, filename.trim(), effectiveDir, paused);
+      const submittedName = isSite && !touchedName ? "" : filename.trim();
+      const gid = await api.confirmPending(item.id, submittedName, effectiveDir, paused);
       markOrganized(gid); // honour the chosen folder; don't let auto-sort move it
     } catch {
       /* ignore */
@@ -134,8 +136,8 @@ export default function ConfirmDownload({ item, onDone }: { item: PendingItem; o
 
         <div className="flex justify-end gap-2 mt-4">
           <button className="btn-ghost" disabled={busy} onClick={() => { api.cancelPending(item.id).catch(() => {}); onDone(); }}>Cancel</button>
-          {!isSite && <button className="btn-ghost" disabled={busy} onClick={() => go(true)} title="Add but don't start yet">Download later</button>}
-          <button className="btn-primary" disabled={busy} onClick={() => go(false)}><I.Play className="w-4 h-4" /> Download</button>
+          {!isSite && !isBrowserLocal && <button className="btn-ghost" disabled={busy} onClick={() => go(true)} title="Add but don't start yet">Download later</button>}
+          <button className="btn-primary" disabled={busy} onClick={() => go(false)}><I.Play className="w-4 h-4" /> {isBrowserLocal ? "Import" : "Download"}</button>
         </div>
       </div>
     </div>

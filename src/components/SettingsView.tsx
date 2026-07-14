@@ -222,7 +222,7 @@ export default function SettingsView() {
 
   function resetRules() {
     setRulesOn(true);
-    setAutoExts("3GP 7Z AAC ACE AIF APK ARJ ASF AVI BIN BZ2 EXE GZ GZIP IMG ISO LZH M4A M4V MKV MOV MP3 MP4 MPA MPE MPEG MPG MSI MSU OGG OGV PDF PLJ PPS PPT QT RA RAR RM RMVB SEA SIT SITX TAR TIF TIFF WAV WMA WMV Z ZIP");
+    setAutoExts("3GP 7Z AAC ACE AIF APK ARJ ASF AVI BIN BZ2 DEB EXE GZ GZIP IMG ISO LZH M4A M4V MD MKV MOV MP3 MP4 MPA MPE MPEG MPG MSI MSU OGG OGV PDF PLJ PPS PPT QT RA RAR RM RMVB SEA SIT SITX TAR TIF TIFF WAV WMA WMV Z ZIP");
     setBlockSites("*.update.microsoft.com\ndownload.windowsupdate.com\n*.download.windowsupdate.com\nsiteseal.thawte.com\necom.cimetz.com\n*.voice2page.com");
     setBlockAddr("");
     setRulesMsg("Reset \u2014 click Save to apply");
@@ -298,11 +298,11 @@ export default function SettingsView() {
   }
 
   return (
-    <div className="settings-console max-w-3xl">
-      <div className="flex flex-wrap gap-1 mb-4 border-b border-white/10">
+    <div className="settings-console w-full max-w-none">
+      <div className="flex overflow-x-auto mb-4 border-b border-white/10">
         {TABS.map(([id, label]) => (
           <button key={id} onClick={() => setTab(id)}
-            className={clsx("px-3 py-2 text-[11px] font-mono uppercase whitespace-nowrap border-b-2 -mb-px", tab === id ? "border-aurora-400 text-white" : "border-transparent text-slate-500 hover:text-slate-300")}>
+            className={clsx("flex-1 min-w-max px-3 py-2 text-[11px] font-mono uppercase whitespace-nowrap text-center border-b-2 -mb-px", tab === id ? "border-aurora-400 text-white" : "border-transparent text-slate-500 hover:text-slate-300")}>
             {label}
           </button>
         ))}
@@ -574,6 +574,7 @@ export default function SettingsView() {
           <label className="text-sm text-slate-400">Auto-download these file types</label>
           <textarea value={autoExts} onChange={(e) => setAutoExts(e.target.value)} placeholder="ISO ZIP MP4 PDF …"
             className="mt-1 w-full h-20 bg-ink-900/60 border border-white/5 rounded-lg px-3 py-2 text-sm font-mono placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-aurora-500/50 resize-none" />
+          <div className="text-[11px] text-slate-600 mt-1">Add any extension separated by spaces or new lines; <code>.pkg</code>, <code>pkg</code>, and <code>PKG</code> are equivalent after saving.</div>
         </div>
         <div>
           <label className="text-sm text-slate-400">Don’t auto-capture from these sites (one per line, * allowed)</label>

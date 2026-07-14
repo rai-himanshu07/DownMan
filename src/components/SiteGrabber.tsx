@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, GrabFile, GrabState } from "../lib/api";
 import { I } from "./icons";
+import { toast } from "../lib/toast";
 
 const IMG_RE = /\.(jpe?g|png|gif|webp|svg|bmp|ico|avif)$/i;
 
@@ -46,6 +47,9 @@ export default function SiteGrabber({ onClose, initialUrl }: { onClose: () => vo
   const [referer, setReferer] = useState("");
   const [cookies, setCookies] = useState("");
   const [showAdv, setShowAdv] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [startError, setStartError] = useState("");
+  const [downloadError, setDownloadError] = useState("");
 
   const [grabId, setGrabId] = useState("");
   const [state, setState] = useState<GrabState>({ status: "exploring", pages: 0, total: 0, files: [] });
@@ -67,6 +71,8 @@ export default function SiteGrabber({ onClose, initialUrl }: { onClose: () => vo
 
   function doExplore() {
     if (!url.trim()) return;
+    setStartError("");
+    setStarting(true);
     localStorage.setItem("dm-grab-url", url.trim());
     setPendingExplore(false);
     const project = {
@@ -82,7 +88,14 @@ export default function SiteGrabber({ onClose, initialUrl }: { onClose: () => vo
       referer: referer.trim(),
       cookies: cookies.trim(),
     };
-    api.grabberStart(project).then((id) => { setGrabId(id); setPhase("results"); }).catch(() => {});
+    api.grabberStart(project)
+      .then((id) => { setGrabId(id); setPhase("results"); })
+      .catch((error) => {
+        const message = String(error).replace(/^Error:\s*/, "") || "The site grab could not be started.";
+        setStartError(message);
+        toast.error("Could not start Site Grabber", message);
+      })
+      .finally(() => setStarting(false));
   }
 
   useEffect(() => {
@@ -93,7 +106,11 @@ export default function SiteGrabber({ onClose, initialUrl }: { onClose: () => vo
         if (stop) return;
         setState(s);
         if (s.status === "exploring") pollRef.current = window.setTimeout(tick, 800);
-      }).catch(() => {});
+      }).catch((error) => {
+        if (stop) return;
+        const message = String(error).replace(/^Error:\s*/, "") || "Could not read Site Grabber progress.";
+        setState((current) => ({ ...current, status: "error", error: message }));
+      });
     };
     tick();
     return () => { stop = true; if (pollRef.current) clearTimeout(pollRef.current); };
@@ -110,13 +127,43 @@ export default function SiteGrabber({ onClose, initialUrl }: { onClose: () => vo
   function download() {
     const urls = [...checked];
     if (!urls.length) return;
-    api.grabberDownload(grabId, urls).then(() => onClose()).catch(() => {});
+    setDownloadError("");
+    api.grabberDownload(grabId, urls).then((result) => {
+      if (!result.failed) { onClose(); return; }
+      const message = `${result.added} added; ${result.failed} failed. Only failed files remain selected.`;
+      setChecked(new Set(result.failedUrls));
+      setDownloadError(message);
+      toast.error("Some files could not be added", message);
+    }).catch((error) => {
+      const message = String(error).replace(/^Error:\s*/, "") || "The selected files could not be added.";
+      setDownloadError(message);
+      toast.error("Could not add grabbed files", message);
+    });
   }
 
   const statusLabel = state.status === "exploring" ? "Exploring…" : state.status === "done" ? "Done" : state.status === "cancelled" ? "Stopped" : state.status === "error" ? "Error" : state.status;
 
+  const resourceWarning = showResourceWarn && (
+    <div className="fixed inset-0 z-[80] grid place-items-center bg-black/60 backdrop-blur-sm" onClick={() => { setShowResourceWarn(false); setPendingExplore(false); }}>
+      <div className="card w-[440px] max-w-[92vw] p-6 animate-fade-up" onClick={(e) => e.stopPropagation()}>
+        <h2 className="text-lg font-semibold mb-1">Site grab may use extra resources</h2>
+        <p className="text-sm text-slate-400 mb-3">This will crawl the target website and may invoke <b className="text-slate-200">yt-dlp</b> / <b className="text-slate-200">ffmpeg</b>, using significant <b className="text-amber-300">CPU, network, and disk space</b>.</p>
+        <label className="flex items-center gap-2 text-sm text-slate-400 mb-4">
+          <input type="checkbox" onChange={(e) => { if (e.target.checked) localStorage.setItem("dm-site-grab-ok","1"); else localStorage.removeItem("dm-site-grab-ok"); }} />
+          Don&apos;t show this again
+        </label>
+        <div className="flex justify-end gap-2">
+          <button className="btn-ghost" onClick={() => { setShowResourceWarn(false); setPendingExplore(false); }}>Cancel</button>
+          <button className="btn-primary" onClick={() => { setShowResourceWarn(false); if (pendingExplore) doExplore(); }}>Continue</button>
+        </div>
+      </div>
+    </div>
+  );
+
   if (phase === "setup") {
     return (
+      <>
+      {resourceWarning}
       <div className="fixed inset-0 z-[60] grid place-items-center bg-black/60 backdrop-blur-sm animate-fade-up">
         <div className="card w-[680px] max-w-[94vw] max-h-[90vh] overflow-auto p-6">
           <div className="flex items-center gap-3 mb-1">
@@ -184,33 +231,25 @@ export default function SiteGrabber({ onClose, initialUrl }: { onClose: () => vo
             </div>
           )}
 
+          {startError && (
+            <div className="mt-3 border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-200" role="alert">
+              {startError}
+            </div>
+          )}
+
           <div className="flex justify-end gap-2 mt-5">
             <button className="btn-ghost" onClick={onClose}>Cancel</button>
-            <button className="btn-primary" disabled={!url.trim()} onClick={explore}><I.Globe className="w-4 h-4" /> Explore</button>
+            <button className="btn-primary" disabled={!url.trim() || starting} onClick={explore}><I.Globe className="w-4 h-4" /> {starting ? "Starting…" : "Explore"}</button>
           </div>
         </div>
       </div>
+      </>
     );
   }
 
   return (
     <>
-    {showResourceWarn && (
-      <div className="fixed inset-0 z-[80] grid place-items-center bg-black/60 backdrop-blur-sm" onClick={() => { setShowResourceWarn(false); setPendingExplore(false); }}>
-        <div className="card w-[440px] max-w-[92vw] p-6 animate-fade-up" onClick={(e) => e.stopPropagation()}>
-          <h2 className="text-lg font-semibold mb-1">Site grab may use extra resources</h2>
-          <p className="text-sm text-slate-400 mb-3">This will crawl the target website and may invoke <b className="text-slate-200">yt-dlp</b> / <b className="text-slate-200">ffmpeg</b>, using significant <b className="text-amber-300">CPU, network, and disk space</b>.</p>
-          <label className="flex items-center gap-2 text-sm text-slate-400 mb-4">
-            <input type="checkbox" onChange={(e) => { if (e.target.checked) localStorage.setItem("dm-site-grab-ok","1"); else localStorage.removeItem("dm-site-grab-ok"); }} />
-            Don&apos;t show this again
-          </label>
-          <div className="flex justify-end gap-2">
-            <button className="btn-ghost" onClick={() => { setShowResourceWarn(false); setPendingExplore(false); }}>Cancel</button>
-            <button className="btn-primary" onClick={() => { setShowResourceWarn(false); if (pendingExplore) doExplore(); }}>Continue</button>
-          </div>
-        </div>
-      </div>
-    )}
+    {resourceWarning}
     <div className="fixed inset-0 z-[60] grid place-items-center bg-black/60 backdrop-blur-sm animate-fade-up">
       <div className="card w-[940px] max-w-[96vw] h-[82vh] flex flex-col p-0 overflow-hidden">
         <header className="flex items-center gap-3 px-5 py-3 border-b border-white/5">
@@ -218,7 +257,7 @@ export default function SiteGrabber({ onClose, initialUrl }: { onClose: () => vo
           <div className="flex-1 min-w-0">
             <div className="font-semibold text-sm truncate">{url}</div>
             <div className="text-xs text-slate-500">
-              {statusLabel} · {state.pages} pages · {state.total} files{state.total >= 3000 ? "+ (capped)" : ""}
+              {statusLabel} · {state.pages} pages · {state.total} files{state.total >= 3000 ? "+ (capped)" : ""}{state.failedPages ? ` · ${state.failedPages} pages skipped` : ""}
             </div>
           </div>
           {state.status === "exploring" && (
@@ -251,6 +290,16 @@ export default function SiteGrabber({ onClose, initialUrl }: { onClose: () => vo
         </div>
 
         <div className="flex-1 overflow-auto">
+          {state.status === "error" && (
+            <div className="m-3 border border-rose-500/30 bg-rose-500/10 p-3 text-sm text-rose-200" role="alert">
+              {state.error || "The site could not be explored."}
+            </div>
+          )}
+          {downloadError && (
+            <div className="m-3 border border-rose-500/30 bg-rose-500/10 p-3 text-sm text-rose-200" role="alert">
+              {downloadError}
+            </div>
+          )}
           {view === "thumbs" ? (
             <div className="grid grid-cols-[repeat(auto-fill,minmax(120px,1fr))] gap-2 p-3">
               {display.filter((f) => IMG_RE.test(f.url)).map((f) => (
@@ -292,8 +341,23 @@ export default function SiteGrabber({ onClose, initialUrl }: { onClose: () => vo
           {shown.length > display.length && (
             <div className="px-3 py-2 text-xs text-slate-500">Showing first {display.length} of {shown.length} — refine filters to narrow.</div>
           )}
-          {state.status !== "exploring" && shown.length === 0 && (
-            <div className="h-full grid place-items-center text-slate-500 text-sm">No matching files found.</div>
+          {state.status === "done" && state.files.length === 0 && (
+            <div className="h-full grid place-items-center px-8 text-center">
+              <div className="max-w-lg">
+                <div className="text-sm text-slate-300">No direct files were exposed by this page.</div>
+                <p className="mt-2 text-xs text-slate-500">
+                  Some social sites often load media through JavaScript and signed session requests. Play the video and use the Download button on the media, or right-click the media and choose Download with DownMan.
+                </p>
+              </div>
+            </div>
+          )}
+          {state.status === "done" && state.files.length > 0 && shown.length === 0 && (
+            <div className="h-full grid place-items-center px-8 text-center">
+              <div>
+                <div className="text-sm text-slate-300">No files match this filter.</div>
+                <button className="mt-3 btn-ghost text-xs" onClick={() => setTypeFilter("")}>Clear type filter</button>
+              </div>
+            </div>
           )}
         </div>
       </div>

@@ -1,7 +1,7 @@
 {
   "name": "downman",
   "private": true,
-  "version": "0.1.3",
+  "version": "1.0.0",
   "type": "module",
   "description": "DownMan — a modern aria2-powered download manager for Linux",
   "license": "MIT",
@@ -17,6 +17,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test:media": "node --test tests/media-resolver.test.mjs tests/background-resolver.test.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
     "app": "tauri dev",

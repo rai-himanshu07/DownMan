@@ -908,7 +908,7 @@ dependencies = [
 
 [[package]]
 name = "downman"
-version = "0.1.3"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "arboard",

@@ -31,7 +31,7 @@ rm -rf "$ART_DIR"
 
 # Stage a Firefox package with an event-page (background.scripts) manifest — the
 # source manifest is Chrome-native (service_worker), which Firefox won't accept.
-FILES=(background.js content.js options.html options.js popup.html popup.js
+FILES=(background.js media-resolver.js content.js options.html options.js popup.html popup.js
        icon16.png icon32.png icon48.png icon128.png)
 FF="$(mktemp -d)"
 trap 'rm -rf "$FF"' EXIT
@@ -39,7 +39,9 @@ cp "${FILES[@]/#/$EXT_DIR/}" "$FF/"
 python3 - "$EXT_DIR/manifest.json" "$FF/manifest.json" <<'PY'
 import json, sys
 m = json.load(open(sys.argv[1]))
-m["background"] = {"scripts": ["background.js"]}
+m.pop("key", None)
+m["background"] = {"scripts": ["media-resolver.js", "background.js"]}
+m["permissions"] = [p for p in m.get("permissions", []) if p not in ("downloads.shelf", "downloads.ui")]
 json.dump(m, open(sys.argv[2], "w"), indent=2)
 PY
 

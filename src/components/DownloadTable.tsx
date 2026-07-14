@@ -1,27 +1,36 @@
 import { Fragment, useMemo, useState } from "react";
 import clsx from "clsx";
-import { Aria2Task, CategoryDef, api } from "../lib/api";
+import { Aria2Task, CategoryDef } from "../lib/api";
 import { fmtBytes, fmtSpeed, eta } from "../lib/format";
-import { useStore, metaOf, categoryNameOf, queueOf, taskUrl } from "../store";
+import { useStore, metaOf, categoryNameOf } from "../store";
 import { I } from "./icons";
 import { RowMenu, DetailsPanel, VerifyBadge, MissingBadge, RetryBadge } from "./downloadShared";
 
-type SortKey = "name" | "size" | "status" | "speed" | "eta" | "category";
+type SortKey = "name" | "size" | "status" | "datetime" | "category";
 
 function sortVal(t: Aria2Task, key: SortKey, cats: CategoryDef[]): string | number {
   const { name } = metaOf(t);
   const total = +t.totalLength || 0;
   const done = +t.completedLength || 0;
-  const speed = +t.downloadSpeed || 0;
   switch (key) {
     case "name": return name.toLowerCase();
     case "size": return total;
     case "status": return total ? done / total : 0;
-    case "speed": return speed;
-    case "eta": return speed > 0 ? (total - done) / speed : t.status === "complete" ? -1 : Infinity;
+    case "datetime": return t.completedAt || t.addedAt || 0;
     case "category": return categoryNameOf(name, cats).toLowerCase();
     default: return 0;
   }
+}
+
+function taskDate(t: Aria2Task): string {
+  const timestamp = t.completedAt || t.addedAt;
+  if (!timestamp) return "—";
+  return new Date(timestamp).toLocaleString([], {
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function statusLabel(t: Aria2Task, pct: number): string {
@@ -37,8 +46,6 @@ function statusLabel(t: Aria2Task, pct: number): string {
 
 export default function DownloadTable({ rows }: { rows: Aria2Task[] }) {
   const categories = useStore((s) => s.categories);
-  const queues = useStore((s) => s.queues);
-  const queueMap = useStore((s) => s.queueMap);
   const selected = useStore((s) => s.selected);
   const toggleSelected = useStore((s) => s.toggleSelected);
   const setSelected = useStore((s) => s.setSelected);
@@ -73,14 +80,22 @@ export default function DownloadTable({ rows }: { rows: Aria2Task[] }) {
     { k: "name", label: "Name", cls: "w-full" },
     { k: "size", label: "Size" },
     { k: "status", label: "Status" },
-    { k: "speed", label: "Speed" },
-    { k: "eta", label: "Time left" },
+    { k: "datetime", label: "Date/time" },
     { k: "category", label: "Category" },
   ];
 
   return (
     <div className="card p-0 overflow-x-auto">
-      <table className="w-full text-sm min-w-[680px]">
+      <table className="w-full text-sm min-w-[700px] table-fixed">
+        <colgroup>
+          <col className="w-9" />
+          <col />
+          <col className="w-20" />
+          <col className="w-36" />
+          <col className="w-36" />
+          <col className="w-24" />
+          <col className="w-24" />
+        </colgroup>
         <thead className="text-xs text-slate-500 border-b border-white/5">
           <tr>
             <th className="px-3 py-2 w-8">
@@ -96,7 +111,6 @@ export default function DownloadTable({ rows }: { rows: Aria2Task[] }) {
                 {sortKey === c.k && <span className="ml-1 text-aurora-300">{dir === 1 ? "▲" : "▼"}</span>}
               </th>
             ))}
-            <th className="px-3 py-2 text-left font-medium whitespace-nowrap">Queue</th>
             <th className="px-3 py-2"></th>
           </tr>
         </thead>
@@ -122,7 +136,7 @@ export default function DownloadTable({ rows }: { rows: Aria2Task[] }) {
                   <td className="px-3 py-2" onClick={(e) => e.stopPropagation()}>
                     <input type="checkbox" checked={selected.has(t.gid)} onChange={() => toggleSelected(t.gid)} />
                   </td>
-                  <td className="px-3 py-2 max-w-0">
+                  <td className="px-3 py-2 min-w-0">
                     {canExpand ? (
                       <button className="flex items-center gap-2 w-full min-w-0 text-left" onClick={() => setOpen((o) => (o === t.gid ? null : t.gid))}>
                         <I.Down className={clsx("w-3.5 h-3.5 shrink-0 text-slate-500 transition-transform", expanded && "rotate-180")} />
@@ -134,31 +148,17 @@ export default function DownloadTable({ rows }: { rows: Aria2Task[] }) {
                   </td>
                   <td className="px-3 py-2 whitespace-nowrap text-slate-400 tabular-nums">{total ? fmtBytes(total) : "—"}</td>
                   <td className="px-3 py-2 whitespace-nowrap">
-                    <div className="flex items-center gap-2">
-                      <div className="dm-progress-track w-16 h-1.5 overflow-hidden shrink-0">
-                        <div
-                          className={clsx("h-full", completed ? "bg-lime-500" : t.status === "error" ? "bg-rose-500" : "dm-progress-active")}
-                          style={{ width: `${pct}%` }}
-                        />
-                      </div>
-                      <span className="text-xs text-slate-400 tabular-nums w-12">{statusLabel(t, pct)}</span>
+                    <div className="min-w-0">
+                      <span className={clsx("text-xs tabular-nums", completed ? "text-lime-400" : t.status === "error" ? "text-rose-400" : t.status === "paused" ? "text-amber-300" : "text-slate-300")}>{statusLabel(t, pct)}</span>
+                      {active && <div className="mt-0.5 text-[10px] text-slate-500 tabular-nums truncate" title={`${fmtSpeed(speed)} · ${eta(total, done, speed)}`}>{fmtSpeed(speed)} · {eta(total, done, speed)}</div>}
                       {completed && (t.dmMissing ? <MissingBadge /> : <VerifyBadge status={t.dmVerify} />)}
                       {!completed && t.dmRetry ? <RetryBadge n={t.dmRetry} /> : null}
                     </div>
                   </td>
-                  <td className="px-3 py-2 whitespace-nowrap text-slate-400 tabular-nums">{active ? fmtSpeed(speed) : "—"}</td>
-                  <td className="px-3 py-2 whitespace-nowrap text-slate-400 tabular-nums">{active ? eta(total, done, speed) : "—"}</td>
-                  <td className="px-3 py-2 whitespace-nowrap text-slate-400">{categoryNameOf(name, categories)}</td>
-                  <td className="px-3 py-2 whitespace-nowrap">
-                    <select
-                      value={queueOf(t, queueMap)}
-                      onChange={(e) => api.assignQueue(taskUrl(t), e.target.value).catch(() => {})}
-                      onClick={(e) => e.stopPropagation()}
-                      className="appearance-none bg-ink-900/60 border border-white/5 rounded px-2 py-1 text-xs text-slate-300 focus:outline-none focus:ring-1 focus:ring-aurora-500/50"
-                    >
-                      {queues.map((q) => <option key={q.id} value={q.id}>{q.name}</option>)}
-                    </select>
+                  <td className="px-3 py-2 whitespace-nowrap text-slate-400 tabular-nums" title={(t.completedAt || t.addedAt) ? new Date(t.completedAt || t.addedAt || 0).toLocaleString() : undefined}>
+                    {taskDate(t)}
                   </td>
+                  <td className="px-3 py-2 whitespace-nowrap text-slate-400">{categoryNameOf(name, categories)}</td>
                   <td className="px-3 py-2 w-px whitespace-nowrap">
                     <div className="flex justify-end">
                       <RowMenu t={t} name={name} category={categoryNameOf(name, categories)} total={total} detailsOpen={expanded} onToggleDetails={() => setOpen((o) => (o === t.gid ? null : t.gid))} />
@@ -167,7 +167,7 @@ export default function DownloadTable({ rows }: { rows: Aria2Task[] }) {
                 </tr>
                 {expanded && (
                   <tr>
-                    <td colSpan={9} className="p-3 bg-ink-900/40 border-b border-white/5">
+                    <td colSpan={7} className="p-3 bg-ink-900/40 border-b border-white/5">
                       <DetailsPanel t={t} />
                     </td>
                   </tr>

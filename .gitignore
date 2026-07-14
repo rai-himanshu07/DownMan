@@ -28,6 +28,11 @@ extensions/DownMan.xpi
 extensions/DownMan-signed.xpi
 .web-ext-artifacts/
 
+# release binaries (staged for GitHub Releases; notes + checksums stay tracked)
+release/**/*.deb
+release/**/*.xpi
+release/**/*.zip
+
 # yt-dlp sidecar copy (generated from binaries/yt-dlp by scripts/prepare_binaries.sh)
 src-tauri/binaries/downman-ytdlp-x86_64-unknown-linux-gnu
 

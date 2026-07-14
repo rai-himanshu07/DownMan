@@ -2,12 +2,12 @@
 
 ## Supported versions
 
-DownMan is pre‑1.0 and ships from a single line of development. Security fixes land on
+DownMan ships from a single line of development. Security fixes land on
 the latest release and `main`; older builds are not maintained.
 
 | Version                 | Supported |
 | ----------------------- | --------- |
-| latest `0.1.x` / `main` | ✅        |
+| latest `1.x` / `main`   | ✅        |
 | anything older          | ❌        |
 
 ## Reporting a vulnerability

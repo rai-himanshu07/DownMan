@@ -36,8 +36,29 @@ function flash(msg, ok = true) {
   // Quick toggle: auto-capture downloads from the browser.
   const intercept = document.getElementById("intercept");
   if (intercept) {
-    chrome.storage.local.get("intercept").then(({ intercept: i }) => { intercept.checked = i === true; });
-    intercept.onchange = () => chrome.storage.local.set({ intercept: intercept.checked });
+    try {
+      const base = await endpoint();
+      const response = await fetch(`${base}/rules`);
+      const captureRules = await response.json();
+      intercept.checked = captureRules.enabled !== false;
+    } catch {
+      intercept.checked = true;
+    }
+    intercept.onchange = async () => {
+      try {
+        const base = await endpoint();
+        const response = await fetch(`${base}/rules`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: intercept.checked }),
+        });
+        if (!response.ok) throw new Error("save failed");
+        chrome.runtime.sendMessage({ dm: "rules-changed" }, () => void chrome.runtime.lastError);
+      } catch {
+        intercept.checked = !intercept.checked;
+        flash("Could not save — is DownMan running?", false);
+      }
+    };
   }
 
   // Live downloads mini-view (polls the local bridge).

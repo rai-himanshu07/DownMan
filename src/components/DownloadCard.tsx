@@ -16,6 +16,9 @@ export default function DownloadCard({ t }: { t: Aria2Task }) {
   const { name, category } = metaOf(t);
   const selected = useStore((s) => s.selected);
   const toggleSelected = useStore((s) => s.toggleSelected);
+  const pauseTask = useStore((s) => s.pauseTask);
+  const resumeTask = useStore((s) => s.resumeTask);
+  const retryTask = useStore((s) => s.retryTask);
   const total = +t.totalLength || 0;
   const done = +t.completedLength || 0;
   const speed = +t.downloadSpeed || 0;
@@ -90,8 +93,8 @@ export default function DownloadCard({ t }: { t: Aria2Task }) {
               <I.More className="w-4 h-4" />
             </button>
           )}
-          {active && <button className="btn-ghost !p-2" title="Pause" onClick={() => api.pause(t.gid)}><I.Pause className="w-4 h-4" /></button>}
-          {paused && <button className="btn-ghost !p-2" title="Resume" onClick={() => api.resume(t.gid)}><I.Play className="w-4 h-4" /></button>}
+          {active && <button className="btn-ghost !p-2" title="Pause" onClick={() => pauseTask(t.gid).catch(() => {})}><I.Pause className="w-4 h-4" /></button>}
+          {paused && <button className="btn-ghost !p-2" title="Resume" onClick={() => resumeTask(t.gid).catch(() => {})}><I.Play className="w-4 h-4" /></button>}
           <button ref={kebabRef} className={`btn-ghost !p-2 ${menuOpen ? "text-aurora-300" : ""}`} title="More actions" onClick={() => (menuOpen ? setMenuOpen(false) : openMenu())}><I.Kebab className="w-4 h-4" /></button>
         </div>
       </div>
@@ -107,7 +110,8 @@ export default function DownloadCard({ t }: { t: Aria2Task }) {
               {completed && hasPath && <MenuItem onClick={() => act(() => api.openPath(path))}>Open file</MenuItem>}
               {hasPath && <MenuItem onClick={() => act(() => api.revealPath(path))}>Open folder</MenuItem>}
               {srcUrl && <MenuItem onClick={() => act(() => navigator.clipboard.writeText(srcUrl))}>Copy link</MenuItem>}
-              {srcUrl && (completed || t.status === "error") && <MenuItem onClick={() => act(() => api.redownload(srcUrl, path))}>Redownload</MenuItem>}
+              {srcUrl && completed && <MenuItem onClick={() => act(() => api.redownload(srcUrl, path))}>Redownload</MenuItem>}
+              {srcUrl && t.status === "error" && <MenuItem onClick={() => act(() => retryTask(t.gid))}>Retry</MenuItem>}
               {completed && hasPath && <MenuItem onClick={() => { setRenameVal(name); setRenaming(true); setMenuOpen(false); }}>Rename…</MenuItem>}
               {completed && hasPath && <MenuItem onClick={doMove}>Move to…</MenuItem>}
               <MenuItem onClick={() => { setShowProps(true); setMenuOpen(false); }}>Properties</MenuItem>
@@ -137,13 +141,13 @@ export default function DownloadCard({ t }: { t: Aria2Task }) {
       )}
       {t.status === "error" && t.dmKind === "site" && srcUrl && (
         <div className="mt-2 flex flex-wrap gap-2">
-          <button className="btn-ghost !py-1 !px-2 text-xs" onClick={() => api.grabSite(srcUrl, "best", undefined, undefined).catch(() => {})}>
+          <button className="btn-ghost !py-1 !px-2 text-xs" onClick={() => retryTask(t.gid).catch(() => {})}>
             Retry
           </button>
           {localStorage.getItem("dm-cookies-browser") && localStorage.getItem("dm-cookies-browser") !== "none" && (
             <button className="btn-ghost !py-1 !px-2 text-xs text-amber-300" onClick={() => {
               const cb = localStorage.getItem("dm-cookies-browser") || undefined;
-              api.grabSite(srcUrl, "best", undefined, cb).catch(() => {});
+              retryTask(t.gid, cb).catch(() => {});
             }}>
               Retry with cookies
             </button>
@@ -151,7 +155,7 @@ export default function DownloadCard({ t }: { t: Aria2Task }) {
           <button className="btn-ghost !py-1 !px-2 text-xs" onClick={async () => {
             toast.info("Updating yt-dlp…", "Fetching the latest version, then retrying.");
             try { await api.updateYtdlp(); } catch { /* fall through to retry anyway */ }
-            api.grabSite(srcUrl, "best", undefined, localStorage.getItem("dm-cookies-browser") || undefined).catch(() => {});
+            retryTask(t.gid, localStorage.getItem("dm-cookies-browser") || undefined).catch(() => {});
           }}>
             Update yt-dlp &amp; retry
           </button>

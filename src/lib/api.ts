@@ -18,6 +18,7 @@ export interface Aria2Task {
   numSeeders?: string;
   followedBy?: string[];
   following?: string;
+  addedAt?: number;
   completedAt?: number;
   errorMessage?: string;
   dmKind?: string;
@@ -95,6 +96,8 @@ export interface GrabFile {
 
 export interface GrabState {
   status: string;
+  error?: string;
+  failedPages?: number;
   pages: number;
   total: number;
   files: GrabFile[];
@@ -193,6 +196,7 @@ export const api = {
   setMeteredPause: (enable: boolean) => invoke("set_metered_pause", { enable }),
   setPowerBlock: (enable: boolean) => invoke("set_power_block", { enable }),
   setSpeedLimitState: (on: boolean, value: string) => invoke("set_speed_limit_state", { on, value }),
+  retryDownload: (gid: string, cookies?: string) => invoke<string>("retry_download", { gid, cookies }),
   redownload: (url: string, path: string) => invoke<string>("redownload", { url, path }),
   clearGone: () => invoke<number>("clear_gone"),
   clearCache: () => invoke<{ bytes: number; files: number }>("clear_cache"),
@@ -216,7 +220,7 @@ export const api = {
   grabberStart: (project: Record<string, unknown>) => invoke<string>("grabber_start", { project }),
   grabberGet: (id: string) => invoke<GrabState>("grabber_get", { id }),
   grabberCancel: (id: string) => invoke("grabber_cancel", { id }),
-  grabberDownload: (id: string, urls: string[]) => invoke("grabber_download", { id, urls }),
+  grabberDownload: (id: string, urls: string[]) => invoke<{ added: number; failed: number; failedUrls: string[] }>("grabber_download", { id, urls }),
 
   // Archive extract / remote web UI
   setAutoExtract: (enable: boolean) => invoke("set_auto_extract", { enable }),

@@ -58,7 +58,7 @@ export default function AboutView() {
     if (!diag) return;
     setCopying(true);
     const text = [
-      `DownMan v0.1.3`,
+      `DownMan v1.0.0`,
       `License: MIT (see LICENSE)`,
       `Engine: aria2`,
       `Download folder: ${diag.dir}`,
@@ -90,7 +90,7 @@ export default function AboutView() {
         <img src="/downman.png" alt="DownMan" className="w-14 h-14 rounded-2xl" />
         <div>
           <div className="text-xl font-bold">DownMan</div>
-          <div className="text-sm text-slate-500">v0.1.3 · aria2 engine · Linux</div>
+          <div className="text-sm text-slate-500">v1.0.0 · aria2 engine · Linux</div>
         </div>
       </div>
 
@@ -98,7 +98,7 @@ export default function AboutView() {
         <h3 className="font-semibold">Diagnostics</h3>
         {diag ? (
           <div className="space-y-1.5 text-sm text-slate-400 font-mono text-xs">
-            <DiagRow label="Version" value="0.1.3 · Linux" />
+            <DiagRow label="Version" value="1.0.0 · Linux" />
             <DiagRow label="License" value="MIT" />
             <DiagRow label="Download folder" value={diag.dir} />
             <DiagRow label="Bridge" value={`${diag.bridgeRunning ? "running" : "offline"} — ${diag.bridgeUrl}`} />

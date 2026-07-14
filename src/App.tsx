@@ -56,7 +56,7 @@ function FilterSelect({ value, onChange, options }: { value: string; onChange: (
 }
 
 export default function App() {
-  const { tasks, pending, view, query, poll, connected, categories, categoryFilter, loadCategories, listMode, queueFilter, queueMap, queues, statusFilter, typeFilter, setStatusFilter, setTypeFilter, liveBg, grabbed, grabRequest, selected, setSelected, clearSelected } = useStore();  const [adding, setAdding] = useState(false);
+  const { tasks, pending, view, query, poll, pauseTask, resumeTask, retryTask, connected, categories, categoryFilter, loadCategories, listMode, queueFilter, queueMap, queues, statusFilter, typeFilter, setStatusFilter, setTypeFilter, liveBg, grabbed, grabRequest, selected, setSelected, clearSelected } = useStore();  const [adding, setAdding] = useState(false);
   const [grabbing, setGrabbing] = useState(false);
   const [grabUrl, setGrabUrl] = useState("");
   const [dragging, setDragging] = useState(false);
@@ -259,7 +259,8 @@ export default function App() {
 
   useEffect(() => {
     if (head && head.status === "ready" && willAuto && catDef) {
-      api.confirmPending(head.id, head.filename, catDef.dir, false)
+      const submittedName = ["site", "stream", "media"].includes(head.kind || "") ? "" : head.filename;
+      api.confirmPending(head.id, submittedName, catDef.dir, false)
         .then((gid) => markOrganized(gid))
         .catch(() => {})
         .finally(() => poll());
@@ -333,8 +334,22 @@ export default function App() {
           <div className="flex items-center gap-2 px-6 py-2 border-b border-white/5 bg-ink-800/50 flex-wrap">
             <span className="text-sm text-slate-200">{selected.size} selected</span>
             <button className="btn-ghost !py-1.5" onClick={() => setSelected(filtered.map((t) => t.gid))}>All ({filtered.length})</button>
+            <button className="btn-ghost !py-1.5" onClick={async () => {
+              for (const gid of selected) {
+                const task = tasks.find((item) => item.gid === gid);
+                if (task?.status === "active") await pauseTask(gid).catch(() => {});
+              }
+              poll();
+            }}><I.Pause className="w-3.5 h-3.5" /> Pause</button>
+            <button className="btn-ghost !py-1.5" onClick={async () => {
+              for (const gid of selected) {
+                const task = tasks.find((item) => item.gid === gid);
+                if (task?.status === "paused") await resumeTask(gid).catch(() => {});
+              }
+              poll();
+            }}><I.Play className="w-3.5 h-3.5" /> Resume</button>
             <button className="btn-ghost !py-1.5" onClick={() => {
-              [...selected].forEach((gid) => { const t = tasks.find((x) => x.gid === gid); if (t?.status === "error") api.add([t.files?.[0]?.uris?.[0]?.uri || ""].filter(Boolean)).catch(() => {}); });
+              [...selected].forEach((gid) => { const t = tasks.find((x) => x.gid === gid); if (t?.status === "error") retryTask(gid).catch(() => {}); });
               clearSelected();
             }}>Retry failed</button>
             <button className="btn-ghost !py-1.5" onClick={async () => {

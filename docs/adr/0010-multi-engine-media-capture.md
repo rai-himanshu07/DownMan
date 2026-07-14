@@ -7,9 +7,9 @@
 
 ## Context
 
-Sending a video *page* URL (e.g. `youtube.com/watch?v=…`) to aria2 just downloads the HTML page
-(observed: a 379 KiB file named `watch`). The real video on YouTube‑class sites is delivered as
-adaptive `googlevideo` DASH chunks with range requests — not a direct file, and not a sniffable
+Sending a video *page* URL (e.g. `example.com/watch?v=…`) to aria2 just downloads the HTML page
+(observed: a 379 KiB file named `watch`). The real video on such sites is delivered as
+adaptive DASH chunks with range requests — not a direct file, and not a sniffable
 `.m3u8`/`.mpd`. No single mechanism captures "video from any website."
 
 ## Decision
@@ -31,7 +31,7 @@ yt‑dlp's `--progress-template`.
 
 ## Boundary (explicit non‑goal)
 
-**DRM‑protected services** (Netflix, Disney+, Spotify, etc.) are **out of scope** — the content is
+**DRM‑protected services** (major streaming platforms) are **out of scope** — the content is
 encrypted and circumventing it violates the DMCA. yt‑dlp refuses such sites and so do we.
 
 ## Alternatives considered
@@ -42,7 +42,7 @@ encrypted and circumventing it violates the DMCA. yt‑dlp refuses such sites an
 
 ## Consequences
 
-- Positive: real one‑click capture from YouTube/Vimeo/X/etc.; quality picker (best/1080/720/audio);
+- Positive: real one‑click capture from supported video sites; quality picker (best/1080/720/audio);
   authenticated content via browser cookies; unified task list.
 - Negative: adds a 39 MB `yt-dlp` binary; site extractors need periodic updates (`yt-dlp -U`);
   yt‑dlp job progress is parsed text (not aria2 RPC), so it's best‑effort.
@@ -58,6 +58,8 @@ encrypted and circumventing it violates the DMCA. yt‑dlp refuses such sites an
 - **Routing is now evidence‑based** (`decide_route`): on top of the `kind`/extension rules above, an
   ambiguous URL is settled by a content‑type `HEAD` probe (media → aria2, page/stream → yt‑dlp), and a
   yt‑dlp “Unsupported URL” on a real file falls back to aria2.
-- **The 0.1.3 browser UX uses one per‑media Download control.** Direct URLs bypass format probing,
-  known extractor sites use their post/page URL, and ordinary blob/MSE players fall back to
-  frame‑scoped network detections. Exact quality selection is explicit and limited to YouTube.
+- **The browser UX uses one per-media Download control.** Since 0.1.4, the extension sends a ranked
+  intent/candidate bundle instead of choosing a post/page URL or newest response. Rust remains the
+  final engine arbiter and advances through the bundle on failure; see
+  [ADR-0013](0013-host-agnostic-media-resolver.md). Exact quality selection remains explicit and
+  limited to sites that expose discrete quality options.

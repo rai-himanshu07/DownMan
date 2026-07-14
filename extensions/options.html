@@ -10,7 +10,8 @@
     <input id="server" placeholder="http://127.0.0.1:6802" />
     <label>Use cookies from browser (for logged-in / age-restricted videos)</label>
     <select id="cookies" style="width:100%;padding:8px;border-radius:8px;border:1px solid #333;background:#111421;color:#fff">
-      <option value="">None</option>
+      <option value="auto">Automatic — this browser (recommended)</option>
+      <option value="none">Don't use cookies</option>
       <option value="chrome">Chrome</option>
       <option value="chromium">Chromium</option>
       <option value="brave">Brave</option>
@@ -18,7 +19,8 @@
       <option value="firefox">Firefox</option>
       <option value="vivaldi">Vivaldi</option>
     </select>
-    <label><input type="checkbox" id="intercept" style="width:auto"> Intercept large browser downloads</label>
+    <label><input type="checkbox" id="intercept" style="width:auto"> Auto-capture configured browser downloads</label>
+    <div id="capture-note" style="margin-top:5px;color:#64748b;font-size:12px">File types are configured in DownMan Settings → Browser interception.</div>
     <script src="options.js"></script>
   </body>
 </html>

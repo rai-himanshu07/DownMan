@@ -57,13 +57,16 @@ That's it! The installer automatically pulls in the two helper tools DownMan nee
 
 - **aria2 engine** — HTTP/FTP, **torrent**, **magnet**, multi‑connection (16 splits/server).
 - **Custom UI** — Tauri 2 + React; dark/light "aurora" design system, ~200–250 MB RAM (system WebView, no Chromium bundle).
-- **One-click media downloads** — a Download button appears on the media you point at; stream
-  detection stays in the background as a fallback for blob/MSE players. HLS/DASH are merged to `.mp4` via ffmpeg.
+- **One-click media downloads** — a Download button appears on the media you point at; a
+  frame-scoped candidate ledger correlates blob/MSE network traffic with that player and asks when
+  multiple sources are equally plausible. HLS/DASH are merged to `.mp4` via ffmpeg.
 - **Site video capture** — page URLs from 1800+ sites are resolved by **yt‑dlp**
-  with optional browser cookies; YouTube also offers an explicit quality picker. DRM sites are not supported.
+  with optional browser cookies; supported video sites also offer an explicit quality picker. DRM sites are not supported.
 - **Auto‑organization** — completed files sorted into `Video / Audio / Images / Documents / Archives / Other`.
-- **Browser bridge** — Chromium + Firefox MV3 extensions talk to the app over a local HTTP endpoint.
-- **Queue control** — pause/resume per item, pause‑all/resume‑all, global speed cap.
+- **Browser bridge** — Chromium + Firefox MV3 extensions talk to the app over a local HTTP endpoint
+  and capture configured file types such as ZIP/EXE after redirects.
+- **Queue control** — pause/resume per item and selected items, pause‑all/resume‑all across aria2 and
+  yt‑dlp jobs, plus a global speed cap.
 - **Integrity & mirrors** — checksum verification (MD5 / SHA‑1 / SHA‑256 / SHA‑512), automatically
   after completion or on demand; multi‑source and **Metalink** downloads; `SHA256SUMS` for releases.
 - **Duplicate detection** — re‑adding a URL already in the list prompts *Skip / Add anyway*.
@@ -89,12 +92,12 @@ The app writes downloads to `~/Downloads/DownMan/`.
 npm run app:build -- --bundles deb appimage   # → src-tauri/target/release/bundle/{deb,appimage}/
 
 # .deb — pulls in aria2 + ffmpeg automatically:
-sudo apt install ./src-tauri/target/release/bundle/deb/downman_0.1.3_amd64.deb
+sudo apt install ./src-tauri/target/release/bundle/deb/downman_1.0.0_amd64.deb
 
 # AppImage — portable, but install its two runtime tools yourself first:
 sudo apt install aria2 ffmpeg
-chmod +x ./src-tauri/target/release/bundle/appimage/downman_0.1.3_amd64.AppImage
-./src-tauri/target/release/bundle/appimage/downman_0.1.3_amd64.AppImage
+chmod +x ./src-tauri/target/release/bundle/appimage/downman_1.0.0_amd64.AppImage
+./src-tauri/target/release/bundle/appimage/downman_1.0.0_amd64.AppImage
 ```
 
 > **AppImage note:** the AppImage bundles the app + the WebKit/GTK runtime, but **not** `aria2`/`ffmpeg`

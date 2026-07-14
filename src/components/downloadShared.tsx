@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { Aria2Task, api } from "../lib/api";
 import { fmtBytes } from "../lib/format";
 import { toast } from "../lib/toast";
+import { queueOf, taskUrl, useStore } from "../store";
 import { I } from "./icons";
 
 export const catColor: Record<string, string> = {
@@ -77,6 +78,11 @@ export function RowMenu({ t, name, category, total, detailsOpen, onToggleDetails
   const active = t.status === "active";
   const paused = t.status === "paused" || t.status === "waiting";
   const [menuOpen, setMenuOpen] = useState(false);
+  const queues = useStore((s) => s.queues);
+  const queueMap = useStore((s) => s.queueMap);
+  const pauseTask = useStore((s) => s.pauseTask);
+  const resumeTask = useStore((s) => s.resumeTask);
+  const retryTask = useStore((s) => s.retryTask);
   const [confirmDel, setConfirmDel] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [renameVal, setRenameVal] = useState("");
@@ -147,8 +153,8 @@ export function RowMenu({ t, name, category, total, detailsOpen, onToggleDetails
       {canControl && (
         <button className={`btn-ghost !p-2 ${detailsOpen ? "text-aurora-300" : ""}`} title="Details" onClick={onToggleDetails}><I.More className="w-4 h-4" /></button>
       )}
-      {active && <button className="btn-ghost !p-2" title="Pause" onClick={() => api.pause(t.gid)}><I.Pause className="w-4 h-4" /></button>}
-      {paused && <button className="btn-ghost !p-2" title="Resume" onClick={() => api.resume(t.gid)}><I.Play className="w-4 h-4" /></button>}
+      {active && <button className="btn-ghost !p-2" title="Pause" onClick={() => pauseTask(t.gid).catch(() => {})}><I.Pause className="w-4 h-4" /></button>}
+      {paused && <button className="btn-ghost !p-2" title="Resume" onClick={() => resumeTask(t.gid).catch(() => {})}><I.Play className="w-4 h-4" /></button>}
       <button ref={kebabRef} className={`btn-ghost !p-2 ${menuOpen ? "text-aurora-300" : ""}`} title="More actions" onClick={() => (menuOpen ? setMenuOpen(false) : openMenu())}><I.Kebab className="w-4 h-4" /></button>
 
       {menuOpen && createPortal(
@@ -158,7 +164,8 @@ export function RowMenu({ t, name, category, total, detailsOpen, onToggleDetails
             {completed && hasPath && <MenuItem onClick={() => act(() => api.openPath(path))}>Open file</MenuItem>}
             {hasPath && <MenuItem onClick={() => act(() => api.revealPath(path))}>Open folder</MenuItem>}
             {srcUrl && <MenuItem onClick={() => act(() => navigator.clipboard.writeText(srcUrl))}>Copy link</MenuItem>}
-            {srcUrl && (completed || t.status === "error") && <MenuItem onClick={() => act(() => api.redownload(srcUrl, path))}>Redownload</MenuItem>}
+            {srcUrl && completed && <MenuItem onClick={() => act(() => api.redownload(srcUrl, path))}>Redownload</MenuItem>}
+            {srcUrl && t.status === "error" && <MenuItem onClick={() => act(() => retryTask(t.gid))}>Retry</MenuItem>}
             {completed && hasPath && <MenuItem onClick={() => { setRenameVal(name); setRenaming(true); setMenuOpen(false); }}>Rename…</MenuItem>}
             {completed && hasPath && <MenuItem onClick={doMove}>Move to…</MenuItem>}
             {completed && hasPath && <MenuItem onClick={() => { setVerifyVal(""); setVerifyMsg(""); setVerifying(true); setMenuOpen(false); }}>Verify checksum…</MenuItem>}
@@ -199,6 +206,18 @@ export function RowMenu({ t, name, category, total, detailsOpen, onToggleDetails
             <PropRow label="Size" value={total ? fmtBytes(total) : "—"} />
             <PropRow label="Category" value={category} />
             <PropRow label="Status" value={t.status} />
+            {taskUrl(t) && (
+              <div className="flex items-center gap-3 py-1.5 border-b border-white/5">
+                <span className="text-xs text-slate-500 w-24 shrink-0">Queue</span>
+                <select
+                  value={queueOf(t, queueMap)}
+                  onChange={(e) => api.assignQueue(taskUrl(t), e.target.value).catch(() => {})}
+                  className="flex-1 appearance-none bg-ink-900/60 border border-white/5 rounded px-2 py-1.5 text-sm text-slate-200 focus:outline-none focus:ring-1 focus:ring-aurora-500/50"
+                >
+                  {queues.map((queue) => <option key={queue.id} value={queue.id}>{queue.name}</option>)}
+                </select>
+              </div>
+            )}
             {hasPath && <PropRow label="Saved to" value={path} copy />}
             {srcUrl && <PropRow label="Source URL" value={srcUrl} copy />}
             {t.files?.length > 1 && <PropRow label="Files" value={`${t.files.length} files`} />}

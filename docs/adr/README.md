@@ -27,6 +27,7 @@ See [`0000-template.md`](0000-template.md). Status is one of:
 | 0010 | [Multi-engine media capture (yt-dlp)](0010-multi-engine-media-capture.md) | Accepted |
 | 0011 | [Light/dark theming via CSS variables](0011-light-dark-theming.md) | Accepted |
 | 0012 | [App/tray/window iconography (Wayland)](0012-iconography-wayland.md) | Accepted |
+| 0013 | [Host-agnostic media intent resolver](0013-host-agnostic-media-resolver.md) | Accepted |
 
 ## Conventions referenced by ADRs
 
