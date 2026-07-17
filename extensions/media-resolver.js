@@ -259,8 +259,14 @@
     //    media ID is the precise target. Only trust this when there is genuine
     //    ambiguity (more than one player in the unit, or a nested quote) so single
     //    videos still prefer the page extractor for best quality and auth.
+    //    A feed is inherently ambiguous too: a bound status link can be a quote-tweet
+    //    or neighbouring post whose page extractor resolves a DIFFERENT video, and a
+    //    quoted player may still be a thumbnail (not a materialised <video>), so
+    //    ownerMediaCount misses it. On a detail page the opened document is
+    //    unambiguous, so only a collection/feed context is treated as ambiguous here.
+    const contextKind = mediaIntent.contextKind || (mediaIntent.feedContext ? "collection" : "document");
     const keys = Array.isArray(mediaIntent.mediaKeys) ? mediaIntent.mediaKeys : [];
-    const ambiguous = finite(mediaIntent.ownerMediaCount, 1) > 1 || !!mediaIntent.nested;
+    const ambiguous = finite(mediaIntent.ownerMediaCount, 1) > 1 || !!mediaIntent.nested || contextKind === "collection";
     if (ambiguous && keys.length) {
       const keyed = candidates
         .map((candidate, index) => ({ candidate, index }))
@@ -288,8 +294,6 @@
       }
     });
     if (boundIndex >= 0) return { action: "submit", index: boundIndex, reason: "bound-page" };
-
-    const contextKind = mediaIntent.contextKind || (mediaIntent.feedContext ? "collection" : "document");
 
     // 3. In a feed, or inside a nested quoted/embedded post, with no exact source and
     //    no bound permalink of its own, only a stream that was explicitly correlated

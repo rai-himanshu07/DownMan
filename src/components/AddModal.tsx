@@ -1,10 +1,11 @@
-import { useMemo, useState } from "react";
-import { api, Fmt } from "../lib/api";
+import { useEffect, useMemo, useState } from "react";
+import { api, DownloadProfile, Fmt } from "../lib/api";
 import { toast } from "../lib/toast";
 import { useStore, taskUrl } from "../store";
 import { I } from "./icons";
 import { useDialogFocus } from "../lib/useDialogFocus";
 import PreDownloadSheet from "./PreDownloadSheet";
+import CollectionInspector from "./CollectionInspector";
 
 interface Link { url: string; host: string; type: string }
 
@@ -37,6 +38,18 @@ function extractLinks(text: string): Link[] {
   return out.sort((a, b) => a.host.localeCompare(b.host) || a.url.localeCompare(b.url));
 }
 
+function isCollectionUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    const path = parsed.pathname.toLowerCase();
+    return parsed.searchParams.has("list")
+      || /\/(playlist|channel|user|c)\//.test(path)
+      || /\/@[^/]+(?:\/|$)/.test(path);
+  } catch {
+    return false;
+  }
+}
+
 export default function AddModal({ onClose }: { onClose: () => void }) {
     const dialogRef = useDialogFocus<HTMLDivElement>(onClose);
   const [text, setText] = useState("");
@@ -55,16 +68,28 @@ export default function AddModal({ onClose }: { onClose: () => void }) {
   const [fsel, setFsel] = useState("");
   const [subs, setSubs] = useState(false);
   const [sb, setSb] = useState(false);
+  const [clipStart, setClipStart] = useState("");
+  const [clipEnd, setClipEnd] = useState("");
+  const [livePolicy, setLivePolicy] = useState<DownloadProfile["livePolicy"] | "">("");
   const [vbusy, setVbusy] = useState(false);
   const [mirrors, setMirrors] = useState(false);
   const [dupInfo, setDupInfo] = useState<{ urls: Set<string> } | null>(null);
   const [preSheet, setPreSheet] = useState<{ url: string; name: string } | null>(null);
+  const [profiles, setProfiles] = useState<DownloadProfile[]>([]);
+  const [profileId, setProfileId] = useState("");
+  const [collectionUrl, setCollectionUrl] = useState("");
   const tasks = useStore((s) => s.tasks);
 
   const links = useMemo(() => extractLinks(text), [text]);
   const selected = links.filter((l) => !unchecked.has(l.url));
   const valid = selected.filter((l) => /^(https?|ftp|magnet):/i.test(l.url) || /\.torrent$/i.test(l.url));
   const single = links.length === 1 && /^https?:/i.test(links[0]?.url || "") ? links[0].url : "";
+
+  useEffect(() => {
+    Promise.all([api.listDownloadProfiles(), api.activeDownloadProfile()])
+      .then(([items, active]) => { setProfiles(items); setProfileId(active.id); })
+      .catch(() => {});
+  }, []);
 
   function loadFormats() {
     if (!single) return;
@@ -78,9 +103,20 @@ export default function AddModal({ onClose }: { onClose: () => void }) {
     if (!single) return;
     setVbusy(true);
     const cb = localStorage.getItem("dm-cookies-browser") || undefined;
-    api.grabSite(single, fsel || "best", referer.trim() || undefined, cb, subs, sb)
+    api.grabSite(
+      single,
+      fsel || "",
+      referer.trim() || undefined,
+      cb,
+      subs,
+      sb,
+      profileId || undefined,
+      clipStart.trim() || undefined,
+      clipEnd.trim() || undefined,
+      livePolicy || undefined,
+    )
       .then(() => onClose())
-      .catch(() => {})
+      .catch((error: unknown) => toast.error("Could not start media download", String(error)))
       .finally(() => setVbusy(false));
   }
 
@@ -94,6 +130,7 @@ export default function AddModal({ onClose }: { onClose: () => void }) {
 
   function buildOpts(): Record<string, unknown> {
     const opts: Record<string, unknown> = {};
+    if (profileId) opts.dmProfileId = profileId;
     if (checksum.trim()) opts.dmChecksum = checksum.trim();
     if (referer.trim()) opts.referer = referer.trim();
     if (user.trim()) opts["http-user"] = user.trim();
@@ -196,6 +233,18 @@ export default function AddModal({ onClose }: { onClose: () => void }) {
             placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-aurora-500/50 resize-none"
         />
 
+        {profiles.length > 0 && (
+          <div className="mt-3 flex items-center gap-3">
+            <label className="text-xs text-slate-500 shrink-0">Download profile</label>
+            <div className="relative flex-1">
+              <select value={profileId} onChange={(event) => setProfileId(event.target.value)} className="control appearance-none pr-9">
+                {profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
+              </select>
+              <I.Down className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500" />
+            </div>
+          </div>
+        )}
+
         {links.length > 0 && (
           <div className="mt-3">
             <div className="flex items-center justify-between text-xs text-slate-500 mb-1.5">
@@ -229,7 +278,10 @@ export default function AddModal({ onClose }: { onClose: () => void }) {
         {single && (
           <div className="mt-3">
             {!vid ? (
-              <button className="btn-ghost text-xs" onClick={loadFormats}><I.Media className="w-4 h-4" /> Video &amp; subtitles…</button>
+              <div className="flex flex-wrap gap-2">
+                <button className="btn-ghost text-xs" onClick={loadFormats}><I.Media className="w-4 h-4" /> Video &amp; subtitles…</button>
+                <button className={isCollectionUrl(single) ? "btn-primary text-xs" : "btn-ghost text-xs"} onClick={() => setCollectionUrl(single)}><I.Table className="w-4 h-4" /> Inspect collection</button>
+              </div>
             ) : (
               <div className="rounded-lg border border-white/5 p-3 space-y-2">
                 <div className="text-xs text-slate-400 truncate">{fmts ? (fmts.title || "Choose a quality") : "Fetching available formats…"}</div>
@@ -245,6 +297,23 @@ export default function AddModal({ onClose }: { onClose: () => void }) {
                 <div className="flex items-center gap-4 text-xs text-slate-400">
                   <label className="flex items-center gap-1.5"><input type="checkbox" checked={subs} onChange={(e) => setSubs(e.target.checked)} /> Subtitles</label>
                   <label className="flex items-center gap-1.5"><input type="checkbox" checked={sb} onChange={(e) => setSb(e.target.checked)} /> Remove sponsors (SponsorBlock)</label>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                  <Field label="Clip start" v={clipStart} set={setClipStart} ph="Profile default" />
+                  <Field label="Clip end" v={clipEnd} set={setClipEnd} ph="Profile default" />
+                  <label className="text-xs text-slate-500">
+                    Live streams
+                    <select
+                      value={livePolicy}
+                      onChange={(event) => setLivePolicy(event.target.value as DownloadProfile["livePolicy"] | "")}
+                      className="mt-0.5 w-full bg-ink-900/60 border border-white/5 rounded-lg px-3 py-1.5 text-sm text-slate-200 focus:outline-none focus:ring-1 focus:ring-aurora-500/50"
+                    >
+                      <option value="">Profile default</option>
+                      <option value="from-now">Download from now</option>
+                      <option value="from-start">Download from start</option>
+                      <option value="skip">Skip live streams</option>
+                    </select>
+                  </label>
                 </div>
                 <div className="flex justify-end gap-2">
                   <button className="btn-ghost" onClick={() => setVid(false)}>Back</button>
@@ -312,6 +381,7 @@ export default function AddModal({ onClose }: { onClose: () => void }) {
               if (paused) opts["pause"] = "true";
               setBusy(true);
               api.add([preSheet.url], opts)
+                .then(() => api.assignQueue(preSheet.url, queueId || "main"))
                 .then(() => { toast.success("Download added"); onClose(); })
                 .catch((e: unknown) => {
                   const msg = String(e);
@@ -323,8 +393,16 @@ export default function AddModal({ onClose }: { onClose: () => void }) {
                   }
                 })
                 .finally(() => setBusy(false));
-              void queueId; // assigned to queue by name if needed — future hook
             }}
+          />
+        )}
+
+        {collectionUrl && (
+          <CollectionInspector
+            sourceUrl={collectionUrl}
+            initialProfileId={profileId || undefined}
+            queues={useStore.getState().queues}
+            onClose={() => setCollectionUrl("")}
           />
         )}
 
@@ -341,8 +419,8 @@ export default function AddModal({ onClose }: { onClose: () => void }) {
 
 function Field({ label, v, set, ph, type }: { label: string; v: string; set: (s: string) => void; ph?: string; type?: string }) {
   return (
-    <div>
-      <label className="text-xs text-slate-500">{label}</label>
+    <label className="block">
+      <span className="text-xs text-slate-500">{label}</span>
       <input
         type={type || "text"}
         value={v}
@@ -350,7 +428,7 @@ function Field({ label, v, set, ph, type }: { label: string; v: string; set: (s:
         placeholder={ph}
         className="mt-0.5 w-full bg-ink-900/60 border border-white/5 rounded-lg px-3 py-1.5 text-sm font-mono placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-aurora-500/50"
       />
-    </div>
+    </label>
   );
 }
 

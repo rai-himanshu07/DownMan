@@ -3,10 +3,13 @@ import { PendingItem, api } from "../lib/api";
 import { fmtBytes } from "../lib/format";
 import { markOrganized, useStore } from "../store";
 import { I } from "./icons";
+import { useDialogFocus } from "../lib/useDialogFocus";
 
 const CATS = ["Video", "Audio", "Images", "Documents", "Archives", "Other"];
 
 export default function ConfirmDownload({ item, onDone }: { item: PendingItem; onDone: () => void }) {
+  const cancel = () => { api.cancelPending(item.id).catch(() => {}); onDone(); };
+  const dialogRef = useDialogFocus<HTMLDivElement>(cancel);
   const [base, setBase] = useState("");
   const [filename, setFilename] = useState(item.filename);
   const [touchedName, setTouchedName] = useState(false);
@@ -65,17 +68,18 @@ export default function ConfirmDownload({ item, onDone }: { item: PendingItem; o
 
   return (
     <div className="fixed inset-0 z-[60] grid place-items-center bg-black/60 backdrop-blur-sm animate-fade-up">
-      <div className="card w-[560px] max-w-[94vw] p-6">
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="confirm-download-title" tabIndex={-1} className="card w-[560px] max-w-[94vw] p-6">
         <div className="flex items-center gap-3 mb-1">
           <div className="w-9 h-9 rounded-xl bg-aurora-600 grid place-items-center shadow-glow text-white"><I.Logo /></div>
           <div>
-            <h2 className="text-lg font-semibold leading-5">{isSite ? "New video download" : "New download"}</h2>
+            <h2 id="confirm-download-title" className="text-lg font-semibold leading-5">{isSite ? "New video download" : "New download"}</h2>
             <div className="text-xs text-slate-500">{isSite ? "Caught a video from your browser" : "Caught a download from your browser"}</div>
           </div>
         </div>
 
         <label className="block mt-4 text-xs text-slate-500">File name</label>
         <input
+          data-dialog-autofocus
           value={filename}
           onChange={(e) => { setFilename(e.target.value); setTouchedName(true); }}
           className="mt-1 w-full bg-ink-900/60 border border-white/5 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-aurora-500/50"
@@ -135,7 +139,7 @@ export default function ConfirmDownload({ item, onDone }: { item: PendingItem; o
         )}
 
         <div className="flex justify-end gap-2 mt-4">
-          <button className="btn-ghost" disabled={busy} onClick={() => { api.cancelPending(item.id).catch(() => {}); onDone(); }}>Cancel</button>
+          <button className="btn-ghost" disabled={busy} onClick={cancel}>Cancel</button>
           {!isSite && !isBrowserLocal && <button className="btn-ghost" disabled={busy} onClick={() => go(true)} title="Add but don't start yet">Download later</button>}
           <button className="btn-primary" disabled={busy} onClick={() => go(false)}><I.Play className="w-4 h-4" /> {isBrowserLocal ? "Import" : "Download"}</button>
         </div>

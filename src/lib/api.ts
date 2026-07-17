@@ -25,6 +25,10 @@ export interface Aria2Task {
   dmChecksum?: string;   // expected checksum stored in DL_META
   dmVerify?: string;    // "" | "pending" | "ok" | "fail"
   dmOnComplete?: string;
+  dmProfileId?: string;
+  dmProfile?: DownloadProfile;
+  dmSchedule?: JobSchedule;
+  dmNetworkOverride?: NetworkOverride;
   dmMissing?: boolean;   // completed file deleted/moved on disk
   dmRetry?: number;      // auto-retry attempt (1..3) while a failure is being retried
 }
@@ -120,6 +124,270 @@ export interface LifetimeStats {
   byCategory: { category: string; count: number; bytes: number }[];
 }
 
+export interface DownloadProfile {
+  id: string;
+  name: string;
+  description: string;
+  builtin: boolean;
+  mediaMode: "video-audio" | "audio-only" | "subtitles-only";
+  quality: string;
+  container: string;
+  videoCodec: string;
+  preferredFps: string;
+  audioFormat: string;
+  audioBitrate: string;
+  subtitleMode: "off" | "sidecar" | "embed";
+  subtitleLanguages: string[];
+  subtitleFormat: string;
+  sponsorblockMode: "off" | "mark" | "remove";
+  sponsorblockCategories: string[];
+  embedMetadata: boolean;
+  embedThumbnail: boolean;
+  embedChapters: boolean;
+  writeDescription: boolean;
+  outputDir: string;
+  subfolder: string;
+  filenameTemplate: string;
+  queueId: string;
+  maxDownloadLimit: string;
+  connections: number;
+  split: number;
+  proxy: string;
+  userAgent: string;
+  headers: string[];
+  retries: number;
+  clipStart: string;
+  clipEnd: string;
+  livePolicy: "skip" | "from-start" | "from-now";
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface CollectionSession {
+  id: string;
+  sourceUrl: string;
+  sourceType: "playlist" | "channel" | "collection";
+  title: string;
+  status: "loading" | "ready" | "cancelled" | "error";
+  totalKnown: number;
+  loadedCount: number;
+  pageSize: number;
+  nextIndex: number;
+  profileId: string;
+  error: string;
+  enqueueStatus: "" | "running" | "complete" | "cancelled";
+  enqueuedCount: number;
+  failedCount: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface CollectionItem {
+  index: number;
+  mediaId: string;
+  extractor: string;
+  url: string;
+  title: string;
+  uploader: string;
+  durationSec: number;
+  uploadDate: string;
+  thumbnail: string;
+  liveState: string;
+  estimatedSize: number;
+  availability: string;
+  selected: boolean;
+  enqueueStatus: "" | "queued" | "active" | "complete" | "error" | "cancelled";
+  archived: boolean;
+}
+
+export interface CollectionPage {
+  session: CollectionSession;
+  items: CollectionItem[];
+  filteredCount: number;
+  selectedCount: number;
+  offset: number;
+  limit: number;
+}
+
+export interface PolicyValidation {
+  valid: boolean;
+  errors: string[];
+  warnings: string[];
+}
+
+export interface ArchiveStatus {
+  count: number;
+  latestCompletedAt: number;
+}
+
+export interface TimeWindow {
+  start: string;
+  stop: string;
+  /** Monday = 0, Sunday = 6; empty means every day. */
+  days: number[];
+}
+
+export interface GlobalSchedule {
+  enabled: boolean;
+  timezone: string;
+  windows: TimeWindow[];
+}
+
+export interface JobSchedule {
+  mode: "inherit" | "always" | "paused" | "window";
+  window: TimeWindow | null;
+}
+
+export interface NetworkOverride {
+  maxDownloadLimit: string;
+  connections: number;
+  split: number;
+  proxy: string;
+  userAgent: string;
+  headers: string[];
+  cookiesBrowser: string;
+  httpUsername: string;
+  hasPassword: boolean;
+  meteredBehavior: "" | "inherit" | "pause" | "ignore";
+}
+
+export interface JobPolicyMeta {
+  checksum: string;
+  verify: string;
+  oncomplete_action: string;
+  oncomplete_cmd: string;
+  added_at: number;
+  profile_id: string;
+  profile_snapshot?: DownloadProfile | null;
+  schedule: JobSchedule;
+  network_override: NetworkOverride;
+}
+
+export interface PreflightSummary {
+  id: string;
+  status: "ready" | "committed";
+  profileId: string;
+  totalCount: number;
+  acceptedCount: number;
+  rejectedCount: number;
+  estimateSizes: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface PreflightItem {
+  index: number;
+  original: string;
+  url: string;
+  kind: string;
+  status: string;
+  reason: string;
+  filename: string;
+  conflictPath: string;
+  estimatedSize: number;
+  estimatedSeconds: number;
+  contentType: string;
+  selected: boolean;
+  commitStatus: "" | "complete" | "error" | "skipped";
+}
+
+export interface PreflightPage {
+  summary: PreflightSummary;
+  items: PreflightItem[];
+  filteredCount: number;
+  offset: number;
+  limit: number;
+}
+
+export interface Subscription {
+  id: string;
+  name: string;
+  kind: "channel" | "playlist";
+  sourceUrl: string;
+  profileId: string;
+  pollIntervalMin: number;
+  enabled: boolean;
+  action: "review" | "auto";
+  notify: boolean;
+  includeKeywords: string[];
+  excludeKeywords: string[];
+  minDurationSec: number;
+  maxDurationSec: number;
+  contentType: "all" | "video" | "live" | "upcoming";
+  maxItemsPerPoll: number;
+  livePolicyOverride: "" | "skip" | "from-start" | "from-now";
+  cookiesBrowser: string;
+  m3uTarget: string;
+  running: boolean;
+  lastRunAt: number;
+  lastSuccessAt: number;
+  nextRunAt: number;
+  lastError: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ReviewItem {
+  id: string;
+  subscriptionId: string;
+  subscriptionName: string;
+  extractor: string;
+  mediaId: string;
+  url: string;
+  title: string;
+  uploader: string;
+  durationSec: number;
+  uploadDate: string;
+  thumbnail: string;
+  liveState: string;
+  profileId: string;
+  status: "new" | "downloaded" | "dismissed" | "error";
+  selected: boolean;
+  discoveredAt: number;
+}
+
+export interface ReviewPage {
+  items: ReviewItem[];
+  total: number;
+  selectedCount: number;
+  offset: number;
+  limit: number;
+}
+
+export interface SearchSession {
+  id: string;
+  query: string;
+  status: "loading" | "ready" | "cancelled" | "error";
+  loadedCount: number;
+  totalLimit: number;
+  pageSize: number;
+  error: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface SearchItem {
+  index: number;
+  extractor: string;
+  mediaId: string;
+  url: string;
+  title: string;
+  uploader: string;
+  durationSec: number;
+  uploadDate: string;
+  thumbnail: string;
+  liveState: string;
+  selected: boolean;
+  archived: boolean;
+}
+
+export interface SearchPage {
+  session: SearchSession;
+  items: SearchItem[];
+  offset: number;
+  limit: number;
+}
+
 export const api = {
   add: (uris: string[], options: Record<string, unknown> = {}) =>
     invoke<string>("add_download", { uris, options }),
@@ -135,8 +403,8 @@ export const api = {
   resetLifetimeStats: () => invoke<LifetimeStats>("reset_lifetime_stats"),
   setGlobal: (options: Record<string, string>) =>
     invoke("set_global_option", { options }),
-  grabSite: (url: string, format = "best", referer?: string, cookies?: string, subs?: boolean, sponsorblock?: boolean) =>
-    invoke<string>("grab_site", { url, format, referer, cookies, subs, sponsorblock }),
+  grabSite: (url: string, format = "", referer?: string, cookies?: string, subs?: boolean, sponsorblock?: boolean, profileId?: string, clipStart?: string, clipEnd?: string, livePolicy?: DownloadProfile["livePolicy"]) =>
+    invoke<string>("grab_site", { url, format, referer, cookies, subs, sponsorblock, policy: { profileId, clipStart, clipEnd, livePolicy } }),
   listFormats: (url: string, referer?: string, cookies?: string) =>
     invoke<{ title: string; formats: Fmt[] }>("list_formats", { url, referer, cookies }),
   info: () => invoke<{ dir: string }>("engine_info"),
@@ -202,13 +470,73 @@ export const api = {
   clearCache: () => invoke<{ bytes: number; files: number }>("clear_cache"),
   importUrls: (urls: string[], options?: Record<string, unknown>) => invoke<{ added: number; skipped: number; failed: number }>("import_urls", { urls, options: options || {} }),
 
+  // Reusable download profiles
+  listDownloadProfiles: () => invoke<DownloadProfile[]>("list_download_profiles"),
+  activeDownloadProfile: () => invoke<DownloadProfile>("active_download_profile"),
+  saveDownloadProfile: (profile: DownloadProfile) => invoke<DownloadProfile>("save_download_profile", { profile }),
+  setActiveDownloadProfile: (id: string) => invoke<DownloadProfile>("set_active_download_profile", { id }),
+  deleteDownloadProfile: (id: string) => invoke("delete_download_profile", { id }),
+  validateMediaPolicy: (profile: DownloadProfile) => invoke<PolicyValidation>("media_policy_validate", { profile }),
+
+  // Playlist and channel collection inspector
+  collectionInspectStart: (sourceUrl: string, profileId?: string, pageSize = 100, cookiesBrowser?: string) =>
+    invoke<CollectionSession>("collection_inspect_start", { sourceUrl, profileId, pageSize, cookiesBrowser }),
+  collectionInspectPage: (id: string, offset = 0, limit = 50, query?: string, filter?: string) =>
+    invoke<CollectionPage>("collection_inspect_page", { id, offset, limit, query, filter }),
+  collectionSelectItems: (id: string, indices: number[], selected: boolean) =>
+    invoke<number>("collection_select_items", { id, indices, selected }),
+  collectionEnqueueSelected: (id: string, profileId?: string, queueId?: string) =>
+    invoke<{ id: string; queued: number }>("collection_enqueue_selected", { id, profileId, queueId }),
+  collectionCancel: (id: string) => invoke("collection_cancel", { id }),
+
+  // Completed media archive and playlist exports
+  extractorArchiveStatus: () => invoke<ArchiveStatus>("extractor_archive_status"),
+  extractorArchiveExport: (path: string) => invoke<number>("extractor_archive_export", { path }),
+  archiveExportM3u: (path: string) => invoke<number>("archive_export_m3u", { path }),
+
+  // Bulk URL cleanup, classification, estimates, and explicit review
+  preflightBatch: (urls: string[], profileId?: string, estimateSizes = false) =>
+    invoke<PreflightPage>("preflight_batch", { urls, profileId, estimateSizes }),
+  preflightGet: (id: string, offset = 0, limit = 100, filter?: string) =>
+    invoke<PreflightPage>("preflight_get", { id, offset, limit, filter }),
+  preflightSelect: (id: string, indices: number[], selected: boolean) =>
+    invoke<number>("preflight_select", { id, indices, selected }),
+  preflightCommit: (id: string) => invoke<{ added: number; failed: number }>("preflight_commit", { id }),
+
+  // Backend-owned schedules and per-job network policy
+  schedulerGet: () => invoke<GlobalSchedule>("scheduler_get"),
+  schedulerSet: (schedule: GlobalSchedule) => invoke<GlobalSchedule>("scheduler_set", { schedule }),
+  jobPolicyGet: (gid: string) => invoke<JobPolicyMeta>("job_policy_get", { gid }),
+  jobPolicySet: (gid: string, schedule: JobSchedule, networkOverride: NetworkOverride, password?: string) =>
+    invoke<JobPolicyMeta>("job_policy_set", { gid, schedule, networkOverride, password }),
+  jobPolicyClear: (gid: string) => invoke<JobPolicyMeta>("job_policy_clear", { gid }),
+
+  // Followed sources and review inbox
+  subscriptionList: () => invoke<Subscription[]>("subscription_list"),
+  subscriptionUpsert: (subscription: Subscription) => invoke<Subscription>("subscription_upsert", { subscription }),
+  subscriptionDelete: (id: string) => invoke("subscription_delete", { id }),
+  subscriptionRunNow: (id: string) => invoke<{ reviewed: number; autoQueued: number; archived: number }>("subscription_run_now", { id }),
+  subscriptionExportM3u: (id: string, path: string) => invoke<number>("subscription_export_m3u", { id, path }),
+  reviewInboxPage: (offset = 0, limit = 100, status = "new") => invoke<ReviewPage>("review_inbox_page", { offset, limit, status }),
+  reviewInboxSelect: (ids: string[], selected: boolean) => invoke<number>("review_inbox_select", { ids, selected }),
+  reviewInboxDismiss: (ids: string[]) => invoke<number>("review_inbox_dismiss", { ids }),
+  reviewInboxDownload: (ids: string[]) => invoke<{ queued: number }>("review_inbox_download", { ids }),
+
+  // Bounded YouTube keyword search via yt-dlp
+  ytSearchStart: (query: string, pageSize = 50, totalLimit = 200, cookiesBrowser?: string) =>
+    invoke<SearchSession>("yt_search_start", { query, pageSize, totalLimit, cookiesBrowser }),
+  ytSearchPage: (id: string, offset = 0, limit = 50) => invoke<SearchPage>("yt_search_page", { id, offset, limit }),
+  ytSearchSelect: (id: string, indices: number[], selected: boolean) => invoke<number>("yt_search_select", { id, indices, selected }),
+  ytSearchCancel: (id: string) => invoke("yt_search_cancel", { id }),
+  ytSearchDownload: (id: string, profileId?: string) => invoke<{ queued: number }>("yt_search_download", { id, profileId }),
+
   // Browser interception rules
   getRules: () => invoke<Rules>("get_rules"),
   setRules: (rules: Rules) => invoke("set_rules", { data: rules }),
 
   // Editable categories
   getCategories: () => invoke<CategoryDef[]>("get_categories"),
-  setCategories: (cats: CategoryDef[]) => invoke("set_categories", { data: cats }),
+  setCategories: (cats: CategoryDef[]) => invoke<{ added: string[] }>("set_categories", { data: cats }),
 
   // Download queues
   getQueues: () => invoke<Queue[]>("get_queues"),

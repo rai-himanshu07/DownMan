@@ -6,7 +6,7 @@ import { migrateTheme } from "./lib/theme";
 
 migrateTheme();
 
-export type View = "all" | "active" | "unfinished" | "completed" | "media" | "sitegrab" | "torrents" | "settings" | "stats" | "about";
+export type View = "all" | "active" | "unfinished" | "completed" | "media" | "sitegrab" | "torrents" | "follows" | "library" | "settings" | "stats" | "about";
 export type Category = "video" | "audio" | "image" | "doc" | "archive" | "torrent" | "other";
 
 const organized = new Set<string>();

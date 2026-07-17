@@ -28,6 +28,8 @@ See [`0000-template.md`](0000-template.md). Status is one of:
 | 0011 | [Light/dark theming via CSS variables](0011-light-dark-theming.md) | Accepted |
 | 0012 | [App/tray/window iconography (Wayland)](0012-iconography-wayland.md) | Accepted |
 | 0013 | [Host-agnostic media intent resolver](0013-host-agnostic-media-resolver.md) | Accepted |
+| 0014 | [Versioned SQLite workflow state and immutable job policies](0014-sqlite-policy-state.md) | Accepted |
+| 0015 | [Backend-owned bounded media automation and scheduling](0015-backend-bounded-automation.md) | Accepted |
 
 ## Conventions referenced by ADRs
 

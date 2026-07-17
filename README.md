@@ -62,11 +62,18 @@ That's it! The installer automatically pulls in the two helper tools DownMan nee
   multiple sources are equally plausible. HLS/DASH are merged to `.mp4` via ffmpeg.
 - **Site video capture** — page URLs from 1800+ sites are resolved by **yt‑dlp**
   with optional browser cookies; supported video sites also offer an explicit quality picker. DRM sites are not supported.
+- **Profiles & media policy** — reusable presets cover quality, codecs, audio, subtitles,
+  SponsorBlock, metadata, output, clip ranges, live streams, and network defaults; queued jobs keep
+  an immutable policy snapshot.
+- **Collections & library** — inspect large playlists/channels in bounded pages, review and select
+  items, skip completed archive identities, synchronize repeated imports, and export M3U playlists.
+- **Follows & search** — poll channels/playlists into a review inbox (or opt into bounded
+  auto-download), and search/select media through paged yt-dlp results.
 - **Auto‑organization** — completed files sorted into `Video / Audio / Images / Documents / Archives / Other`.
 - **Browser bridge** — Chromium + Firefox MV3 extensions talk to the app over a local HTTP endpoint
   and capture configured file types such as ZIP/EXE after redirects.
-- **Queue control** — pause/resume per item and selected items, pause‑all/resume‑all across aria2 and
-  yt‑dlp jobs, plus a global speed cap.
+- **Queue control & schedules** — pause/resume per item and selected items across aria2 and yt-dlp,
+  plus backend-owned global/queue/job windows and per-job network overrides that work while hidden.
 - **Integrity & mirrors** — checksum verification (MD5 / SHA‑1 / SHA‑256 / SHA‑512), automatically
   after completion or on demand; multi‑source and **Metalink** downloads; `SHA256SUMS` for releases.
 - **Duplicate detection** — re‑adding a URL already in the list prompts *Skip / Add anyway*.
@@ -92,12 +99,12 @@ The app writes downloads to `~/Downloads/DownMan/`.
 npm run app:build -- --bundles deb appimage   # → src-tauri/target/release/bundle/{deb,appimage}/
 
 # .deb — pulls in aria2 + ffmpeg automatically:
-sudo apt install ./src-tauri/target/release/bundle/deb/downman_1.0.0_amd64.deb
+sudo apt install ./src-tauri/target/release/bundle/deb/downman_1.1.0_amd64.deb
 
 # AppImage — portable, but install its two runtime tools yourself first:
 sudo apt install aria2 ffmpeg
-chmod +x ./src-tauri/target/release/bundle/appimage/downman_1.0.0_amd64.AppImage
-./src-tauri/target/release/bundle/appimage/downman_1.0.0_amd64.AppImage
+chmod +x ./src-tauri/target/release/bundle/appimage/downman_1.1.0_amd64.AppImage
+./src-tauri/target/release/bundle/appimage/downman_1.1.0_amd64.AppImage
 ```
 
 > **AppImage note:** the AppImage bundles the app + the WebKit/GTK runtime, but **not** `aria2`/`ffmpeg`
@@ -124,6 +131,23 @@ The extension defaults to the app endpoint `http://127.0.0.1:6802` (configurable
 
 ---
 
+## Known issues
+
+A couple of cosmetic first-launch quirks, mostly on Linux desktops (GNOME/Wayland in particular).
+Both are harmless and clear once the window and tray settle:
+
+- **Tray label missing on first start.** The system-tray icon may appear without its text/label the
+  very first time DownMan launches — DownMan can publish its tray item before the desktop's
+  AppIndicator/StatusNotifier host has finished registering it, so the label renders empty. Quitting
+  and relaunching DownMan (or restarting the tray/panel) brings the label back.
+
+- **Window controls inactive at first open.** Right after the UI first appears, the title‑bar
+  minimize/maximize/close buttons can be unresponsive — a client‑side‑decoration timing quirk in the
+  GTK/WebKit window shell under some compositors. Double‑click the title bar once (to maximize or
+  restore) and the controls become active.
+
+---
+
 ## Repository layout
 
 ```
@@ -136,6 +160,15 @@ DownMan/
 ├── src-tauri/               # Rust core
 │   ├── src/lib.rs           # commands, engine spawn, HTTP bridge
 │   ├── src/aria2.rs         # aria2 JSON-RPC client
+│   ├── src/state_db.rs      # SQLite migrations and legacy backup
+│   ├── src/profiles.rs      # reusable download profiles
+│   ├── src/media_policy.rs  # validation + aria2/yt-dlp policy arguments
+│   ├── src/collections.rs   # paged playlist/channel inspection
+│   ├── src/preflight.rs     # bulk URL review and estimates
+│   ├── src/archive.rs       # completed-media identity and M3U export
+│   ├── src/scheduler.rs     # backend schedule and network policy
+│   ├── src/subscriptions.rs # follows, seen state, and review inbox
+│   ├── src/search.rs        # bounded media search sessions
 │   ├── binaries/            # local build staging (gitignored); aria2/ffmpeg are runtime deps
 │   └── tauri.conf.json, Cargo.toml, capabilities/
 ├── extensions/              # MV3 browser extension (Chromium + Firefox)

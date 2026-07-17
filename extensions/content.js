@@ -479,7 +479,7 @@ function onClick() {
     return;
   }
   if (DM_DEBUG) console.log("[DownMan] media-intent", JSON.stringify({
-    build: "1.0.0",
+    build: "1.1.0",
     context: intent.contextKind,
     element: intent.element,
     currentSrc: intent.currentSrc,

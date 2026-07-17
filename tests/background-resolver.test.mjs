@@ -15,6 +15,7 @@ function browserWorker(session = {}, options = {}) {
     downloadFilename: [],
     headersReceived: [],
     messages: [],
+    storageChanged: [],
     tabRemoved: [],
   };
   const posted = [];
@@ -58,7 +59,16 @@ function browserWorker(session = {}, options = {}) {
       },
       async resume(id) { resumed.push(id); actions.push(`resume:${id}`); },
       async erase(query) { erased.push(query); actions.push(`erase:${query.id}`); return [query.id]; },
-      setUiOptions(options, callback) { uiOptions.push(options); callback?.(); },
+      setUiOptions(uiOption, callback) {
+        uiOptions.push(uiOption);
+        if (options.uiRestoreFailsOnce && uiOptions.length === 1) {
+          runtimeLastError = { message: "temporary UI failure" };
+          callback?.();
+          runtimeLastError = null;
+          return;
+        }
+        callback?.();
+      },
       async search(query) {
         actions.push(`search:${query.id}`);
         return options.downloads?.filter((item) => item.id === query.id) || [];
@@ -75,6 +85,7 @@ function browserWorker(session = {}, options = {}) {
       onMessage: event("messages"),
     },
     storage: {
+      onChanged: event("storageChanged"),
         local: {
         async get(keys) {
           const names = Array.isArray(keys) ? keys : [keys];
@@ -97,6 +108,7 @@ function browserWorker(session = {}, options = {}) {
     },
   };
   const context = vm.createContext({
+    AbortController,
     chrome,
     console,
     URL,
@@ -104,8 +116,12 @@ function browserWorker(session = {}, options = {}) {
     clearTimeout,
     fetch: async (url, init) => {
       if (String(url).endsWith("/rules")) {
-        if (!options.rules) throw new Error("app offline");
-        return { ok: true, async json() { return options.rules; } };
+        if (options.offline) throw new Error("app offline");
+        const fallback = { enabled: true, autoExts: ["ZIP", "EXE", "MD"], blockSites: [], blockAddresses: [] };
+        return { ok: true, async json() { return structuredClone(options.rules || fallback); } };
+      }
+      if (options.hangAdd) {
+        return new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true }));
       }
       posted.push(JSON.parse(init.body));
       actions.push("post");
@@ -114,7 +130,10 @@ function browserWorker(session = {}, options = {}) {
     setTimeout,
     structuredClone,
   });
-  vm.runInContext(backgroundSource, context, { filename: "background.js" });
+  const source = options.bridgeTimeoutMs
+    ? backgroundSource.replace("const BRIDGE_REQUEST_TIMEOUT_MS = 15000;", `const BRIDGE_REQUEST_TIMEOUT_MS = ${options.bridgeTimeoutMs};`)
+    : backgroundSource;
+  vm.runInContext(source, context, { filename: "background.js" });
 
   async function message(message, sender) {
     return new Promise((resolve, reject) => {
@@ -265,13 +284,105 @@ test("default rules capture a ZIP browser download", async () => {
   await waitFor(() => worker.posted.length === 1, "ZIP download was not captured");
   assert.deepEqual(worker.cancelled, [41]);
   assert.deepEqual(worker.paused, [41]);
-  assert.deepEqual(worker.actions.filter((action) => action !== "search:41"), ["pause:41", "post", "cancel:41"]);
+  assert.deepEqual(worker.actions.filter((action) => action !== "search:41"), ["pause:41", "post", "cancel:41", "erase:41"]);
   assert.deepEqual(worker.posted[0].uris, ["https://dl.test/platform-tools-latest-linux.zip"]);
+  assert.equal(worker.posted[0].kind, "browser");
+  assert.equal(worker.posted[0].options.filename, "platform-tools-latest-linux.zip");
 });
 
-test("Chrome's own download UI is hidden while intercepting and restored when off", async () => {
-  const rules = { enabled: true, autoExts: ["ZIP"], blockSites: [], blockAddresses: [] };
-  const worker = browserWorker({}, { rules });
+test("configured JSON is captured with the browser-resolved filename", async () => {
+  const worker = browserWorker({}, {
+    rules: { enabled: true, autoExts: ["JSON"], blockSites: [], blockAddresses: [] },
+  });
+  worker.listeners.downloadCreated[0](browserDownload({
+    id: 61,
+    url: "https://api.test/export?id=7",
+    finalUrl: "https://api.test/export?id=7",
+    filename: "/tmp/report.json",
+    fileSize: 4096,
+    totalBytes: 4096,
+  }));
+
+  await waitFor(() => worker.posted.length === 1, "JSON download was not captured");
+  assert.equal(worker.posted[0].kind, "browser");
+  assert.equal(worker.posted[0].options.filename, "report.json");
+  assert.deepEqual(worker.cancelled, [61]);
+});
+
+test("small extensionless download remains entirely browser-owned", async () => {
+  const worker = browserWorker();
+  worker.listeners.downloadCreated[0](browserDownload({
+    id: 62,
+    url: "https://files.test/download",
+    finalUrl: "https://files.test/download",
+    filename: "/tmp/download",
+    fileSize: 4096,
+    totalBytes: 4096,
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  assert.deepEqual(worker.paused, []);
+  assert.deepEqual(worker.cancelled, []);
+  assert.equal(worker.posted.length, 0);
+});
+
+test("offline rules fail open without pausing a configured download", async () => {
+  const worker = browserWorker({}, { offline: true });
+  worker.listeners.downloadCreated[0](browserDownload({ id: 63 }));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  assert.deepEqual(worker.paused, []);
+  assert.deepEqual(worker.cancelled, []);
+  assert.equal(worker.posted.length, 0);
+});
+
+test("hung bridge handoff releases the filename hook and resumes the browser", async () => {
+  const worker = browserWorker({}, { hangAdd: true, bridgeTimeoutMs: 20 });
+  let suggested = 0;
+  worker.listeners.downloadFilename[0](browserDownload({ id: 64 }), () => { suggested += 1; });
+  await waitFor(() => suggested === 1, "filename hook stayed held after bridge timeout");
+
+  assert.deepEqual(worker.paused, [64]);
+  assert.deepEqual(worker.resumed, [64]);
+  assert.deepEqual(worker.cancelled, []);
+});
+
+test("changing the endpoint invalidates cached interception rules", async () => {
+  const activeRules = { enabled: true, autoExts: ["ZIP"], blockSites: [], blockAddresses: [] };
+  const worker = browserWorker({}, { rules: activeRules });
+  worker.listeners.downloadCreated[0](browserDownload({ id: 65 }));
+  await waitFor(() => worker.posted.length === 1, "initial ZIP was not captured");
+
+  activeRules.autoExts = ["JSON"];
+  worker.listeners.storageChanged[0]({ server: { oldValue: "http://old", newValue: "http://new" } }, "local");
+  worker.listeners.downloadCreated[0](browserDownload({
+    id: 66,
+    url: "https://api.test/data",
+    finalUrl: "https://api.test/data",
+    filename: "/tmp/data.json",
+    fileSize: 1024,
+    totalBytes: 1024,
+  }));
+  await waitFor(() => worker.posted.length === 2, "new endpoint rules were not fetched");
+  assert.equal(worker.posted[1].options.filename, "data.json");
+});
+
+test("a download UI hidden by an earlier build is restored on startup", async () => {
+  const worker = browserWorker({}, { local: { dmHideDownloadUi: true } });
+  await waitFor(() => worker.uiOptions.some((option) => option.enabled === true), "a previously hidden download UI should be restored");
+  assert.equal(worker.uiOptions.some((option) => option.enabled === false), false, "DownMan must never hide the download UI");
+});
+
+test("a transient download UI restore failure is retried", async () => {
+  const worker = browserWorker({}, { local: { dmHideDownloadUi: true }, uiRestoreFailsOnce: true });
+  await waitFor(() => worker.uiOptions.length === 1, "initial UI restore was not attempted");
+  worker.listeners.downloadCreated[0](browserDownload({ id: 67 }));
+  await waitFor(() => worker.uiOptions.length === 2, "UI restore was not retried");
+  assert.deepEqual(worker.uiOptions.map((option) => option.enabled), [true, true]);
+});
+
+test("the browser download UI is left untouched when DownMan never hid it", async () => {
+  const worker = browserWorker({}, { rules: { enabled: true, autoExts: ["ZIP"], blockSites: [], blockAddresses: [] } });
   worker.listeners.downloadCreated[0](browserDownload({
     id: 60,
     url: "https://dl.test/pack.zip",
@@ -280,11 +391,7 @@ test("Chrome's own download UI is hidden while intercepting and restored when of
     referrer: "",
   }));
   await waitFor(() => worker.posted.length === 1, "download was not captured");
-  await waitFor(() => worker.uiOptions.some((option) => option.enabled === false), "download UI should be hidden while intercepting");
-
-  rules.enabled = false;
-  await worker.message({ dm: "rules-changed" }, { tab: { id: 1 } });
-  await waitFor(() => worker.uiOptions.some((option) => option.enabled === true), "download UI should be restored when interception is off");
+  assert.deepEqual(worker.uiOptions, [], "DownMan must not toggle the download UI on a fresh install");
 });
 
 test("onChanged captures an EXE after its redirect and filename resolve", async () => {
@@ -387,7 +494,7 @@ test("filename hook holds Chromium download until handoff and cancellation finis
   await waitFor(() => suggested === 1, "filename hook did not release");
 
   assert.deepEqual(worker.paused, [46]);
-  assert.deepEqual(worker.actions, ["pause:46", "post", "cancel:46"]);
+  assert.deepEqual(worker.actions, ["pause:46", "post", "cancel:46", "erase:46"]);
 });
 
 test("tiny Markdown is handed off while Chromium filename finalization is held", async () => {
@@ -406,7 +513,7 @@ test("tiny Markdown is handed off while Chromium filename finalization is held",
 
   assert.equal(worker.posted.length, 1);
   assert.deepEqual(worker.cancelled, [49]);
-  assert.deepEqual(worker.actions, ["pause:49", "post", "cancel:49"]);
+  assert.deepEqual(worker.actions, ["pause:49", "post", "cancel:49", "erase:49"]);
 });
 
 test("callback runtime.lastError from late pause is consumed without console leakage", async () => {
@@ -418,7 +525,7 @@ test("callback runtime.lastError from late pause is consumed without console lea
   assert.equal(worker.lastErrorReads(), 1);
   assert.equal(worker.posted.length, 1);
   assert.deepEqual(worker.cancelled, [52]);
-  assert.deepEqual(worker.actions, ["pause:52", "post", "cancel:52"]);
+  assert.deepEqual(worker.actions, ["pause:52", "post", "cancel:52", "erase:52"]);
 });
 
 test("completed blob Markdown is adopted into DownMan and removed from Chrome history", async () => {

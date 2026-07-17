@@ -1,6 +1,6 @@
 import { type ReactElement, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { Aria2Task, api } from "../lib/api";
+import { Aria2Task, JobSchedule, NetworkOverride, api } from "../lib/api";
 import { fmtBytes } from "../lib/format";
 import { toast } from "../lib/toast";
 import { queueOf, taskUrl, useStore } from "../store";
@@ -377,6 +377,7 @@ export function DetailsPanel({ t }: { t: Aria2Task }) {
   const [onFinCmd, setOnFinCmd] = useState("");
   const [csInput, setCsInput] = useState(() => t.dmChecksum || "");
   const [csSaved, setCsSaved] = useState(false);
+  const [policyOpen, setPolicyOpen] = useState(false);
   const active = t.status === "active";
   const numPieces = +(t.numPieces || 0);
   const conns = +(t.connections || 0);
@@ -440,6 +441,14 @@ export function DetailsPanel({ t }: { t: Aria2Task }) {
         </div>
       )}
       {canControl && (
+        <div className="border-t border-white/5 pt-2">
+          <button className="flex items-center gap-1.5 text-xs text-slate-500 hover:text-slate-300" onClick={() => setPolicyOpen((value) => !value)}>
+            <I.Down className={`w-3.5 h-3.5 transition-transform ${policyOpen ? "rotate-180" : ""}`} /> Schedule &amp; network overrides
+          </button>
+          {policyOpen && <JobPolicyEditor t={t} />}
+        </div>
+      )}
+      {canControl && (
         <div className="flex items-center gap-2 text-xs text-slate-500 flex-wrap">
           <span>When this finishes</span>
           <div className="relative">
@@ -491,6 +500,87 @@ export function DetailsPanel({ t }: { t: Aria2Task }) {
       )}
     </div>
   );
+}
+
+const EMPTY_NETWORK: NetworkOverride = {
+  maxDownloadLimit: "", connections: 0, split: 0, proxy: "", userAgent: "", headers: [],
+  cookiesBrowser: "", httpUsername: "", hasPassword: false, meteredBehavior: "inherit",
+};
+
+function JobPolicyEditor({ t }: { t: Aria2Task }) {
+  const [schedule, setSchedule] = useState<JobSchedule>(t.dmSchedule || { mode: "inherit", window: null });
+  const [network, setNetwork] = useState<NetworkOverride>(t.dmNetworkOverride || EMPTY_NETWORK);
+  const [password, setPassword] = useState("");
+  const [message, setMessage] = useState("");
+
+  useEffect(() => {
+    api.jobPolicyGet(t.gid).then((meta) => {
+      setSchedule(meta.schedule || { mode: "inherit", window: null });
+      setNetwork(meta.network_override || EMPTY_NETWORK);
+    }).catch(() => {});
+  }, [t.gid]);
+
+  function setMode(mode: JobSchedule["mode"]) {
+    setSchedule((current) => ({
+      mode,
+      window: mode === "window" ? current.window || { start: "01:00", stop: "08:00", days: [] } : null,
+    }));
+  }
+
+  async function savePolicy() {
+    try {
+      const meta = await api.jobPolicySet(t.gid, schedule, network, password || undefined);
+      setSchedule(meta.schedule);
+      setNetwork(meta.network_override);
+      setPassword("");
+      setMessage("Saved — backend policy is active");
+    } catch (error) {
+      setMessage(String(error));
+    }
+  }
+
+  async function clearPolicy() {
+    try {
+      const meta = await api.jobPolicyClear(t.gid);
+      setSchedule(meta.schedule);
+      setNetwork(meta.network_override);
+      setPassword("");
+      setMessage("Overrides cleared");
+    } catch (error) {
+      setMessage(String(error));
+    }
+  }
+
+  return (
+    <div className="mt-2 space-y-3 border border-white/5 p-3">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+        <PolicyField label="Schedule">
+          <select value={schedule.mode} onChange={(event) => setMode(event.target.value as JobSchedule["mode"])} className="control !py-1.5 text-xs">
+            <option value="inherit">Inherit queue / global</option><option value="always">Always allowed</option><option value="paused">Always paused</option><option value="window">Custom window</option>
+          </select>
+        </PolicyField>
+        {schedule.mode === "window" && <PolicyField label="Start"><input type="time" value={schedule.window?.start || "01:00"} onChange={(event) => setSchedule({ ...schedule, window: { ...(schedule.window || { stop: "08:00", days: [] }), start: event.target.value } })} className="control !py-1.5 text-xs" /></PolicyField>}
+        {schedule.mode === "window" && <PolicyField label="Stop"><input type="time" value={schedule.window?.stop || "08:00"} onChange={(event) => setSchedule({ ...schedule, window: { ...(schedule.window || { start: "01:00", days: [] }), stop: event.target.value } })} className="control !py-1.5 text-xs" /></PolicyField>}
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+        <PolicyField label="Speed limit"><input value={network.maxDownloadLimit} onChange={(event) => setNetwork({ ...network, maxDownloadLimit: event.target.value })} placeholder="2M or blank" className="control !py-1.5 text-xs font-mono" /></PolicyField>
+        <PolicyField label="Connections"><input type="number" min="0" max="16" value={network.connections} onChange={(event) => setNetwork({ ...network, connections: Number(event.target.value) || 0 })} className="control !py-1.5 text-xs" /></PolicyField>
+        <PolicyField label="Split"><input type="number" min="0" max="64" value={network.split} onChange={(event) => setNetwork({ ...network, split: Number(event.target.value) || 0 })} className="control !py-1.5 text-xs" /></PolicyField>
+        <PolicyField label="Proxy"><input value={network.proxy} onChange={(event) => setNetwork({ ...network, proxy: event.target.value })} placeholder="http://host:port" className="control !py-1.5 text-xs font-mono" /></PolicyField>
+        <PolicyField label="User-Agent"><input value={network.userAgent} onChange={(event) => setNetwork({ ...network, userAgent: event.target.value })} className="control !py-1.5 text-xs font-mono" /></PolicyField>
+        <PolicyField label="Cookies browser"><select value={network.cookiesBrowser} onChange={(event) => setNetwork({ ...network, cookiesBrowser: event.target.value })} className="control !py-1.5 text-xs"><option value="">Inherit</option>{["firefox", "chrome", "chromium", "brave", "edge", "vivaldi", "opera"].map((browser) => <option key={browser}>{browser}</option>)}</select></PolicyField>
+        <PolicyField label="HTTP username"><input value={network.httpUsername} onChange={(event) => setNetwork({ ...network, httpUsername: event.target.value })} className="control !py-1.5 text-xs font-mono" /></PolicyField>
+        <PolicyField label={network.hasPassword ? "Replace saved password" : "HTTP password"}><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder={network.hasPassword ? "Saved; enter to replace" : "Not stored"} className="control !py-1.5 text-xs" /></PolicyField>
+        <PolicyField label="Metered network"><select value={network.meteredBehavior || "inherit"} onChange={(event) => setNetwork({ ...network, meteredBehavior: event.target.value as NetworkOverride["meteredBehavior"] })} className="control !py-1.5 text-xs"><option value="inherit">Inherit global</option><option value="pause">Always pause</option><option value="ignore">Ignore metered pause</option></select></PolicyField>
+      </div>
+      <PolicyField label="Headers"><textarea value={network.headers.join("\n")} onChange={(event) => setNetwork({ ...network, headers: event.target.value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean) })} placeholder="One header per line" className="control min-h-16 resize-y !py-1.5 text-xs font-mono" /></PolicyField>
+      <div className="flex flex-wrap items-center gap-2"><button className="btn-primary !py-1.5 text-xs" onClick={savePolicy}>Apply overrides</button><button className="btn-ghost !py-1.5 text-xs" onClick={clearPolicy}>Clear overrides</button>{message && <span className="text-[11px] text-slate-500 break-words">{message}</span>}</div>
+    </div>
+  );
+}
+
+function PolicyField({ label, children }: { label: string; children: React.ReactNode }) {
+  return <label className="block min-w-0"><span className="block text-[10px] font-mono uppercase text-slate-600 mb-1">{label}</span>{children}</label>;
 }
 
 function TrackerEditor({ t }: { t: Aria2Task }) {

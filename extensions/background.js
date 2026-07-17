@@ -9,7 +9,7 @@ const MediaResolver = globalThis.DownManMediaResolver;
 
 const DEFAULT_ENDPOINT = "http://127.0.0.1:6802";
 const WORKER_STARTED_AT = Date.now();
-const DM_BUILD = "1.0.0";
+const DM_BUILD = "1.1.0";
 // Verbose resolver diagnostics for the service-worker console. Off for releases.
 const DM_DEBUG = false;
 const NEW_DOWNLOAD_GRACE_MS = 60 * 1000;
@@ -206,9 +206,24 @@ async function endpoint() {
   return server || DEFAULT_ENDPOINT;
 }
 
+// Backend aria2 RPC calls are bounded at 10s; keep a buffer so the browser never
+// resumes at the exact instant DownMan may have accepted the same download.
+const BRIDGE_REQUEST_TIMEOUT_MS = 15000;
+const RULES_REQUEST_TIMEOUT_MS = 2500;
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = BRIDGE_REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function post(payload) {
   const base = await endpoint();
-  const r = await fetch(`${base}/add`, {
+  const r = await fetchWithTimeout(`${base}/add`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -255,21 +270,33 @@ let _rulesAt = 0;
 async function rules() {
   const now = Date.now();
   if (_rules && now - _rulesAt < RULES_TTL_MS) return _rules;
-  let reachable = false;
   try {
     const base = await endpoint();
-    const r = await fetch(`${base}/rules`);
-    if (r.ok) {
-      _rules = await r.json();
-      _rulesAt = now;
-      reachable = true;
-    }
-  } catch {}
-  const effective = _rules || { enabled: true, autoExts: DEFAULT_AUTO_EXTS, blockSites: [], blockAddresses: [] };
-  // Hide Chrome's own download bubble only while DownMan is reachable and
-  // interception is on, so downloads still appear normally when the app is closed.
-  applyDownloadUi(reachable && effective.enabled !== false);
+    const r = await fetchWithTimeout(`${base}/rules`, {}, RULES_REQUEST_TIMEOUT_MS);
+    if (!r.ok) throw new Error("rules unavailable");
+    _rules = await r.json();
+    _rulesAt = now;
+  } catch {
+    // Fail open: if DownMan cannot confirm the current interception rules, leave
+    // the file with the browser instead of pausing it on stale/default settings.
+    _rules = null;
+    _rulesAt = 0;
+  }
+  const effective = _rules || { enabled: false, autoExts: DEFAULT_AUTO_EXTS, blockSites: [], blockAddresses: [] };
+  // Keep the browser's own download UI visible. Files DownMan does not take over
+  // (unconfigured extensions, small files) must stay visible so the browser hands
+  // them to the user — hiding the UI made those downloads look like they vanished.
+  applyDownloadUi(false);
   return effective;
+}
+
+if (chrome.storage?.onChanged) {
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes.server) {
+      _rules = null;
+      _rulesAt = 0;
+    }
+  });
 }
 
 function extOf(s) {
@@ -523,7 +550,7 @@ async function resolveMediaIntent(tabId, frameId, intent) {
 // Ask the app for the real, per-video quality list (yt-dlp -J under the hood).
 async function fetchFormats(url, referer = "") {
   const base = await endpoint();
-  const r = await fetch(`${base}/formats`, {
+  const r = await fetchWithTimeout(`${base}/formats`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ url, referer, cookies: await cookiesPref() }),
@@ -569,37 +596,36 @@ function downloadsCall(method, ...args) {
   });
 }
 
-// Chrome pops a download bubble the instant any download starts. While DownMan is
-// capturing downloads that bubble only flashes files we immediately hand off (and,
-// for blob files such as GitHub .md, adopt then erase), which looks like a broken
-// or vanished download. Hide Chrome's own download UI while interception is active
-// so DownMan is the single place downloads show up. It is restored automatically
-// when DownMan is closed, interception is turned off, or the extension is removed.
-let _downloadUiHidden = false;
+// DownMan no longer hides the browser's own download UI. An earlier build hid
+// Chrome's download bubble so hand-offs wouldn't flash, but that also hid every
+// download DownMan did NOT take over (unconfigured extensions, small files), which
+// made them look like they had vanished. applyDownloadUi now only RESTORES the UI,
+// once, and only if that earlier build had actually hidden it; a fresh install is
+// left untouched (the browser shows its downloads normally).
+let _downloadUiChecked = false;
 async function applyDownloadUi(hidden) {
-  hidden = !!hidden;
-  if (_downloadUiHidden === hidden) return;
+  if (hidden || _downloadUiChecked) return; // never hide — see note above
   try {
-    if (chrome.downloads?.setUiOptions) {
-      await downloadsCall("setUiOptions", { enabled: !hidden });
-    } else if (chrome.downloads?.setShelfEnabled) {
-      chrome.downloads.setShelfEnabled(!hidden);
-      void chrome.runtime.lastError;
-    } else {
-      return;
+    const stored = await chrome.storage?.local?.get?.("dmHideDownloadUi");
+    if (!stored || !stored.dmHideDownloadUi) {
+      _downloadUiChecked = true;
+      return; // never hidden — leave the UI as-is
     }
-    _downloadUiHidden = hidden;
-    chrome.storage?.local?.set?.({ dmHideDownloadUi: hidden });
+    if (chrome.downloads?.setUiOptions) {
+      await downloadsCall("setUiOptions", { enabled: true });
+    } else if (chrome.downloads?.setShelfEnabled) {
+      chrome.downloads.setShelfEnabled(true);
+      void chrome.runtime.lastError;
+    }
+    _downloadUiChecked = true;
+    chrome.storage?.local?.set?.({ dmHideDownloadUi: false });
   } catch (_) { /* download UI control is best-effort */ }
 }
 
-// Reapply the last preference immediately on service-worker start (no network) so
-// the bubble stays hidden across worker restarts until rules() reconciles it.
+// On service-worker start, restore the browser download UI if a previous build left
+// it hidden, so downloads the browser handles are visible again.
 (async () => {
-  try {
-    const stored = await chrome.storage.local.get("dmHideDownloadUi");
-    if (stored && stored.dmHideDownloadUi) await applyDownloadUi(true);
-  } catch (_) { /* reconcile on the next rules fetch instead */ }
+  try { await applyDownloadUi(false); } catch (_) { /* reconciles on the next rules fetch */ }
 })();
 
 async function persistBrowserDownloadState() {
@@ -682,9 +708,22 @@ async function maybeCaptureBrowserDownload(item, filenameHeld = false) {
     capturedBrowserDownloads.add(item.id);
     queueBrowserStatePersist();
     try {
-      await send([url], item.referrer ? { referer: item.referrer } : {});
+      const filename = String(item.filename || "").split(/[\\/]/).pop() || "";
+      await post({
+        kind: "browser",
+        uris: [url],
+        options: {
+          ...(item.referrer ? { referer: item.referrer } : {}),
+          ...(filename ? { filename } : {}),
+        },
+      });
       try {
         await downloadsCall("cancel", item.id);
+        // Remove the cancelled stub so it doesn't linger in the browser's download
+        // list now that DownMan owns the file and the browser UI is visible again.
+        if (chrome.downloads?.erase) {
+          try { await downloadsCall("erase", { id: item.id }); } catch (_) { /* stub cleanup is best-effort */ }
+        }
       } catch (error) {
         notifyFailure("DownMan accepted this download, but the browser copy may continue", error);
       }
@@ -863,7 +902,7 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 async function grabPage(url) {
   const base = await endpoint();
-  await fetch(`${base}/grab`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }) });
+  await fetchWithTimeout(`${base}/grab`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }) });
 }
 
 // Ask the content script in the clicked frame for the exact media intent.

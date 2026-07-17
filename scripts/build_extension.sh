@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the browser extension archives from a single source manifest:
 #   DownMan.zip  — Chrome/Chromium (MV3 `background.service_worker`)
-#   DownMan.xpi  — Firefox (MV3 event page: `background.scripts`, required by Fx 115+)
+#   DownMan.xpi  — Firefox 140+ (MV3 event page via `background.scripts`)
 # The source extensions/manifest.json is Chrome-native (service_worker only), so
 # loading the unpacked folder in Chrome is warning-free. The Firefox package is
 # generated with a background.scripts event page so Firefox has a working background.

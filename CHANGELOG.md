@@ -5,6 +5,73 @@ All notable changes to DownMan are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] — 2026-07-17
+
+### Added
+
+- Add reusable download profiles with built-in presets, active-profile selection, immutable
+  per-job policy snapshots, output rules, and per-download network overrides.
+- Add a paged Collection Inspector for playlists and channels with filtering, persistent
+  selection, cancellation, archive indicators, and bounded 10,000-item handling.
+- Add semantic media policies for quality, container, codec, FPS, audio extraction, subtitles,
+  SponsorBlock, metadata, thumbnails, chapters, clip ranges, and live-stream behavior.
+- Add bulk URL preflight with normalization, classification, duplicate/conflict review, optional
+  size and ETA estimates, and selected-item commit.
+- Add extractor archive deduplication, playlist synchronization, and M3U export backed by SQLite.
+- Add backend-owned global, queue, and per-job schedules that continue while the UI is hidden,
+  plus proxy, headers, user-agent, connection, split, retry, and speed policy overrides.
+- Add followed channel/playlist polling with bounded review or opt-in auto-download actions,
+  notifications, filters, browser cookies, live overrides, and duplicate suppression.
+- Add paged keyword media search with selectable results and profile-aware downloads.
+- Add per-download clip and live-stream overrides to the media download dialog.
+
+### Changed
+
+- Introduce a versioned bundled-SQLite state store while preserving and backing up legacy 1.0.1
+  files; early 1.1 subscription schemas migrate in place without losing followed sources.
+- Promote Profiles, Library, Follows, and Search workflows into the main desktop interface.
+- Consolidate the media archive into the single Library view (dropping the duplicate Settings
+  tab) and wrap the Settings tab strip instead of scrolling it horizontally.
+
+### Fixed
+
+- Treat an end-only clip as an absolute range from zero instead of yt-dlp's relative
+  "last N seconds" syntax.
+- Trap focus and expose modal, tab, and active-profile state to assistive technology across the
+  confirmation dialog and new 1.1 workspaces.
+- Capture the exact clicked video in a busy social feed by preferring its own media manifest, so a
+  quoted or embedded post's video is no longer downloaded instead.
+
+## [1.0.1] — 2026-07-17
+
+### Added
+
+- Automatically add file extensions introduced in Categories to browser auto-capture and
+  report which types were added.
+- Enable separate production and development Content Security Policies for the Tauri WebView.
+
+### Fixed
+
+- Leave unconfigured, extensionless, small, blocked, and offline-fallback downloads with the
+  browser while keeping its download UI visible; configured JSON files now preserve the
+  browser-resolved filename when handed to DownMan.
+- Bound browser-extension and aria2 requests, make bridge handling concurrent and size-limited,
+  invalidate stale endpoint rules, and prevent a slow request from blocking browser downloads.
+- Start silently at login, keep duplicate hidden launches silent, render tray labels on first
+  launch, and synchronize the tray speed-limit check state.
+- Clean up aria2, yt-dlp, ffmpeg, and sleep-inhibitor processes on normal exit or parent crash,
+  without terminating unrelated aria2 instances.
+- Keep deleted queue assignments under Main queue controls and safely quote autostart paths.
+- Re-resolve selected video qualities by height instead of reusing session-specific format IDs,
+  preventing an available 480p selection from failing as "Requested format is not available."
+- Persist and validate performance settings, provide one consistent browser-rule save path, and
+  keep category controls and save feedback usable at narrow widths.
+
+### Maintenance
+
+- Apply standard Rust formatting and resolve all Clippy warnings; strict Clippy now passes with
+  warnings treated as errors.
+
 ## [1.0.0] — 2026-07-15
 
 First stable release. Consolidates the host-agnostic media resolver and cross-site capture
@@ -176,6 +243,8 @@ extension share one version line; the extension's 0.1.0–0.1.1 builds were pre�
   web pages are rejected, so a website cannot drive the download manager. See
   [`SECURITY.md`](SECURITY.md).
 
+[1.1.0]: https://github.com/rai-himanshu07/DownMan/releases/tag/v1.1.0
+[1.0.1]: https://github.com/rai-himanshu07/DownMan/releases/tag/v1.0.1
 [1.0.0]: https://github.com/rai-himanshu07/DownMan/releases/tag/v1.0.0
 [0.1.4]: https://github.com/rai-himanshu07/DownMan/releases/tag/v0.1.4
 [0.1.3]: https://github.com/rai-himanshu07/DownMan/releases/tag/v0.1.3

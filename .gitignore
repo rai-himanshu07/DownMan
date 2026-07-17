@@ -39,3 +39,7 @@ src-tauri/binaries/downman-ytdlp-x86_64-unknown-linux-gnu
 # logs
 *.log
 npm-debug.log*
+
+# MemPalace per-project files (issue #185)
+mempalace.yaml
+entities.json

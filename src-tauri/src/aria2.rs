@@ -1,6 +1,7 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
+use std::time::Duration;
 
 /// Minimal aria2 JSON-RPC client over HTTP.
 #[derive(Clone)]
@@ -15,7 +16,11 @@ impl Aria2 {
         Self {
             endpoint: format!("http://127.0.0.1:{port}/jsonrpc"),
             secret,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(10))
+                .build()
+                .expect("valid aria2 HTTP client"),
         }
     }
 
@@ -43,9 +48,7 @@ impl Aria2 {
     }
 
     pub async fn add_uri(&self, uris: Vec<String>, options: Value) -> Result<String> {
-        let r = self
-            .call("aria2.addUri", json!([uris, options]))
-            .await?;
+        let r = self.call("aria2.addUri", json!([uris, options])).await?;
         Ok(r.as_str().unwrap_or_default().to_string())
     }
 
@@ -101,6 +104,16 @@ impl Aria2 {
         Ok(())
     }
 
+    pub async fn save_session(&self) -> Result<()> {
+        self.call("aria2.saveSession", json!([])).await?;
+        Ok(())
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        self.call("aria2.shutdown", json!([])).await?;
+        Ok(())
+    }
+
     /// Per-download options (speed limit, file selection, etc.).
     pub async fn change_option(&self, gid: &str, opts: Value) -> Result<()> {
         self.call("aria2.changeOption", json!([gid, opts])).await?;
@@ -125,7 +138,8 @@ impl Aria2 {
 
     /// Add downloads from base64-encoded .metalink/.meta4 contents (may be several files).
     pub async fn add_metalink(&self, metalink_b64: String, options: Value) -> Result<Value> {
-        self.call("aria2.addMetalink", json!([metalink_b64, options])).await
+        self.call("aria2.addMetalink", json!([metalink_b64, options]))
+            .await
     }
 }
 

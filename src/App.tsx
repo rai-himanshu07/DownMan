@@ -7,6 +7,8 @@ import AddModal from "./components/AddModal";
 import SettingsView from "./components/SettingsView";
 import StatsView from "./components/StatsView";
 import AboutView from "./components/AboutView";
+import FollowsView from "./components/FollowsView";
+import LibrarySettings from "./components/LibrarySettings";
 import FirstRunPanel from "./components/FirstRunPanel";
 import SignalBackground from "./components/SignalBackground";
 import ConfirmDownload from "./components/ConfirmDownload";
@@ -118,7 +120,11 @@ export default function App() {
     api.setAvScan(localStorage.getItem("dm-av") === "on").catch(() => {});
     api.setOrganize(localStorage.getItem("dm-organize") !== "off").catch(() => {});
     const speed = localStorage.getItem("dm-speed") || "0";
-    const opts: Record<string, string> = { "max-overall-download-limit": speed === "0" ? "0" : `${speed}K` };
+    const opts: Record<string, string> = {
+      "max-concurrent-downloads": localStorage.getItem("dm-max-downloads") || "5",
+      "max-connection-per-server": localStorage.getItem("dm-conns") || "16",
+      "max-overall-download-limit": speed === "0" ? "0" : `${speed}K`,
+    };
     const proxy = localStorage.getItem("dm-proxy") || ""; if (proxy) opts["all-proxy"] = proxy;
     const ua = localStorage.getItem("dm-ua") || ""; if (ua) opts["user-agent"] = ua;
     const header = localStorage.getItem("dm-header") || ""; if (header) opts["header"] = header;
@@ -142,40 +148,23 @@ export default function App() {
     if (grabRequest) { setGrabUrl(grabRequest); setGrabbing(true); api.clearGrabRequest().catch(() => {}); }
   }, [grabRequest]);
 
-  // ---- Scheduler: global active-hours + per-queue start/stop windows ----
-  const schedPaused = useRef(false);
-  const qSched = useRef<Record<string, boolean>>({});
+  // 1.0.1 stored global active hours in the webview. Migrate that value once;
+  // Rust owns all schedule decisions from 1.1 onward, even while this window is hidden.
   useEffect(() => {
-    const toMin = (t: string) => { const [h, m] = t.split(":").map(Number); return h * 60 + m; };
-    const tick = () => {
-      const now = new Date();
-      const cur = now.getHours() * 60 + now.getMinutes();
-
-      // Per-queue schedules: start/stop the queue when crossing its window edges.
-      for (const q of useStore.getState().queues) {
-        const sc = q.schedule;
-        if (!sc || !sc.start || !sc.stop || sc.start === sc.stop) continue;
-        const a = toMin(sc.start), b = toMin(sc.stop);
-        const inWin = a < b ? cur >= a && cur < b : cur >= a || cur < b;
-        const prev = qSched.current[q.id];
-        if (prev === undefined) { qSched.current[q.id] = inWin; continue; }
-        if (inWin !== prev) { qSched.current[q.id] = inWin; api.setQueueRunning(q.id, inWin).catch(() => {}); }
-      }
-
-      // Global active-hours window.
-      const raw = localStorage.getItem("dm-sched");
-      if (!raw) return;
-      let s: { start?: string; stop?: string };
-      try { s = JSON.parse(raw); } catch { return; }
-      if (!s.start || !s.stop || s.start === s.stop) return;
-      const a = toMin(s.start), b = toMin(s.stop);
-      const inWindow = a < b ? cur >= a && cur < b : cur >= a || cur < b; // handles overnight windows
-      if (!inWindow && !schedPaused.current) { schedPaused.current = true; api.pauseAll().catch(() => {}); }
-      else if (inWindow && schedPaused.current) { schedPaused.current = false; api.resumeAll().catch(() => {}); }
-    };
-    tick();
-    const id = setInterval(tick, 20000);
-    return () => clearInterval(id);
+    const raw = localStorage.getItem("dm-sched");
+    if (!raw) return;
+    try {
+      const legacy = JSON.parse(raw) as { start?: string; stop?: string };
+      if (!legacy.start || !legacy.stop || legacy.start === legacy.stop) return;
+      api.schedulerGet()
+        .then((current) => current.enabled || current.windows.length
+          ? current
+          : api.schedulerSet({ enabled: true, timezone: "local", windows: [{ start: legacy.start!, stop: legacy.stop!, days: [] }] }))
+        .then(() => localStorage.removeItem("dm-sched"))
+        .catch(() => {});
+    } catch {
+      /* leave malformed legacy state untouched for manual recovery */
+    }
   }, []);
 
   // ---- Clipboard monitor: when DownMan regains focus, offer a copied link ----
@@ -381,7 +370,7 @@ export default function App() {
             </button>
           </div>
         )}
-        {view !== "settings" && view !== "stats" && tasks.length > 0 && (
+        {!(["settings", "stats", "follows", "library", "about"] as const).includes(view as "settings" | "stats" | "follows" | "library" | "about") && tasks.length > 0 && (
           <div className="flex items-center gap-2 px-6 py-2 border-b border-white/5 text-xs">
             <span className="text-slate-500">Filter</span>
             <FilterSelect value={statusFilter} onChange={setStatusFilter} options={[["all", "Any status"], ["active", "Downloading"], ["waiting", "Queued"], ["paused", "Paused"], ["complete", "Completed"], ["error", "Failed"]]} />
@@ -400,6 +389,10 @@ export default function App() {
             <StatsView />
           ) : view === "about" ? (
             <AboutView />
+          ) : view === "follows" ? (
+            <FollowsView />
+          ) : view === "library" ? (
+            <LibrarySettings />
           ) : filtered.length ? (
             listMode === "table" ? (
               <DownloadTable rows={filtered} />

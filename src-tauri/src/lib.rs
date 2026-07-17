@@ -1,11 +1,21 @@
+mod archive;
 mod aria2;
+mod collections;
+mod media_policy;
+mod preflight;
+mod profiles;
+mod scheduler;
+mod search;
+mod state_db;
+mod subscriptions;
 
 use aria2::{Aria2, Snapshot};
 use once_cell::sync::{Lazy, OnceCell};
+use profiles::DownloadProfile;
 use rand::RngExt;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::os::unix::process::CommandExt;
@@ -19,6 +29,8 @@ static ARIA2: OnceCell<Aria2> = OnceCell::new();
 static SITE_JOBS: OnceCell<Mutex<Vec<Value>>> = OnceCell::new();
 static SITE_PROCESSES: OnceCell<Mutex<HashMap<String, u32>>> = OnceCell::new();
 static SITE_CANCELLED: OnceCell<Mutex<HashSet<String>>> = OnceCell::new();
+/// Process groups for legacy ffmpeg HLS downloads, so Quit cannot orphan them.
+static AUX_PROCESSES: OnceCell<Mutex<HashSet<u32>>> = OnceCell::new();
 static APP: OnceCell<tauri::AppHandle> = OnceCell::new();
 /// Downloads awaiting the user's confirmation dialog.
 static PENDING: OnceCell<Mutex<Vec<Value>>> = OnceCell::new();
@@ -83,6 +95,12 @@ static TRAY_LIMIT: OnceCell<tauri::menu::CheckMenuItem<tauri::Wry>> = OnceCell::
 static INHIBITOR: OnceCell<Mutex<Option<Child>>> = OnceCell::new();
 /// Auto-retry bookkeeping: source URL -> attempts made.
 static RETRIES: OnceCell<Mutex<HashMap<String, u32>>> = OnceCell::new();
+/// Collection inspector session -> currently running media job (one at a time).
+static COLLECTION_ACTIVE_JOBS: OnceCell<Mutex<HashMap<String, String>>> = OnceCell::new();
+/// Jobs paused by scheduler policy; only these are auto-resumed when allowed again.
+static SCHEDULER_PAUSED: OnceCell<Mutex<HashSet<String>>> = OnceCell::new();
+/// Authentication secrets are intentionally memory-only and disappear on restart.
+static JOB_PASSWORDS: OnceCell<Mutex<HashMap<String, String>>> = OnceCell::new();
 
 fn limit_val() -> &'static Mutex<String> {
     LIMIT_VAL.get_or_init(|| Mutex::new("1M".into()))
@@ -92,8 +110,24 @@ fn inhibitor() -> &'static Mutex<Option<Child>> {
     INHIBITOR.get_or_init(|| Mutex::new(None))
 }
 
+fn aux_processes() -> &'static Mutex<HashSet<u32>> {
+    AUX_PROCESSES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
 fn retries() -> &'static Mutex<HashMap<String, u32>> {
     RETRIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn collection_active_jobs() -> &'static Mutex<HashMap<String, String>> {
+    COLLECTION_ACTIVE_JOBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn scheduler_paused() -> &'static Mutex<HashSet<String>> {
+    SCHEDULER_PAUSED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn job_passwords() -> &'static Mutex<HashMap<String, String>> {
+    JOB_PASSWORDS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn history() -> &'static Mutex<Vec<Value>> {
@@ -127,10 +161,10 @@ fn lifetime_stats_file() -> std::path::PathBuf {
 
 fn save_lifetime_stats() {
     std::fs::create_dir_all(state_dir()).ok();
-    if let Ok(stats) = lifetime_stats_state().lock() {
-        if let Ok(s) = serde_json::to_string(&*stats) {
-            let _ = std::fs::write(lifetime_stats_file(), s);
-        }
+    if let Ok(stats) = lifetime_stats_state().lock()
+        && let Ok(s) = serde_json::to_string(&*stats)
+    {
+        let _ = std::fs::write(lifetime_stats_file(), s);
     }
 }
 
@@ -168,12 +202,18 @@ fn completion_category(rec: &Value) -> String {
 
 fn record_lifetime_completion(rec: &Value) {
     let gid = rec.get("gid").and_then(|v| v.as_str()).unwrap_or("");
-    let bytes = rec.get("totalLength").and_then(|v| v.as_str())
-        .and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-    let completed_at = rec.get("completedAt").and_then(|v| v.as_u64())
+    let bytes = rec
+        .get("totalLength")
+        .and_then(|v| v.as_str())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let completed_at = rec
+        .get("completedAt")
+        .and_then(|v| v.as_u64())
         .unwrap_or_else(|| now_ms() as u64);
     let category = completion_category(rec);
-    let changed = lifetime_stats_state().lock()
+    let changed = lifetime_stats_state()
+        .lock()
         .map(|mut stats| record_lifetime_entry(&mut stats, gid, bytes, &category, completed_at))
         .unwrap_or(false);
     if changed {
@@ -182,20 +222,23 @@ fn record_lifetime_completion(rec: &Value) {
 }
 
 fn load_lifetime_stats() {
-    if let Ok(s) = std::fs::read_to_string(lifetime_stats_file()) {
-        if let Ok(saved) = serde_json::from_str::<LifetimeStatsState>(&s) {
-            if let Ok(mut stats) = lifetime_stats_state().lock() {
-                *stats = saved;
-            }
-            return;
+    if let Ok(s) = std::fs::read_to_string(lifetime_stats_file())
+        && let Ok(saved) = serde_json::from_str::<LifetimeStatsState>(&s)
+    {
+        if let Ok(mut stats) = lifetime_stats_state().lock() {
+            *stats = saved;
         }
+        return;
     }
     let existing = history().lock().map(|h| h.clone()).unwrap_or_default();
     let mut seeded = LifetimeStatsState::default();
     for rec in &existing {
         let gid = rec.get("gid").and_then(|v| v.as_str()).unwrap_or("");
-        let bytes = rec.get("totalLength").and_then(|v| v.as_str())
-            .and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        let bytes = rec
+            .get("totalLength")
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
         let completed_at = rec.get("completedAt").and_then(|v| v.as_u64()).unwrap_or(0);
         let category = completion_category(rec);
         record_lifetime_entry(&mut seeded, gid, bytes, &category, completed_at);
@@ -211,20 +254,30 @@ fn lifetime_stats_value(stats: &LifetimeStatsState, now_ms_value: u64) -> Value 
     let first_day = current_day.saturating_sub(6);
     let mut last7 = StatBucket::default();
     for (day, bucket) in &stats.by_day {
-        if day.parse::<u64>().map(|d| d >= first_day && d <= current_day).unwrap_or(false) {
+        if day
+            .parse::<u64>()
+            .map(|d| d >= first_day && d <= current_day)
+            .unwrap_or(false)
+        {
             last7.count = last7.count.saturating_add(bucket.count);
             last7.bytes = last7.bytes.saturating_add(bucket.bytes);
         }
     }
-    let mut categories: Vec<Value> = stats.by_category.iter()
-        .map(|(category, bucket)| json!({
-            "category": category,
-            "count": bucket.count,
-            "bytes": bucket.bytes,
-        }))
+    let mut categories: Vec<Value> = stats
+        .by_category
+        .iter()
+        .map(|(category, bucket)| {
+            json!({
+                "category": category,
+                "count": bucket.count,
+                "bytes": bucket.bytes,
+            })
+        })
         .collect();
     categories.sort_by(|a, b| {
-        b.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0)
+        b.get("bytes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
             .cmp(&a.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0))
     });
     json!({
@@ -238,17 +291,21 @@ fn lifetime_stats_value(stats: &LifetimeStatsState, now_ms_value: u64) -> Value 
 
 fn collect_completed_gids(records: &[Value], out: &mut HashSet<String>) {
     for rec in records {
-        if rec.get("status").and_then(|v| v.as_str()) == Some("complete") {
-            if let Some(gid) = rec.get("gid").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
-                out.insert(gid.to_string());
-            }
+        if rec.get("status").and_then(|v| v.as_str()) == Some("complete")
+            && let Some(gid) = rec
+                .get("gid")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+        {
+            out.insert(gid.to_string());
         }
     }
 }
 
 #[tauri::command]
 fn lifetime_stats() -> Value {
-    lifetime_stats_state().lock()
+    lifetime_stats_state()
+        .lock()
         .map(|stats| lifetime_stats_value(&stats, now_ms() as u64))
         .unwrap_or_else(|_| lifetime_stats_value(&LifetimeStatsState::default(), now_ms() as u64))
 }
@@ -259,12 +316,11 @@ async fn reset_lifetime_stats() -> Value {
     if let Ok(records) = history().lock() {
         collect_completed_gids(&records, &mut known_completed);
     }
-    if let Some(c) = ARIA2.get() {
-        if let Ok(stopped) = c.tell_stopped().await {
-            if let Some(records) = stopped.as_array() {
-                collect_completed_gids(records, &mut known_completed);
-            }
-        }
+    if let Some(c) = ARIA2.get()
+        && let Ok(stopped) = c.tell_stopped().await
+        && let Some(records) = stopped.as_array()
+    {
+        collect_completed_gids(records, &mut known_completed);
     }
     if let Ok(jobs) = site_jobs().lock() {
         collect_completed_gids(&jobs, &mut known_completed);
@@ -289,26 +345,26 @@ fn history_file() -> std::path::PathBuf {
 }
 
 fn save_history() {
-    if let Ok(h) = history().lock() {
-        if let Ok(s) = serde_json::to_string(&*h) {
-            let _ = std::fs::write(history_file(), s);
-        }
+    if let Ok(h) = history().lock()
+        && let Ok(s) = serde_json::to_string(&*h)
+    {
+        let _ = std::fs::write(history_file(), s);
     }
 }
 
 fn load_history() {
-    if let Ok(s) = std::fs::read_to_string(history_file()) {
-        if let Ok(Value::Array(mut arr)) = serde_json::from_str::<Value>(&s) {
-            // Purge stale magnet-metadata / superseded placeholders saved by older builds.
-            let before = arr.len();
-            arr.retain(|t| !is_superseded(t));
-            let changed = arr.len() != before;
-            if let Ok(mut h) = history().lock() {
-                *h = arr;
-            }
-            if changed {
-                save_history();
-            }
+    if let Ok(s) = std::fs::read_to_string(history_file())
+        && let Ok(Value::Array(mut arr)) = serde_json::from_str::<Value>(&s)
+    {
+        // Purge stale magnet-metadata / superseded placeholders saved by older builds.
+        let before = arr.len();
+        arr.retain(|t| !is_superseded(t));
+        let changed = arr.len() != before;
+        if let Ok(mut h) = history().lock() {
+            *h = arr;
+        }
+        if changed {
+            save_history();
         }
     }
 }
@@ -332,26 +388,28 @@ fn rules_file() -> std::path::PathBuf {
 }
 
 fn load_rules() {
-    if let Ok(s) = std::fs::read_to_string(rules_file()) {
-        if let Ok(v) = serde_json::from_str::<Value>(&s) {
-            if let Ok(mut r) = rules().lock() {
-                *r = v;
-            }
-        }
+    if let Ok(s) = std::fs::read_to_string(rules_file())
+        && let Ok(v) = serde_json::from_str::<Value>(&s)
+        && let Ok(mut r) = rules().lock()
+    {
+        *r = v;
     }
 }
 
 fn save_rules() {
-    if let Ok(r) = rules().lock() {
-        if let Ok(s) = serde_json::to_string_pretty(&*r) {
-            let _ = std::fs::write(rules_file(), s);
-        }
+    if let Ok(r) = rules().lock()
+        && let Ok(s) = serde_json::to_string_pretty(&*r)
+    {
+        let _ = std::fs::write(rules_file(), s);
     }
 }
 
 #[tauri::command]
 fn get_rules() -> Value {
-    rules().lock().map(|r| r.clone()).unwrap_or_else(|_| default_rules())
+    rules()
+        .lock()
+        .map(|r| r.clone())
+        .unwrap_or_else(|_| default_rules())
 }
 
 #[tauri::command]
@@ -386,20 +444,19 @@ fn categories_file() -> std::path::PathBuf {
 }
 
 fn load_categories() {
-    if let Ok(s) = std::fs::read_to_string(categories_file()) {
-        if let Ok(v @ Value::Array(_)) = serde_json::from_str::<Value>(&s) {
-            if let Ok(mut c) = categories().lock() {
-                *c = v;
-            }
-        }
+    if let Ok(s) = std::fs::read_to_string(categories_file())
+        && let Ok(v @ Value::Array(_)) = serde_json::from_str::<Value>(&s)
+        && let Ok(mut c) = categories().lock()
+    {
+        *c = v;
     }
 }
 
 fn save_categories() {
-    if let Ok(c) = categories().lock() {
-        if let Ok(s) = serde_json::to_string_pretty(&*c) {
-            let _ = std::fs::write(categories_file(), s);
-        }
+    if let Ok(c) = categories().lock()
+        && let Ok(s) = serde_json::to_string_pretty(&*c)
+    {
+        let _ = std::fs::write(categories_file(), s);
     }
 }
 
@@ -416,26 +473,34 @@ fn resolve_folder(folder: &str) -> std::path::PathBuf {
 /// Resolve a filename to (category name, absolute destination folder).
 fn category_of(name: &str) -> (String, std::path::PathBuf) {
     let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
-    if let Ok(guard) = categories().lock() {
-        if let Value::Array(list) = &*guard {
-            if !ext.is_empty() {
-                for c in list {
-                    if let Some(exts) = c.get("exts").and_then(|e| e.as_array()) {
-                        if exts.iter().any(|e| e.as_str().map(|s| s.eq_ignore_ascii_case(&ext)).unwrap_or(false)) {
-                            let folder = c.get("folder").and_then(|f| f.as_str()).unwrap_or("Other");
-                            let nm = c.get("name").and_then(|n| n.as_str()).unwrap_or("Other");
-                            return (nm.to_string(), resolve_folder(folder));
-                        }
-                    }
-                }
-            }
+    if let Ok(guard) = categories().lock()
+        && let Value::Array(list) = &*guard
+    {
+        if !ext.is_empty() {
             for c in list {
-                let empty = c.get("exts").and_then(|e| e.as_array()).map(|a| a.is_empty()).unwrap_or(true);
-                if empty {
+                if let Some(exts) = c.get("exts").and_then(|e| e.as_array())
+                    && exts.iter().any(|e| {
+                        e.as_str()
+                            .map(|s| s.eq_ignore_ascii_case(&ext))
+                            .unwrap_or(false)
+                    })
+                {
                     let folder = c.get("folder").and_then(|f| f.as_str()).unwrap_or("Other");
                     let nm = c.get("name").and_then(|n| n.as_str()).unwrap_or("Other");
                     return (nm.to_string(), resolve_folder(folder));
                 }
+            }
+        }
+        for c in list {
+            let empty = c
+                .get("exts")
+                .and_then(|e| e.as_array())
+                .map(|a| a.is_empty())
+                .unwrap_or(true);
+            if empty {
+                let folder = c.get("folder").and_then(|f| f.as_str()).unwrap_or("Other");
+                let nm = c.get("name").and_then(|n| n.as_str()).unwrap_or("Other");
+                return (nm.to_string(), resolve_folder(folder));
             }
         }
     }
@@ -444,37 +509,130 @@ fn category_of(name: &str) -> (String, std::path::PathBuf) {
 
 #[tauri::command]
 fn get_categories() -> Value {
-    let cats = categories().lock().map(|c| c.clone()).unwrap_or_else(|_| default_categories());
+    let cats = categories()
+        .lock()
+        .map(|c| c.clone())
+        .unwrap_or_else(|_| default_categories());
     if let Value::Array(arr) = cats {
-        let out: Vec<Value> = arr.into_iter().map(|mut c| {
-            let folder = c.get("folder").and_then(|f| f.as_str()).unwrap_or("").to_string();
-            if let Value::Object(m) = &mut c {
-                m.insert("folderAbs".into(), json!(resolve_folder(&folder).display().to_string()));
-            }
-            c
-        }).collect();
+        let out: Vec<Value> = arr
+            .into_iter()
+            .map(|mut c| {
+                let folder = c
+                    .get("folder")
+                    .and_then(|f| f.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if let Value::Object(m) = &mut c {
+                    m.insert(
+                        "folderAbs".into(),
+                        json!(resolve_folder(&folder).display().to_string()),
+                    );
+                }
+                c
+            })
+            .collect();
         return Value::Array(out);
     }
     default_categories()
 }
 
+fn category_exts(data: &Value) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    if let Value::Array(list) = data {
+        for c in list {
+            if let Some(exts) = c.get("exts").and_then(|e| e.as_array()) {
+                for e in exts {
+                    if let Some(s) = e.as_str() {
+                        let up = s.trim().trim_start_matches('.').to_uppercase();
+                        if !up.is_empty() {
+                            set.insert(up);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    set
+}
+
+/// Compute category types that should enter browser auto-capture. A type is added
+/// when the user just introduced it, or when it predates this synchronization feature
+/// and is not part of the broad built-in category defaults. Existing auto-capture
+/// entries are preserved and unchanged defaults do not become aggressive captures.
+fn category_auto_capture_additions(
+    previous: &Value,
+    current: &Value,
+    auto_exts: &[String],
+) -> Vec<String> {
+    let previous = category_exts(previous);
+    let current = category_exts(current);
+    let defaults = category_exts(&default_categories());
+    let existing: std::collections::HashSet<String> = auto_exts
+        .iter()
+        .map(|ext| ext.trim().trim_start_matches('.').to_uppercase())
+        .collect();
+    let mut added: Vec<String> = current
+        .into_iter()
+        .filter(|ext| {
+            !existing.contains(ext) && (!previous.contains(ext) || !defaults.contains(ext))
+        })
+        .collect();
+    added.sort();
+    added
+}
+
 #[tauri::command]
-fn set_categories(data: Value) -> Result<(), String> {
-    if let Ok(mut c) = categories().lock() {
-        if let Value::Array(arr) = &data {
-            // Keep only name/exts/folder; folderAbs is derived on read.
-            let cleaned: Vec<Value> = arr.iter().map(|c| json!({
+fn set_categories(data: Value) -> Result<Value, String> {
+    let Value::Array(arr) = &data else {
+        return Err("categories must be a list".into());
+    };
+    // Keep only name/exts/folder; folderAbs is derived on read.
+    let cleaned: Vec<Value> = arr
+        .iter()
+        .map(|c| {
+            json!({
                 "name": c.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string(),
                 "exts": c.get("exts").cloned().unwrap_or(json!([])),
                 "folder": c.get("folder").and_then(|f| f.as_str()).unwrap_or("").to_string(),
-            })).collect();
-            *c = Value::Array(cleaned);
-        } else {
-            *c = data;
-        }
+            })
+        })
+        .collect();
+    let current = Value::Array(cleaned);
+    // Acquire both locks before changing either state, so the command cannot report
+    // failure after categories have already been committed.
+    let mut category_guard = categories()
+        .lock()
+        .map_err(|_| "category settings unavailable")?;
+    let mut rule_guard = rules()
+        .lock()
+        .map_err(|_| "browser interception settings unavailable")?;
+    let mut auto_exts: Vec<String> = rule_guard
+        .get("autoExts")
+        .and_then(|a| a.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| {
+                    x.as_str()
+                        .map(|s| s.trim().trim_start_matches('.').to_uppercase())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let added = category_auto_capture_additions(&category_guard, &current, &auto_exts);
+    if !added.is_empty() {
+        auto_exts.extend(added.iter().cloned());
+        auto_exts.sort();
+        auto_exts.dedup();
+        rule_guard["autoExts"] = json!(auto_exts);
     }
+    *category_guard = current;
+    drop(category_guard);
+    drop(rule_guard);
     save_categories();
-    Ok(())
+    if !added.is_empty() {
+        save_rules();
+    }
+    Ok(json!({ "added": added }))
 }
 
 fn queues() -> &'static Mutex<Value> {
@@ -490,20 +648,19 @@ fn queues_file() -> std::path::PathBuf {
 }
 
 fn load_queues() {
-    if let Ok(s) = std::fs::read_to_string(queues_file()) {
-        if let Ok(v @ Value::Array(_)) = serde_json::from_str::<Value>(&s) {
-            if let Ok(mut q) = queues().lock() {
-                *q = v;
-            }
-        }
+    if let Ok(s) = std::fs::read_to_string(queues_file())
+        && let Ok(v @ Value::Array(_)) = serde_json::from_str::<Value>(&s)
+        && let Ok(mut q) = queues().lock()
+    {
+        *q = v;
     }
 }
 
 fn save_queues() {
-    if let Ok(q) = queues().lock() {
-        if let Ok(s) = serde_json::to_string_pretty(&*q) {
-            let _ = std::fs::write(queues_file(), s);
-        }
+    if let Ok(q) = queues().lock()
+        && let Ok(s) = serde_json::to_string_pretty(&*q)
+    {
+        let _ = std::fs::write(queues_file(), s);
     }
 }
 
@@ -516,20 +673,19 @@ fn qmember_file() -> std::path::PathBuf {
 }
 
 fn load_qmember() {
-    if let Ok(s) = std::fs::read_to_string(qmember_file()) {
-        if let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(&s) {
-            if let Ok(mut m) = qmember().lock() {
-                *m = v;
-            }
-        }
+    if let Ok(s) = std::fs::read_to_string(qmember_file())
+        && let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(&s)
+        && let Ok(mut m) = qmember().lock()
+    {
+        *m = v;
     }
 }
 
 fn save_qmember() {
-    if let Ok(m) = qmember().lock() {
-        if let Ok(s) = serde_json::to_string_pretty(&*m) {
-            let _ = std::fs::write(qmember_file(), s);
-        }
+    if let Ok(m) = qmember().lock()
+        && let Ok(s) = serde_json::to_string_pretty(&*m)
+    {
+        let _ = std::fs::write(qmember_file(), s);
     }
 }
 
@@ -550,20 +706,63 @@ fn url_of_task(t: &Value) -> String {
 
 #[tauri::command]
 fn get_queues() -> Value {
-    queues().lock().map(|q| q.clone()).unwrap_or_else(|_| default_queues())
+    queues()
+        .lock()
+        .map(|q| q.clone())
+        .unwrap_or_else(|_| default_queues())
+}
+
+fn queue_ids(data: &Value) -> std::collections::HashSet<String> {
+    data.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|queue| queue.get("id").and_then(|id| id.as_str()))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+fn normalize_queue_memberships(queue_data: &Value, memberships: &mut Value) -> bool {
+    let known = queue_ids(queue_data);
+    let Some(map) = memberships.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for queue in map.values_mut() {
+        let valid = queue.as_str().map(|id| known.contains(id)).unwrap_or(false);
+        if !valid {
+            *queue = json!("main");
+            changed = true;
+        }
+    }
+    changed
 }
 
 #[tauri::command]
 fn set_queues(data: Value) -> Result<(), String> {
-    if let Value::Array(_) = &data {
-        if let Ok(mut q) = queues().lock() {
-            *q = data;
-        }
-        save_queues();
-        Ok(())
-    } else {
-        Err("expected array".into())
+    let Value::Array(_) = &data else {
+        return Err("expected array".into());
+    };
+    let ids = queue_ids(&data);
+    if !ids.contains("main") {
+        return Err("the Main queue cannot be removed".into());
     }
+    {
+        let mut q = queues().lock().map_err(|_| "queue settings unavailable")?;
+        *q = data.clone();
+    }
+    save_queues();
+    let normalized = {
+        let mut memberships = qmember()
+            .lock()
+            .map_err(|_| "queue assignments unavailable")?;
+        normalize_queue_memberships(&data, &mut memberships)
+    };
+    if normalized {
+        save_qmember();
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -571,23 +770,32 @@ fn assign_queue(url: String, queue: String) -> Result<(), String> {
     if url.is_empty() {
         return Err("no url".into());
     }
-    if let Ok(mut m) = qmember().lock() {
-        if let Value::Object(map) = &mut *m {
-            map.insert(url, json!(queue));
-        }
+    let known = queues()
+        .lock()
+        .map(|data| queue_ids(&data))
+        .map_err(|_| "queue settings unavailable")?;
+    if !known.contains(&queue) {
+        return Err("queue does not exist".into());
     }
+    let mut memberships = qmember()
+        .lock()
+        .map_err(|_| "queue assignments unavailable")?;
+    if let Value::Object(map) = &mut *memberships {
+        map.insert(url, json!(queue));
+    }
+    drop(memberships);
     save_qmember();
     Ok(())
 }
 
 #[tauri::command]
 async fn set_queue_running(id: String, running: bool) -> Result<(), String> {
-    if let Ok(mut q) = queues().lock() {
-        if let Value::Array(arr) = &mut *q {
-            for item in arr.iter_mut() {
-                if item.get("id").and_then(|i| i.as_str()) == Some(id.as_str()) {
-                    item["running"] = json!(running);
-                }
+    if let Ok(mut q) = queues().lock()
+        && let Value::Array(arr) = &mut *q
+    {
+        for item in arr.iter_mut() {
+            if item.get("id").and_then(|i| i.as_str()) == Some(id.as_str()) {
+                item["running"] = json!(running);
             }
         }
     }
@@ -603,39 +811,80 @@ async fn gate_queues() {
         Some(c) => c,
         None => return,
     };
-    let qs = queues().lock().map(|q| q.clone()).unwrap_or_else(|_| default_queues());
+    let qs = queues()
+        .lock()
+        .map(|q| q.clone())
+        .unwrap_or_else(|_| default_queues());
     let qarr = match qs.as_array() {
         Some(a) if !a.is_empty() => a.clone(),
         _ => return,
     };
-    // Fast path: only the default, unlimited, running Main queue → nothing to do.
-    if qarr.len() == 1 {
-        let q = &qarr[0];
-        let is_default = q.get("id").and_then(|i| i.as_str()) == Some("main")
-            && q.get("maxActive").and_then(|m| m.as_i64()).unwrap_or(0) == 0
-            && q.get("speed").and_then(|s| s.as_i64()).unwrap_or(0) == 0
-            && q.get("running").and_then(|r| r.as_bool()).unwrap_or(true)
-            && q.get("schedule").map(|s| s.is_null()).unwrap_or(true);
-        if is_default {
-            return;
-        }
-    }
     let map = qmember().lock().map(|m| m.clone()).unwrap_or(json!({}));
+    let known = queue_ids(&qs);
     let queue_of = |url: &str| -> String {
-        map.get(url).and_then(|v| v.as_str()).unwrap_or("main").to_string()
+        map.get(url)
+            .and_then(|v| v.as_str())
+            .filter(|id| known.contains(*id))
+            .unwrap_or("main")
+            .to_string()
     };
     let active = c.tell_active().await.unwrap_or(json!([]));
     let waiting = c.tell_waiting().await.unwrap_or(json!([]));
-    let mut tasks: Vec<(String, String, String)> = Vec::new();
+    let global_schedule = scheduler::load_global(&state_dir()).unwrap_or_default();
+    let moment = scheduler::current_moment();
+    let metadata = dl_meta()
+        .lock()
+        .map(|metadata| metadata.clone())
+        .unwrap_or_default();
+    let queue_windows: HashMap<String, scheduler::TimeWindow> = qarr
+        .iter()
+        .filter_map(|queue| {
+            let id = queue.get("id").and_then(Value::as_str)?;
+            scheduler::queue_window(queue.get("schedule")).map(|window| (id.to_string(), window))
+        })
+        .collect();
+    let mut tasks: Vec<(String, String, String, bool)> = Vec::new();
     for arr in [&active, &waiting] {
         if let Some(a) = arr.as_array() {
             for t in a {
-                let gid = t.get("gid").and_then(|g| g.as_str()).unwrap_or("").to_string();
+                let gid = t
+                    .get("gid")
+                    .and_then(|g| g.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if gid.is_empty() {
                     continue;
                 }
-                let status = t.get("status").and_then(|s| s.as_str()).unwrap_or("").to_string();
-                tasks.push((gid, queue_of(&url_of_task(t)), status));
+                let status = t
+                    .get("status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let queue_id = queue_of(&url_of_task(t));
+                let decision = scheduler::effective_decision(
+                    moment,
+                    metadata.get(&gid).map(|entry| &entry.schedule),
+                    queue_windows.get(&queue_id),
+                    &global_schedule,
+                );
+                let mut allowed = decision.allowed;
+                if !allowed {
+                    if (status == "active" || status == "waiting") && c.pause(&gid).await.is_ok() {
+                        set_scheduler_pause_owner(&gid, true);
+                    }
+                } else {
+                    let scheduler_owned = scheduler_paused()
+                        .lock()
+                        .map(|mut paused| paused.remove(&gid))
+                        .unwrap_or(false);
+                    if scheduler_owned && status == "paused" {
+                        allowed = c.unpause(&gid).await.is_ok();
+                        if allowed {
+                            set_scheduler_pause_owner(&gid, false);
+                        }
+                    }
+                }
+                tasks.push((gid, queue_id, status, allowed));
             }
         }
     }
@@ -647,11 +896,23 @@ async fn gate_queues() {
         let running = q.get("running").and_then(|r| r.as_bool()).unwrap_or(true);
         let max_active = q.get("maxActive").and_then(|m| m.as_i64()).unwrap_or(0);
         let speed = q.get("speed").and_then(|s| s.as_i64()).unwrap_or(0);
-        let on_done = q.get("schedule").and_then(|s| s.get("onDone")).and_then(|d| d.as_str()).unwrap_or("none").to_string();
-        let members: Vec<(String, String)> = tasks.iter().filter(|(_, m, _)| m == qid).map(|(g, _, s)| (g.clone(), s.clone())).collect();
+        let on_done = q
+            .get("schedule")
+            .and_then(|s| s.get("onDone"))
+            .and_then(|d| d.as_str())
+            .unwrap_or("none")
+            .to_string();
+        let members: Vec<(String, String)> = tasks
+            .iter()
+            .filter(|(_, queue_id, _, allowed)| queue_id == qid && *allowed)
+            .map(|(gid, _, status, _)| (gid.clone(), status.clone()))
+            .collect();
 
         if running && on_done != "none" {
-            let live = members.iter().filter(|(_, s)| s == "active" || s == "waiting").count();
+            let live = members
+                .iter()
+                .filter(|(_, s)| s == "active" || s == "waiting")
+                .count();
             let mut fire = false;
             if let Ok(mut had) = qhadactive().lock() {
                 let prev = *had.get(qid).unwrap_or(&false);
@@ -672,7 +933,12 @@ async fn gate_queues() {
             if speed > 0 {
                 for (gid, status) in &members {
                     if status == "active" {
-                        let _ = c.change_option(gid, json!({ "max-download-limit": format!("{}K", speed) })).await;
+                        let _ = c
+                            .change_option(
+                                gid,
+                                json!({ "max-download-limit": format!("{}K", speed) }),
+                            )
+                            .await;
                     }
                 }
             }
@@ -689,7 +955,11 @@ async fn gate_queues() {
         // Running with a concurrency cap.
         let n_active = members.iter().filter(|(_, s)| s == "active").count() as i64;
         if n_active > max_active {
-            for (gid, _) in members.iter().filter(|(_, s)| s == "active").skip(max_active as usize) {
+            for (gid, _) in members
+                .iter()
+                .filter(|(_, s)| s == "active")
+                .skip(max_active as usize)
+            {
                 let _ = c.pause(gid).await;
             }
         } else if n_active < max_active {
@@ -701,8 +971,66 @@ async fn gate_queues() {
         if speed > 0 {
             for (gid, status) in &members {
                 if status == "active" {
-                    let _ = c.change_option(gid, json!({ "max-download-limit": format!("{}K", speed) })).await;
+                    let _ = c
+                        .change_option(gid, json!({ "max-download-limit": format!("{}K", speed) }))
+                        .await;
                 }
+            }
+        }
+    }
+    gate_site_schedules(&qs, &map, &global_schedule, moment, &metadata);
+}
+
+fn gate_site_schedules(
+    queues_value: &Value,
+    memberships: &Value,
+    global: &scheduler::GlobalSchedule,
+    moment: scheduler::Moment,
+    metadata: &HashMap<String, DlMeta>,
+) {
+    let queue_windows: HashMap<String, scheduler::TimeWindow> = queues_value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|queue| {
+            let id = queue.get("id").and_then(Value::as_str)?;
+            scheduler::queue_window(queue.get("schedule")).map(|window| (id.to_string(), window))
+        })
+        .collect();
+    let jobs = site_jobs()
+        .lock()
+        .map(|jobs| jobs.clone())
+        .unwrap_or_default();
+    for job in jobs {
+        let Some(gid) = job.get("gid").and_then(Value::as_str) else {
+            continue;
+        };
+        let status = job.get("status").and_then(Value::as_str).unwrap_or("");
+        if !matches!(status, "active" | "paused") {
+            continue;
+        }
+        let url = url_of_task(&job);
+        let queue_id = memberships
+            .get(&url)
+            .and_then(Value::as_str)
+            .unwrap_or("main");
+        let decision = scheduler::effective_decision(
+            moment,
+            metadata.get(gid).map(|entry| &entry.schedule),
+            queue_windows.get(queue_id),
+            global,
+        );
+        if !decision.allowed && status == "active" && signal_site_process(gid, "STOP").is_ok() {
+            update_site_job(gid, |job| job["status"] = json!("paused"));
+            set_scheduler_pause_owner(gid, true);
+        } else if decision.allowed && status == "paused" {
+            let scheduler_owned = scheduler_paused()
+                .lock()
+                .map(|mut paused| paused.remove(gid))
+                .unwrap_or(false);
+            if scheduler_owned && signal_site_process(gid, "CONT").is_ok() {
+                update_site_job(gid, |job| job["status"] = json!("active"));
+                set_scheduler_pause_owner(gid, false);
             }
         }
     }
@@ -730,18 +1058,32 @@ fn run_on_done(action: &str) {
 }
 
 fn record_history(mut rec: Value) {
-    if rec.get("addedAt").and_then(|v| v.as_u64()).unwrap_or(0) == 0 {
-        if let Some(added_at) = rec.get("gid").and_then(|g| g.as_str())
-            .and_then(|gid| dl_meta().lock().ok().and_then(|metadata| metadata.get(gid).map(|entry| entry.added_at)))
+    if rec.get("addedAt").and_then(|v| v.as_u64()).unwrap_or(0) == 0
+        && let Some(added_at) = rec
+            .get("gid")
+            .and_then(|g| g.as_str())
+            .and_then(|gid| {
+                dl_meta()
+                    .lock()
+                    .ok()
+                    .and_then(|metadata| metadata.get(gid).map(|entry| entry.added_at))
+            })
             .filter(|value| *value > 0)
-        {
-            rec["addedAt"] = json!(added_at);
-        }
+    {
+        rec["addedAt"] = json!(added_at);
     }
     record_lifetime_completion(&rec);
     if let Ok(mut h) = history().lock() {
-        let gid = rec.get("gid").and_then(|g| g.as_str()).unwrap_or("").to_string();
-        if !gid.is_empty() && !h.iter().any(|x| x.get("gid").and_then(|g| g.as_str()) == Some(gid.as_str())) {
+        let gid = rec
+            .get("gid")
+            .and_then(|g| g.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !gid.is_empty()
+            && !h
+                .iter()
+                .any(|x| x.get("gid").and_then(|g| g.as_str()) == Some(gid.as_str()))
+        {
             h.insert(0, rec);
             let limit = HISTORY_LIMIT.load(Ordering::Relaxed);
             if limit > 0 && h.len() > limit {
@@ -753,10 +1095,12 @@ fn record_history(mut rec: Value) {
 }
 
 fn update_history<F: FnOnce(&mut Value)>(gid: &str, f: F) {
-    if let Ok(mut h) = history().lock() {
-        if let Some(j) = h.iter_mut().find(|x| x.get("gid").and_then(|g| g.as_str()) == Some(gid)) {
-            f(j);
-        }
+    if let Ok(mut h) = history().lock()
+        && let Some(j) = h
+            .iter_mut()
+            .find(|x| x.get("gid").and_then(|g| g.as_str()) == Some(gid))
+    {
+        f(j);
     }
     save_history();
 }
@@ -764,11 +1108,18 @@ fn update_history<F: FnOnce(&mut Value)>(gid: &str, f: F) {
 /// Remove a gid from history; returns its file path if it was present.
 fn remove_from_history(gid: &str) -> Option<String> {
     let mut path = None;
-    if let Ok(mut h) = history().lock() {
-        if let Some(pos) = h.iter().position(|x| x.get("gid").and_then(|g| g.as_str()) == Some(gid)) {
-            path = h[pos].get("files").and_then(|f| f.get(0)).and_then(|f| f.get("path")).and_then(|p| p.as_str()).map(String::from);
-            h.remove(pos);
-        }
+    if let Ok(mut h) = history().lock()
+        && let Some(pos) = h
+            .iter()
+            .position(|x| x.get("gid").and_then(|g| g.as_str()) == Some(gid))
+    {
+        path = h[pos]
+            .get("files")
+            .and_then(|f| f.get(0))
+            .and_then(|f| f.get("path"))
+            .and_then(|p| p.as_str())
+            .map(String::from);
+        h.remove(pos);
     }
     save_history();
     path
@@ -778,10 +1129,12 @@ fn remove_from_history(gid: &str) -> Option<String> {
 /// metadata) if it was present.
 fn take_history_value(gid: &str) -> Option<Value> {
     let mut out = None;
-    if let Ok(mut h) = history().lock() {
-        if let Some(pos) = h.iter().position(|x| x.get("gid").and_then(|g| g.as_str()) == Some(gid)) {
-            out = Some(h.remove(pos));
-        }
+    if let Ok(mut h) = history().lock()
+        && let Some(pos) = h
+            .iter()
+            .position(|x| x.get("gid").and_then(|g| g.as_str()) == Some(gid))
+    {
+        out = Some(h.remove(pos));
     }
     save_history();
     out
@@ -792,10 +1145,10 @@ fn history_limit_file() -> std::path::PathBuf {
 }
 
 fn load_history_limit() {
-    if let Ok(s) = std::fs::read_to_string(history_limit_file()) {
-        if let Ok(n) = s.trim().parse::<usize>() {
-            HISTORY_LIMIT.store(n, Ordering::Relaxed);
-        }
+    if let Ok(s) = std::fs::read_to_string(history_limit_file())
+        && let Ok(n) = s.trim().parse::<usize>()
+    {
+        HISTORY_LIMIT.store(n, Ordering::Relaxed);
     }
 }
 
@@ -804,12 +1157,11 @@ fn load_history_limit() {
 fn set_history_limit(limit: usize) -> Result<(), String> {
     HISTORY_LIMIT.store(limit, Ordering::Relaxed);
     let _ = std::fs::write(history_limit_file(), limit.to_string());
-    if limit > 0 {
-        if let Ok(mut h) = history().lock() {
-            if h.len() > limit {
-                h.truncate(limit);
-            }
-        }
+    if limit > 0
+        && let Ok(mut h) = history().lock()
+        && h.len() > limit
+    {
+        h.truncate(limit);
     }
     save_history();
     Ok(())
@@ -829,17 +1181,43 @@ async fn import_urls(urls: Vec<String>, options: Value) -> Result<Value, String>
     let mut added = 0u32;
     let mut skipped = 0u32;
     let mut failed = 0u32;
+    let mut base_options = options.as_object().cloned().unwrap_or_default();
+    let profile_id = base_options
+        .remove("dmProfileId")
+        .and_then(|value| value.as_str().map(String::from));
+    let profile = resolve_download_profile(profile_id.as_deref())?;
+    let user_checksum = base_options
+        .remove("dmChecksum")
+        .and_then(|value| value.as_str().map(String::from))
+        .unwrap_or_default();
+    media_policy::apply_aria2_options(&profile, &mut base_options, &download_dir());
     // Check against current download URLs to skip obvious duplicates.
     let existing: std::collections::HashSet<String> = {
         let c = client()?;
         let active = c.tell_active().await.unwrap_or(json!([]));
         let waiting = c.tell_waiting().await.unwrap_or(json!([]));
-        let hist = history().lock().map(|h| Value::Array(h.clone())).unwrap_or(json!([]));
-        [active, waiting, hist].iter().flat_map(|arr| {
-            arr.as_array().cloned().unwrap_or_default().into_iter().filter_map(|t| {
-                t.get("files")?.get(0)?.get("uris")?.get(0)?.get("uri")?.as_str().map(|s| s.to_string())
+        let hist = history()
+            .lock()
+            .map(|h| Value::Array(h.clone()))
+            .unwrap_or(json!([]));
+        [active, waiting, hist]
+            .iter()
+            .flat_map(|arr| {
+                arr.as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|t| {
+                        t.get("files")?
+                            .get(0)?
+                            .get("uris")?
+                            .get(0)?
+                            .get("uri")?
+                            .as_str()
+                            .map(|s| s.to_string())
+                    })
             })
-        }).collect()
+            .collect()
     };
     for url in urls {
         let url = url.trim().to_string();
@@ -851,22 +1229,27 @@ async fn import_urls(urls: Vec<String>, options: Value) -> Result<Value, String>
             skipped += 1;
             continue;
         }
-        let mut opts = options.as_object().cloned().unwrap_or_default();
-        let user_cs = opts.remove("dmChecksum").and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default();
-        match client()?.add_uri(vec![url.clone()], Value::Object(opts)).await {
+        match client()?
+            .add_uri(vec![url.clone()], Value::Object(base_options.clone()))
+            .await
+        {
             Ok(gid) => {
                 mark_download_added(&gid);
-                if !user_cs.is_empty() {
+                attach_profile_snapshot(&gid, &profile);
+                assign_profile_queue(&url, &profile);
+                if !user_checksum.is_empty() {
                     if let Ok(mut m) = dl_meta().lock() {
                         let e = m.entry(gid).or_default();
-                        e.checksum = user_cs;
+                        e.checksum = user_checksum.clone();
                         e.verify = "pending".into();
                     }
                     save_dl_meta();
                 }
                 added += 1;
             }
-            Err(_) => { failed += 1; }
+            Err(_) => {
+                failed += 1;
+            }
         }
     }
     Ok(json!({ "added": added, "skipped": skipped, "failed": failed }))
@@ -882,11 +1265,19 @@ fn export_history(path: String, format: String) -> Result<(), String> {
             let name = task_name(t);
             let status = t.get("status").and_then(|s| s.as_str()).unwrap_or("");
             let size = t.get("totalLength").and_then(|s| s.as_str()).unwrap_or("0");
-            let ts = t.get("completedAt").and_then(|c| c.as_u64()).map(|n| n.to_string()).unwrap_or_default();
+            let ts = t
+                .get("completedAt")
+                .and_then(|c| c.as_u64())
+                .map(|n| n.to_string())
+                .unwrap_or_default();
             let url = url_of_task(t);
             out.push_str(&format!(
                 "{},{},{},{},{}\n",
-                csv_field(&name), csv_field(status), csv_field(size), csv_field(&ts), csv_field(&url)
+                csv_field(&name),
+                csv_field(status),
+                csv_field(size),
+                csv_field(&ts),
+                csv_field(&url)
             ));
         }
         out
@@ -905,13 +1296,21 @@ fn on_complete_file() -> std::path::PathBuf {
     state_dir().join(".downman-oncomplete.json")
 }
 fn load_on_complete() {
-    if let Ok(s) = std::fs::read_to_string(on_complete_file()) {
-        if let Ok(v) = serde_json::from_str::<Value>(&s) {
-            let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("none").to_string();
-            let command = v.get("command").and_then(|c| c.as_str()).unwrap_or("").to_string();
-            if let Ok(mut g) = on_complete().lock() {
-                *g = (action, command);
-            }
+    if let Ok(s) = std::fs::read_to_string(on_complete_file())
+        && let Ok(v) = serde_json::from_str::<Value>(&s)
+    {
+        let action = v
+            .get("action")
+            .and_then(|a| a.as_str())
+            .unwrap_or("none")
+            .to_string();
+        let command = v
+            .get("command")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        if let Ok(mut g) = on_complete().lock() {
+            *g = (action, command);
         }
     }
 }
@@ -921,7 +1320,10 @@ fn set_on_complete(action: String, command: String) -> Result<(), String> {
     if let Ok(mut g) = on_complete().lock() {
         *g = (action.clone(), command.clone());
     }
-    let _ = std::fs::write(on_complete_file(), json!({ "action": action, "command": command }).to_string());
+    let _ = std::fs::write(
+        on_complete_file(),
+        json!({ "action": action, "command": command }).to_string(),
+    );
     Ok(())
 }
 
@@ -936,33 +1338,126 @@ fn dl_on_complete() -> &'static Mutex<HashMap<String, (String, String)>> {
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
 struct DlMeta {
-    #[serde(default)] checksum: String,
-    #[serde(default)] verify: String,      // ""=unchecked, "pending", "ok", "fail"
-    #[serde(default)] oncomplete_action: String,
-    #[serde(default)] oncomplete_cmd: String,
-    #[serde(default)] added_at: u64,
+    #[serde(default)]
+    checksum: String,
+    #[serde(default)]
+    verify: String, // ""=unchecked, "pending", "ok", "fail"
+    #[serde(default)]
+    oncomplete_action: String,
+    #[serde(default)]
+    oncomplete_cmd: String,
+    #[serde(default)]
+    added_at: u64,
+    #[serde(default)]
+    profile_id: String,
+    #[serde(default)]
+    profile_snapshot: Option<DownloadProfile>,
+    #[serde(default)]
+    schedule: scheduler::JobSchedule,
+    #[serde(default)]
+    network_override: scheduler::NetworkOverride,
+    #[serde(default)]
+    scheduler_paused: bool,
 }
 
 static DL_META: OnceCell<Mutex<HashMap<String, DlMeta>>> = OnceCell::new();
 fn dl_meta() -> &'static Mutex<HashMap<String, DlMeta>> {
     DL_META.get_or_init(|| Mutex::new(HashMap::new()))
 }
-fn dl_meta_file() -> std::path::PathBuf { state_dir().join(".downman-dlmeta.json") }
+fn dl_meta_file() -> std::path::PathBuf {
+    state_dir().join(".downman-dlmeta.json")
+}
 fn save_dl_meta() {
-    if let Ok(m) = dl_meta().lock() {
-        if let Ok(s) = serde_json::to_string(&*m) { let _ = std::fs::write(dl_meta_file(), s); }
+    if let Ok(m) = dl_meta().lock()
+        && let Ok(s) = serde_json::to_string(&*m)
+    {
+        let _ = std::fs::write(dl_meta_file(), s);
     }
 }
 fn load_dl_meta() {
-    if let Ok(s) = std::fs::read_to_string(dl_meta_file()) {
-        if let Ok(v) = serde_json::from_str::<HashMap<String, DlMeta>>(&s) {
-            if let Ok(mut m) = dl_meta().lock() { *m = v; }
+    if let Ok(s) = std::fs::read_to_string(dl_meta_file())
+        && let Ok(v) = serde_json::from_str::<HashMap<String, DlMeta>>(&s)
+        && let Ok(mut m) = dl_meta().lock()
+    {
+        *m = v;
+        let scheduler_owned: Vec<String> = m
+            .iter()
+            .filter(|(_, entry)| entry.scheduler_paused)
+            .map(|(gid, _)| gid.clone())
+            .collect();
+        for entry in m.values_mut() {
+            entry.network_override.has_password = false;
+        }
+        if let Ok(mut paused) = scheduler_paused().lock() {
+            paused.extend(scheduler_owned);
         }
     }
 }
 
+fn set_scheduler_pause_owner(gid: &str, owned: bool) {
+    let changed = scheduler_paused()
+        .lock()
+        .map(|mut paused| {
+            if owned {
+                paused.insert(gid.to_string())
+            } else {
+                paused.remove(gid)
+            }
+        })
+        .unwrap_or(false);
+    if let Ok(mut metadata) = dl_meta().lock() {
+        let entry = metadata.entry(gid.to_string()).or_default();
+        if entry.scheduler_paused != owned {
+            entry.scheduler_paused = owned;
+            drop(metadata);
+            save_dl_meta();
+            return;
+        }
+    }
+    if changed {
+        save_dl_meta();
+    }
+}
+
+fn transfer_job_metadata(old_gid: &str, new_gid: &str) {
+    let mut changed = false;
+    if let Ok(mut metadata) = dl_meta().lock()
+        && let Some(existing) = metadata.remove(old_gid)
+    {
+        metadata.insert(new_gid.to_string(), existing);
+        changed = true;
+    }
+    if let Ok(mut passwords) = job_passwords().lock()
+        && let Some(password) = passwords.remove(old_gid)
+    {
+        passwords.insert(new_gid.to_string(), password);
+    }
+    let scheduler_owned = scheduler_paused()
+        .lock()
+        .map(|mut paused| {
+            let owned = paused.remove(old_gid);
+            if owned {
+                paused.insert(new_gid.to_string());
+            }
+            owned
+        })
+        .unwrap_or(false);
+    if scheduler_owned && let Ok(mut metadata) = dl_meta().lock() {
+        metadata
+            .entry(new_gid.to_string())
+            .or_default()
+            .scheduler_paused = true;
+        changed = true;
+    }
+    if changed {
+        save_dl_meta();
+    }
+}
+
 fn mark_download_added(gid: &str) {
-    if gid.is_empty() { return; }
+    if gid.is_empty() {
+        return;
+    }
     let mut changed = false;
     if let Ok(mut metadata) = dl_meta().lock() {
         let entry = metadata.entry(gid.to_string()).or_default();
@@ -976,13 +1471,78 @@ fn mark_download_added(gid: &str) {
     }
 }
 
+fn attach_profile_snapshot(gid: &str, profile: &DownloadProfile) {
+    if gid.is_empty() {
+        return;
+    }
+    if let Ok(mut metadata) = dl_meta().lock() {
+        let entry = metadata.entry(gid.to_string()).or_default();
+        entry.profile_id = profile.id.clone();
+        entry.profile_snapshot = Some(profile.clone());
+    }
+    save_dl_meta();
+}
+
+fn resolve_download_profile(id: Option<&str>) -> Result<DownloadProfile, String> {
+    let profile = if let Some(id) = id.map(str::trim).filter(|id| !id.is_empty()) {
+        profiles::get(&state_dir(), id)?
+            .ok_or_else(|| "download profile does not exist".to_string())?
+    } else {
+        profiles::active(&state_dir())?
+    };
+    media_policy::ensure_valid(&profile)?;
+    Ok(profile)
+}
+
+fn profile_from_value(value: Option<&Value>) -> Result<DownloadProfile, String> {
+    match value {
+        Some(value) if !value.is_null() => serde_json::from_value(value.clone())
+            .map_err(|error| format!("invalid download profile snapshot: {error}")),
+        _ => resolve_download_profile(None),
+    }
+}
+
+fn assign_profile_queue(url: &str, profile: &DownloadProfile) {
+    if url.is_empty() {
+        return;
+    }
+    let queue = queues()
+        .lock()
+        .ok()
+        .map(|data| queue_ids(&data))
+        .filter(|ids| ids.contains(&profile.queue_id))
+        .map(|_| profile.queue_id.as_str())
+        .unwrap_or("main");
+    if let Ok(mut memberships) = qmember().lock()
+        && let Value::Object(map) = &mut *memberships
+    {
+        map.insert(url.to_string(), json!(queue));
+        drop(memberships);
+        save_qmember();
+    }
+}
+
 #[tauri::command]
-fn set_dl_meta(gid: String, checksum: Option<String>, oncomplete_action: Option<String>, oncomplete_cmd: Option<String>) -> Result<(), String> {
+fn set_dl_meta(
+    gid: String,
+    checksum: Option<String>,
+    oncomplete_action: Option<String>,
+    oncomplete_cmd: Option<String>,
+) -> Result<(), String> {
     if let Ok(mut m) = dl_meta().lock() {
         let e = m.entry(gid).or_default();
-        if let Some(c) = checksum { e.checksum = c; if !e.checksum.is_empty() && e.verify == "ok" { e.verify = "pending".into(); } }
-        if let Some(a) = oncomplete_action { e.oncomplete_action = a; }
-        if let Some(c) = oncomplete_cmd { e.oncomplete_cmd = c; }
+        if let Some(c) = checksum {
+            e.checksum = c;
+            if !e.checksum.is_empty() && e.verify == "ok" {
+                e.verify = "pending".into();
+            }
+        }
+        if let Some(a) = oncomplete_action {
+            e.oncomplete_action = a;
+        }
+        if let Some(c) = oncomplete_cmd {
+            e.oncomplete_cmd = c;
+        }
     }
     save_dl_meta();
     Ok(())
@@ -990,7 +1550,134 @@ fn set_dl_meta(gid: String, checksum: Option<String>, oncomplete_action: Option<
 
 #[tauri::command]
 fn get_dl_meta(gid: String) -> DlMeta {
-    dl_meta().lock().ok().and_then(|m| m.get(&gid).cloned()).unwrap_or_default()
+    dl_meta()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&gid).cloned())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn scheduler_get() -> Result<scheduler::GlobalSchedule, String> {
+    scheduler::load_global(&state_dir())
+}
+
+#[tauri::command]
+fn scheduler_set(schedule: scheduler::GlobalSchedule) -> Result<scheduler::GlobalSchedule, String> {
+    scheduler::save_global(&state_dir(), schedule)
+}
+
+#[tauri::command]
+fn job_policy_get(gid: String) -> DlMeta {
+    get_dl_meta(gid)
+}
+
+#[tauri::command]
+async fn job_policy_set(
+    gid: String,
+    mut schedule: scheduler::JobSchedule,
+    mut network_override: scheduler::NetworkOverride,
+    password: Option<String>,
+) -> Result<DlMeta, String> {
+    if gid.trim().is_empty() {
+        return Err("download id is required".into());
+    }
+    scheduler::normalize_job(&mut schedule)?;
+    scheduler::normalize_network(&mut network_override)?;
+    if let Some(password) = password.as_deref().filter(|value| !value.is_empty())
+        && let Ok(mut passwords) = job_passwords().lock()
+    {
+        passwords.insert(gid.clone(), password.to_string());
+    }
+    network_override.has_password = job_passwords()
+        .lock()
+        .map(|passwords| passwords.contains_key(&gid))
+        .unwrap_or(false);
+    {
+        let mut metadata = dl_meta().lock().map_err(|_| "job metadata unavailable")?;
+        let entry = metadata.entry(gid.clone()).or_default();
+        entry.schedule = schedule;
+        entry.network_override = network_override.clone();
+    }
+    save_dl_meta();
+    if !gid.starts_with("site-") {
+        let mut options = serde_json::Map::new();
+        let active_password = job_passwords()
+            .lock()
+            .ok()
+            .and_then(|passwords| passwords.get(&gid).cloned());
+        scheduler::apply_aria2_options(&network_override, active_password.as_deref(), &mut options);
+        if !options.is_empty() {
+            client()?
+                .change_option(&gid, Value::Object(options))
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(get_dl_meta(gid))
+}
+
+#[tauri::command]
+async fn job_policy_clear(gid: String) -> Result<DlMeta, String> {
+    let profile = dl_meta().lock().ok().and_then(|metadata| {
+        metadata
+            .get(&gid)
+            .and_then(|entry| entry.profile_snapshot.clone())
+    });
+    {
+        let mut metadata = dl_meta().lock().map_err(|_| "job metadata unavailable")?;
+        let entry = metadata.entry(gid.clone()).or_default();
+        entry.schedule = scheduler::JobSchedule::default();
+        entry.network_override = scheduler::NetworkOverride::default();
+    }
+    if let Ok(mut passwords) = job_passwords().lock() {
+        passwords.remove(&gid);
+    }
+    save_dl_meta();
+    if !gid.starts_with("site-") {
+        let mut options = serde_json::Map::new();
+        if let Some(profile) = profile {
+            media_policy::apply_aria2_options(&profile, &mut options, &download_dir());
+        }
+        options.insert(
+            "max-download-limit".into(),
+            json!(
+                options
+                    .get("max-download-limit")
+                    .and_then(Value::as_str)
+                    .unwrap_or("0")
+            ),
+        );
+        options.insert(
+            "all-proxy".into(),
+            json!(
+                options
+                    .get("all-proxy")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            ),
+        );
+        options.insert(
+            "user-agent".into(),
+            json!(
+                options
+                    .get("user-agent")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            ),
+        );
+        options.insert(
+            "header".into(),
+            options.get("header").cloned().unwrap_or_else(|| json!([])),
+        );
+        options.insert("http-user".into(), json!(""));
+        options.insert("http-passwd".into(), json!(""));
+        client()?
+            .change_option(&gid, Value::Object(options))
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(get_dl_meta(gid))
 }
 
 /// Set a one-shot on-complete action for a single download (overrides the global default).
@@ -998,12 +1685,19 @@ fn get_dl_meta(gid: String) -> DlMeta {
 fn set_download_on_complete(gid: String, action: String, command: String) -> Result<(), String> {
     // Keep the old in-memory map for backward compat, AND persist in DL_META.
     if let Ok(mut m) = dl_on_complete().lock() {
-        if action.is_empty() || action == "default" { m.remove(&gid); }
-        else { m.insert(gid.clone(), (action.clone(), command.clone())); }
+        if action.is_empty() || action == "default" {
+            m.remove(&gid);
+        } else {
+            m.insert(gid.clone(), (action.clone(), command.clone()));
+        }
     }
     if let Ok(mut m) = dl_meta().lock() {
         let e = m.entry(gid).or_default();
-        e.oncomplete_action = if action == "default" { String::new() } else { action };
+        e.oncomplete_action = if action == "default" {
+            String::new()
+        } else {
+            action
+        };
         e.oncomplete_cmd = command;
     }
     save_dl_meta();
@@ -1022,11 +1716,24 @@ fn verify_checksum_inner(path: &str, expected: &str) -> Result<bool, String> {
         (Some("sha1"), _) | (None, 40) => "sha1sum",
         (Some("sha256"), _) | (None, 64) => "sha256sum",
         (Some("sha512"), _) | (None, 128) => "sha512sum",
-        _ => return Err("Unrecognized checksum (expect md5/sha1/sha256/sha512, or an algo= prefix)".into()),
+        _ => {
+            return Err(
+                "Unrecognized checksum (expect md5/sha1/sha256/sha512, or an algo= prefix)".into(),
+            );
+        }
     };
-    let out = Command::new(tool).arg(path).output().map_err(|e| e.to_string())?;
-    if !out.status.success() { return Err("Could not read the file to hash it.".into()); }
-    let computed = String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or("").to_lowercase();
+    let out = Command::new(tool)
+        .arg(path)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err("Could not read the file to hash it.".into());
+    }
+    let computed = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
     Ok(!hash.is_empty() && computed == hash)
 }
 
@@ -1047,16 +1754,23 @@ fn shell_quote(s: &str) -> String {
 /// replaces the original after it validates, so a failed/expired link never
 /// destroys the existing file.
 static REDL_TARGET: OnceCell<Mutex<HashMap<String, (String, String)>>> = OnceCell::new(); // gid -> (final_path, expected_ext)
-fn redl_target() -> &'static Mutex<HashMap<String, (String, String)>> { REDL_TARGET.get_or_init(|| Mutex::new(HashMap::new())) }
+fn redl_target() -> &'static Mutex<HashMap<String, (String, String)>> {
+    REDL_TARGET.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// True if the file begins like an HTML document — an expired/auth-gated link
 /// (e.g. a Gmail attachment) often returns a login/error web page, not the file.
 fn file_looks_html(path: &str) -> bool {
     use std::io::Read;
-    let mut f = match std::fs::File::open(path) { Ok(f) => f, Err(_) => return false };
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
     let mut buf = [0u8; 512];
     let n = f.read(&mut buf).unwrap_or(0);
-    let head = String::from_utf8_lossy(&buf[..n]).trim_start().to_lowercase();
+    let head = String::from_utf8_lossy(&buf[..n])
+        .trim_start()
+        .to_lowercase();
     head.starts_with("<!doctype html") || head.starts_with("<html") || head.starts_with("<head")
 }
 
@@ -1064,21 +1778,37 @@ fn file_looks_html(path: &str) -> bool {
 /// replace the original (success) or discard the temp and flag failure — the
 /// original is never touched until we have a good file.
 fn finish_redownload(temp_path: &str, final_path: &str, expected_ext: &str) {
-    let name = std::path::Path::new(final_path).file_name().and_then(|s| s.to_str()).unwrap_or("file").to_string();
-    let bad_html = file_looks_html(temp_path) && !expected_ext.is_empty() && expected_ext != "html" && expected_ext != "htm";
+    let name = std::path::Path::new(final_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let bad_html = file_looks_html(temp_path)
+        && !expected_ext.is_empty()
+        && expected_ext != "html"
+        && expected_ext != "htm";
     if bad_html {
         let _ = std::fs::remove_file(temp_path);
         let _ = std::fs::remove_file(format!("{temp_path}.aria2"));
-        notify(&format!("✗ Re-download failed: {name}"), "The link returned a web page, not the file — it may have expired or need sign-in.");
+        notify(
+            &format!("✗ Re-download failed: {name}"),
+            "The link returned a web page, not the file — it may have expired or need sign-in.",
+        );
         return;
     }
     // Good file → replace the original (copy+remove fallback across filesystems).
     let moved = std::fs::rename(temp_path, final_path).is_ok()
-        || (std::fs::copy(temp_path, final_path).is_ok() && { let _ = std::fs::remove_file(temp_path); true });
+        || (std::fs::copy(temp_path, final_path).is_ok() && {
+            let _ = std::fs::remove_file(temp_path);
+            true
+        });
     if moved {
         notify(&format!("✓ Re-downloaded: {name}"), final_path);
     } else {
-        notify(&format!("✗ Re-download failed: {name}"), "Could not replace the original file.");
+        notify(
+            &format!("✗ Re-download failed: {name}"),
+            "Could not replace the original file.",
+        );
     }
 }
 
@@ -1094,27 +1824,42 @@ fn run_on_complete(gid: &str, path: &str, name: &str) {
     if let Some(exp) = expected_cs {
         // Run synchronously in the watcher thread — file is already fully written.
         let ok = verify_checksum_inner(path, &exp).unwrap_or(false);
-        if let Ok(mut m) = dl_meta().lock() {
-            if let Some(e) = m.get_mut(gid) {
-                e.verify = if ok { "ok".into() } else { "fail".into() };
-            }
+        if let Ok(mut m) = dl_meta().lock()
+            && let Some(e) = m.get_mut(gid)
+        {
+            e.verify = if ok { "ok".into() } else { "fail".into() };
         }
         save_dl_meta();
         if ok {
-            notify(&format!("✓ Checksum verified: {name}"), "The file is intact.");
+            notify(
+                &format!("✓ Checksum verified: {name}"),
+                "The file is intact.",
+            );
         } else {
-            notify(&format!("✗ Checksum mismatch: {name}"), "The file may be corrupt.");
+            notify(
+                &format!("✗ Checksum mismatch: {name}"),
+                "The file may be corrupt.",
+            );
         }
     }
     // Resolve action: persisted DL_META → in-memory DL_ON_COMPLETE → global default.
     let per_meta = dl_meta().lock().ok().and_then(|mut m| {
         let e = m.get_mut(gid)?;
-        if e.oncomplete_action.is_empty() { return None; }
-        Some((std::mem::take(&mut e.oncomplete_action), std::mem::take(&mut e.oncomplete_cmd)))
+        if e.oncomplete_action.is_empty() {
+            return None;
+        }
+        Some((
+            std::mem::take(&mut e.oncomplete_action),
+            std::mem::take(&mut e.oncomplete_cmd),
+        ))
     });
     let per_mem = dl_on_complete().lock().ok().and_then(|mut m| m.remove(gid));
-    let (action, command) = per_meta.or(per_mem)
-        .unwrap_or_else(|| on_complete().lock().map(|g| g.clone()).unwrap_or(("none".to_string(), String::new())));
+    let (action, command) = per_meta.or(per_mem).unwrap_or_else(|| {
+        on_complete()
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or(("none".to_string(), String::new()))
+    });
     match action.as_str() {
         "reveal" => {
             if let Some(app) = APP.get() {
@@ -1133,7 +1878,9 @@ fn run_on_complete(gid: &str, path: &str, name: &str) {
             if cmd.is_empty() {
                 return;
             }
-            let full = cmd.replace("{path}", &shell_quote(path)).replace("{name}", &shell_quote(name));
+            let full = cmd
+                .replace("{path}", &shell_quote(path))
+                .replace("{name}", &shell_quote(name));
             let _ = Command::new("sh").arg("-c").arg(full).spawn();
         }
         _ => {}
@@ -1141,11 +1888,17 @@ fn run_on_complete(gid: &str, path: &str, name: &str) {
 }
 
 fn history_path(gid: &str) -> Option<String> {
-    history()
-        .lock()
-        .ok()
-        .and_then(|h| h.iter().find(|x| x.get("gid").and_then(|g| g.as_str()) == Some(gid))
-            .and_then(|x| x.get("files").and_then(|f| f.get(0)).and_then(|f| f.get("path")).and_then(|p| p.as_str()).map(String::from)))
+    history().lock().ok().and_then(|h| {
+        h.iter()
+            .find(|x| x.get("gid").and_then(|g| g.as_str()) == Some(gid))
+            .and_then(|x| {
+                x.get("files")
+                    .and_then(|f| f.get(0))
+                    .and_then(|f| f.get("path"))
+                    .and_then(|p| p.as_str())
+                    .map(String::from)
+            })
+    })
 }
 
 /// Move a finished file into its category subfolder; returns the resulting path.
@@ -1159,7 +1912,11 @@ fn reserved() -> &'static Mutex<HashSet<String>> {
 fn unique_out(dir: &std::path::Path, filename: &str) -> String {
     std::fs::create_dir_all(dir).ok();
     let fallback = "download".to_string();
-    let filename = if filename.trim().is_empty() { fallback.as_str() } else { filename };
+    let filename = if filename.trim().is_empty() {
+        fallback.as_str()
+    } else {
+        filename
+    };
     let (stem, ext) = match filename.rfind('.') {
         Some(i) if i > 0 => (filename[..i].to_string(), filename[i..].to_string()),
         _ => (filename.to_string(), String::new()),
@@ -1167,7 +1924,10 @@ fn unique_out(dir: &std::path::Path, filename: &str) -> String {
     let taken = |name: &str| -> bool {
         let full = dir.join(name).display().to_string();
         std::path::Path::new(&full).exists()
-            || reserved().lock().map(|s| s.contains(&full)).unwrap_or(false)
+            || reserved()
+                .lock()
+                .map(|s| s.contains(&full))
+                .unwrap_or(false)
     };
     let mut name = filename.to_string();
     let mut n = 1;
@@ -1214,34 +1974,35 @@ fn organize_path(path: &str) -> String {
     dest.display().to_string()
 }
 
-
 fn pending() -> &'static Mutex<Vec<Value>> {
     PENDING.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 fn update_pending<F: FnOnce(&mut Value)>(id: &str, f: F) {
-    if let Ok(mut jobs) = pending().lock() {
-        if let Some(j) = jobs.iter_mut().find(|j| j.get("id").and_then(|g| g.as_str()) == Some(id)) {
-            f(j);
-        }
+    if let Ok(mut jobs) = pending().lock()
+        && let Some(j) = jobs
+            .iter_mut()
+            .find(|j| j.get("id").and_then(|g| g.as_str()) == Some(id))
+    {
+        f(j);
     }
 }
 
 fn focus_main() {
-    if let Some(app) = APP.get() {
-        if let Some(w) = app.get_webview_window("main") {
-            let was_hidden = !w.is_visible().unwrap_or(true);
-            let _ = w.show();
-            let _ = w.unminimize();
-            let _ = w.set_focus();
-            // GNOME/Wayland blocks programmatic focus-stealing, so also flag the
-            // taskbar entry to demand attention when the window can't be raised.
-            let _ = w.request_user_attention(Some(tauri::UserAttentionType::Critical));
-            // Showing a previously-hidden window leaves its title-bar buttons inert
-            // on GNOME/Wayland until the surface is reconfigured — re-arm them.
-            if was_hidden {
-                rearm_window_controls();
-            }
+    if let Some(app) = APP.get()
+        && let Some(w) = app.get_webview_window("main")
+    {
+        let was_hidden = !w.is_visible().unwrap_or(true);
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+        // GNOME/Wayland blocks programmatic focus-stealing, so also flag the
+        // taskbar entry to demand attention when the window can't be raised.
+        let _ = w.request_user_attention(Some(tauri::UserAttentionType::Critical));
+        // Showing a previously-hidden window leaves its title-bar buttons inert
+        // on GNOME/Wayland until the surface is reconfigured — re-arm them.
+        if was_hidden {
+            rearm_window_controls();
         }
     }
 }
@@ -1254,7 +2015,9 @@ fn rearm_window_controls() {
     std::thread::spawn(|| {
         std::thread::sleep(Duration::from_millis(80));
         let Some(app) = APP.get() else { return };
-        let Some(w) = app.get_webview_window("main") else { return };
+        let Some(w) = app.get_webview_window("main") else {
+            return;
+        };
         if !w.is_visible().unwrap_or(false) || w.is_maximized().unwrap_or(false) {
             return;
         }
@@ -1297,12 +2060,13 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
-                out.push(h * 16 + l);
-                i += 3;
-                continue;
-            }
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2]))
+        {
+            out.push(h * 16 + l);
+            i += 3;
+            continue;
         }
         out.push(b[i]);
         i += 1;
@@ -1315,7 +2079,11 @@ fn url_filename(url: &str) -> String {
     let no_q = url.split(['?', '#']).next().unwrap_or(url);
     let last = no_q.trim_end_matches('/').rsplit('/').next().unwrap_or("");
     let decoded = percent_decode(last);
-    if decoded.trim().is_empty() { "download".into() } else { decoded }
+    if decoded.trim().is_empty() {
+        "download".into()
+    } else {
+        decoded
+    }
 }
 
 /// Pull a filename out of a Content-Disposition header value.
@@ -1342,7 +2110,10 @@ fn cd_filename(cd: &str) -> Option<String> {
 
 /// HEAD the URL to learn the real filename and size for the confirmation dialog.
 async fn probe_url(url: String, referer: Option<String>) -> (Option<String>, u64) {
-    let client = match reqwest::Client::builder().timeout(Duration::from_secs(8)).build() {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+    {
         Ok(c) => c,
         Err(_) => return (None, 0),
     };
@@ -1356,10 +2127,10 @@ async fn probe_url(url: String, referer: Option<String>) -> (Option<String>, u64
         if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
             size = cl.to_str().ok().and_then(|s| s.parse().ok()).unwrap_or(0);
         }
-        if let Some(cd) = resp.headers().get(reqwest::header::CONTENT_DISPOSITION) {
-            if let Ok(s) = cd.to_str() {
-                filename = cd_filename(s);
-            }
+        if let Some(cd) = resp.headers().get(reqwest::header::CONTENT_DISPOSITION)
+            && let Ok(s) = cd.to_str()
+        {
+            filename = cd_filename(s);
         }
     }
     (filename, size)
@@ -1368,7 +2139,10 @@ async fn probe_url(url: String, referer: Option<String>) -> (Option<String>, u64
 /// HEAD the URL and report whether the server serves media/binary content. Used as a
 /// content-type safety net for extensionless URLs (no file suffix to match on).
 async fn url_is_media(url: &str, referer: Option<&str>) -> bool {
-    let client = match reqwest::Client::builder().timeout(Duration::from_secs(6)).build() {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(6))
+        .build()
+    {
         Ok(c) => c,
         Err(_) => return false,
     };
@@ -1377,9 +2151,15 @@ async fn url_is_media(url: &str, referer: Option<&str>) -> bool {
         req = req.header(reqwest::header::REFERER, r);
     }
     if let Ok(resp) = req.send().await {
-        let ct = resp.headers().get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
-        return ct.starts_with("image/") || ct.starts_with("video/") || ct.starts_with("audio/")
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_lowercase();
+        return ct.starts_with("image/")
+            || ct.starts_with("video/")
+            || ct.starts_with("audio/")
             || ct.starts_with("application/octet-stream");
     }
     false
@@ -1388,13 +2168,21 @@ async fn url_is_media(url: &str, referer: Option<&str>) -> bool {
 /// Which engine handles a URL: direct files → aria2 (fast, resumable, correct
 /// naming); pages/streams → yt-dlp (1800+ extractors + muxing).
 #[derive(Debug, PartialEq, Clone, Copy)]
-enum Route { Aria2, Ytdlp }
+enum Route {
+    Aria2,
+    Ytdlp,
+}
 
 /// A routing decision plus any content-type learned while probing (used to give an
 /// extensionless direct file a proper name).
-struct Routing { route: Route, ctype: Option<String> }
+struct Routing {
+    route: Route,
+    ctype: Option<String>,
+}
 impl Routing {
-    fn just(route: Route) -> Self { Routing { route, ctype: None } }
+    fn just(route: Route) -> Self {
+        Routing { route, ctype: None }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1416,10 +2204,15 @@ struct MediaDownloadOptions {
     out_name: Option<String>,
     elem: Option<String>,
     paused: bool,
+    profile: DownloadProfile,
 }
 
 fn media_candidate(value: &Value) -> Option<MediaCandidate> {
-    if value.get("partial").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if value
+        .get("partial")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         return None;
     }
     let url = value.get("url").and_then(|v| v.as_str())?.trim();
@@ -1434,8 +2227,12 @@ fn media_candidate(value: &Value) -> Option<MediaCandidate> {
     Some(MediaCandidate {
         url: url.to_string(),
         kind: kind.to_string(),
-        content_type: value.get("contentType").and_then(|v| v.as_str())
-            .map(str::trim).filter(|s| !s.is_empty()).map(str::to_lowercase),
+        content_type: value
+            .get("contentType")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_lowercase),
     })
 }
 
@@ -1443,16 +2240,24 @@ fn media_candidates(value: &Value) -> Result<Vec<MediaCandidate>, String> {
     if value.get("schemaVersion").and_then(|v| v.as_u64()) != Some(2) {
         return Err("unsupported media resolver schema".into());
     }
-    let raw = value.get("candidates").and_then(|v| v.as_array())
+    let raw = value
+        .get("candidates")
+        .and_then(|v| v.as_array())
         .ok_or_else(|| "media resolver sent no candidates".to_string())?;
-    let selected = value.get("selectedIndex").and_then(|v| v.as_u64()).map(|v| v as usize);
+    let selected = value
+        .get("selectedIndex")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
     if let Some(index) = selected {
-        let candidate = raw.get(index).and_then(media_candidate)
+        let candidate = raw
+            .get(index)
+            .and_then(media_candidate)
             .ok_or_else(|| "selected media source is unavailable".to_string())?;
         return Ok(vec![candidate]);
     }
     let mut seen = HashSet::new();
-    let candidates: Vec<MediaCandidate> = raw.iter()
+    let candidates: Vec<MediaCandidate> = raw
+        .iter()
         .filter_map(media_candidate)
         .filter(|candidate| seen.insert(candidate.url.clone()))
         .take(8)
@@ -1466,8 +2271,10 @@ fn media_candidates(value: &Value) -> Result<Vec<MediaCandidate>, String> {
 
 fn route_from_media_evidence(kind: &str, content_type: Option<&str>) -> Option<Route> {
     let content_type = content_type.unwrap_or("").to_lowercase();
-    if kind == "manifest" || kind == "stream"
-        || content_type.contains("mpegurl") || content_type.contains("dash+xml")
+    if kind == "manifest"
+        || kind == "stream"
+        || content_type.contains("mpegurl")
+        || content_type.contains("dash+xml")
     {
         return Some(Route::Ytdlp);
     }
@@ -1479,7 +2286,12 @@ fn route_from_media_evidence(kind: &str, content_type: Option<&str>) -> Option<R
 
 fn is_torrent_like(url: &str) -> bool {
     url.starts_with("magnet:")
-        || url.split(['?', '#']).next().unwrap_or("").to_lowercase().ends_with(".torrent")
+        || url
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("")
+            .to_lowercase()
+            .ends_with(".torrent")
 }
 
 fn is_stream_manifest(url: &str) -> bool {
@@ -1491,27 +2303,63 @@ fn is_stream_manifest(url: &str) -> bool {
 fn is_known_ytdlp_host(url: &str) -> bool {
     let host = host_of(url).to_lowercase();
     const SITES: &[&str] = &[
-        "youtube.com", "youtube-nocookie.com", "youtu.be", "vimeo.com", "dailymotion.com", "tiktok.com",
-        "instagram.com", "twitter.com", "x.com", "facebook.com", "fb.watch",
-        "twitch.tv", "soundcloud.com", "bandcamp.com", "reddit.com", "streamable.com",
-        "bilibili.com", "nicovideo.jp", "ok.ru", "rutube.ru", "vk.com", "odysee.com",
+        "youtube.com",
+        "youtube-nocookie.com",
+        "youtu.be",
+        "vimeo.com",
+        "dailymotion.com",
+        "tiktok.com",
+        "instagram.com",
+        "twitter.com",
+        "x.com",
+        "facebook.com",
+        "fb.watch",
+        "twitch.tv",
+        "soundcloud.com",
+        "bandcamp.com",
+        "reddit.com",
+        "streamable.com",
+        "bilibili.com",
+        "nicovideo.jp",
+        "ok.ru",
+        "rutube.ru",
+        "vk.com",
+        "odysee.com",
     ];
-    SITES.iter().any(|s| host == *s || host.ends_with(&format!(".{s}")))
+    SITES
+        .iter()
+        .any(|s| host == *s || host.ends_with(&format!(".{s}")))
 }
 
 /// Map a media content-type to a file extension (to name an extensionless file).
 fn ext_for_ctype(ct: &str) -> Option<&'static str> {
     Some(match ct.split(';').next().unwrap_or("").trim() {
-        "image/png" => "png", "image/jpeg" => "jpg", "image/gif" => "gif",
-        "image/webp" => "webp", "image/avif" => "avif", "image/bmp" => "bmp",
-        "image/svg+xml" => "svg", "image/tiff" => "tiff",
-        "video/mp4" => "mp4", "video/webm" => "webm", "video/x-matroska" => "mkv",
-        "video/quicktime" => "mov", "video/mpeg" => "mpeg", "video/x-msvideo" => "avi",
-        "video/x-flv" => "flv", "video/3gpp" => "3gp",
-        "audio/mpeg" => "mp3", "audio/mp4" => "m4a", "audio/aac" => "aac",
-        "audio/ogg" => "ogg", "audio/wav" | "audio/x-wav" => "wav",
-        "audio/flac" | "audio/x-flac" => "flac", "audio/opus" => "opus", "audio/webm" => "weba",
-        "application/pdf" => "pdf", "application/zip" => "zip",
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/avif" => "avif",
+        "image/bmp" => "bmp",
+        "image/svg+xml" => "svg",
+        "image/tiff" => "tiff",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "video/x-matroska" => "mkv",
+        "video/quicktime" => "mov",
+        "video/mpeg" => "mpeg",
+        "video/x-msvideo" => "avi",
+        "video/x-flv" => "flv",
+        "video/3gpp" => "3gp",
+        "audio/mpeg" => "mp3",
+        "audio/mp4" => "m4a",
+        "audio/aac" => "aac",
+        "audio/ogg" => "ogg",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/flac" | "audio/x-flac" => "flac",
+        "audio/opus" => "opus",
+        "audio/webm" => "weba",
+        "application/pdf" => "pdf",
+        "application/zip" => "zip",
         _ => return None,
     })
 }
@@ -1520,10 +2368,10 @@ fn ext_for_ctype(ct: &str) -> Option<&'static str> {
 /// its content-type (so a CDN image saves as name.png, not a bare name).
 fn filename_with_ext(url: &str, ctype: Option<&str>) -> String {
     let name = url_filename(url);
-    if std::path::Path::new(&name).extension().is_none() {
-        if let Some(ext) = ctype.and_then(ext_for_ctype) {
-            return format!("{name}.{ext}");
-        }
+    if std::path::Path::new(&name).extension().is_none()
+        && let Some(ext) = ctype.and_then(ext_for_ctype)
+    {
+        return format!("{name}.{ext}");
     }
     name
 }
@@ -1533,9 +2381,12 @@ fn browser_import_path_allowed(source: &std::path::Path, downloads: &std::path::
 }
 
 fn browser_import_source(path: &str) -> Result<std::path::PathBuf, String> {
-    let source = std::fs::canonicalize(path).map_err(|_| "browser file is no longer available".to_string())?;
-    let downloads = dirs::download_dir().ok_or_else(|| "Downloads folder is unavailable".to_string())?;
-    let downloads = std::fs::canonicalize(downloads).map_err(|_| "Downloads folder is unavailable".to_string())?;
+    let source = std::fs::canonicalize(path)
+        .map_err(|_| "browser file is no longer available".to_string())?;
+    let downloads =
+        dirs::download_dir().ok_or_else(|| "Downloads folder is unavailable".to_string())?;
+    let downloads = std::fs::canonicalize(downloads)
+        .map_err(|_| "Downloads folder is unavailable".to_string())?;
     if !browser_import_path_allowed(&source, &downloads) || !source.is_file() {
         return Err("browser file must be a regular file inside Downloads".into());
     }
@@ -1544,20 +2395,26 @@ fn browser_import_source(path: &str) -> Result<std::path::PathBuf, String> {
 
 fn queue_browser_file(path: &str, source_url: &str) -> Result<String, String> {
     let source = browser_import_source(path)?;
-    let name = source.file_name().and_then(|value| value.to_str()).filter(|value| !value.is_empty())
-        .ok_or_else(|| "browser file has no usable name".to_string())?.to_string();
+    let name = source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "browser file has no usable name".to_string())?
+        .to_string();
     let source_path = source.display().to_string();
-    if let Ok(items) = pending().lock() {
-        if let Some(existing) = items.iter().find(|item| {
+    if let Ok(items) = pending().lock()
+        && let Some(existing) = items.iter().find(|item| {
             item.get("kind").and_then(|value| value.as_str()) == Some("browser-local")
-                && item.get("localPath").and_then(|value| value.as_str()) == Some(source_path.as_str())
-        }) {
-            if let Some(id) = existing.get("id").and_then(|value| value.as_str()) {
-                return Ok(id.to_string());
-            }
-        }
+                && item.get("localPath").and_then(|value| value.as_str())
+                    == Some(source_path.as_str())
+        })
+        && let Some(id) = existing.get("id").and_then(|value| value.as_str())
+    {
+        return Ok(id.to_string());
     }
-    let size = std::fs::metadata(&source).map(|metadata| metadata.len()).unwrap_or(0);
+    let size = std::fs::metadata(&source)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
     let category = category_of(&name).0;
     let id = format!("pend-{}", now_ms());
     pending().lock().map_err(|_| "lock")?.push(json!({
@@ -1582,26 +2439,48 @@ fn import_browser_file(
     requested_name: Option<&str>,
 ) -> Result<String, String> {
     let source = browser_import_source(path)?;
-    let original_name = source.file_name().and_then(|value| value.to_str()).filter(|value| !value.is_empty())
-        .ok_or_else(|| "browser file has no usable name".to_string())?.to_string();
-    let name = match requested_name.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(value) => std::path::Path::new(value).file_name().and_then(|part| part.to_str())
-            .filter(|part| !part.is_empty()).ok_or_else(|| "browser file has no usable name".to_string())?.to_string(),
+    let original_name = source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "browser file has no usable name".to_string())?
+        .to_string();
+    let name = match requested_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => std::path::Path::new(value)
+            .file_name()
+            .and_then(|part| part.to_str())
+            .filter(|part| !part.is_empty())
+            .ok_or_else(|| "browser file has no usable name".to_string())?
+            .to_string(),
         None => original_name,
     };
-    let destination_dir = requested_dir.map(str::trim).filter(|value| !value.is_empty())
+    let destination_dir = requested_dir
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| if ORGANIZE.load(Ordering::Relaxed) { category_of(&name).1 } else { download_dir() });
-    std::fs::create_dir_all(&destination_dir).map_err(|error| format!("could not create destination folder: {error}"))?;
+        .unwrap_or_else(|| {
+            if ORGANIZE.load(Ordering::Relaxed) {
+                category_of(&name).1
+            } else {
+                download_dir()
+            }
+        });
+    std::fs::create_dir_all(&destination_dir)
+        .map_err(|error| format!("could not create destination folder: {error}"))?;
     let output_name = unique_out(&destination_dir, &name);
     let destination = destination_dir.join(&output_name);
-    if source != destination {
-        if std::fs::rename(&source, &destination).is_err() {
-            std::fs::copy(&source, &destination).map_err(|error| format!("could not import browser file: {error}"))?;
-            std::fs::remove_file(&source).map_err(|error| format!("could not remove browser copy: {error}"))?;
-        }
+    if source != destination && std::fs::rename(&source, &destination).is_err() {
+        std::fs::copy(&source, &destination)
+            .map_err(|error| format!("could not import browser file: {error}"))?;
+        std::fs::remove_file(&source)
+            .map_err(|error| format!("could not remove browser copy: {error}"))?;
     }
-    let size = std::fs::metadata(&destination).map(|metadata| metadata.len()).unwrap_or(0);
+    let size = std::fs::metadata(&destination)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
     let now = now_ms() as u64;
     let gid = format!("local-{now}");
     let source_uri = if source_url.starts_with("http://") || source_url.starts_with("https://") {
@@ -1635,26 +2514,54 @@ fn import_browser_file(
 /// HEAD (or a ranged GET when HEAD is refused) the URL and classify it by
 /// content-type. Returns (engine, content-type); None when there's nothing to go on.
 async fn head_classify(url: &str, referer: Option<&str>) -> Option<(Route, String)> {
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(8)).build().ok()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .ok()?;
     let mut hb = client.head(url);
-    if let Some(rf) = referer.filter(|r| !r.is_empty()) { hb = hb.header(reqwest::header::REFERER, rf); }
+    if let Some(rf) = referer.filter(|r| !r.is_empty()) {
+        hb = hb.header(reqwest::header::REFERER, rf);
+    }
     let mut resp = hb.send().await.ok()?;
     if matches!(resp.status().as_u16(), 403 | 405 | 501) {
         // Server refuses HEAD — peek with a 1-byte ranged GET.
         let mut gb = client.get(url).header(reqwest::header::RANGE, "bytes=0-0");
-        if let Some(rf) = referer.filter(|r| !r.is_empty()) { gb = gb.header(reqwest::header::REFERER, rf); }
-        if let Ok(r) = gb.send().await { resp = r; }
+        if let Some(rf) = referer.filter(|r| !r.is_empty()) {
+            gb = gb.header(reqwest::header::REFERER, rf);
+        }
+        if let Ok(r) = gb.send().await {
+            resp = r;
+        }
     }
-    let ct = resp.headers().get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
+    let ct = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
     // An explicit attachment is a download whatever the type says.
-    let attach = resp.headers().get(reqwest::header::CONTENT_DISPOSITION)
-        .and_then(|v| v.to_str().ok()).map(|s| s.to_lowercase().contains("attachment")).unwrap_or(false);
-    if attach { return Some((Route::Aria2, ct)); }
-    if ct.contains("mpegurl") || ct.contains("dash+xml") { return Some((Route::Ytdlp, ct)); }
-    if ct.starts_with("image/") || ct.starts_with("video/") || ct.starts_with("audio/")
-        || ct.starts_with("application/octet-stream") { return Some((Route::Aria2, ct)); }
-    if ct.starts_with("text/html") || ct.contains("xhtml") { return Some((Route::Ytdlp, ct)); }
+    let attach = resp
+        .headers()
+        .get(reqwest::header::CONTENT_DISPOSITION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_lowercase().contains("attachment"))
+        .unwrap_or(false);
+    if attach {
+        return Some((Route::Aria2, ct));
+    }
+    if ct.contains("mpegurl") || ct.contains("dash+xml") {
+        return Some((Route::Ytdlp, ct));
+    }
+    if ct.starts_with("image/")
+        || ct.starts_with("video/")
+        || ct.starts_with("audio/")
+        || ct.starts_with("application/octet-stream")
+    {
+        return Some((Route::Aria2, ct));
+    }
+    if ct.starts_with("text/html") || ct.contains("xhtml") {
+        return Some((Route::Ytdlp, ct));
+    }
     None
 }
 
@@ -1668,31 +2575,46 @@ async fn decide_route(
     content_type: Option<&str>,
     referer: Option<&str>,
 ) -> Routing {
-    if is_torrent_like(url) { return Routing::just(Route::Aria2); }
-    if is_stream_manifest(url) { return Routing::just(Route::Ytdlp); }
-    if let Some(route) = route_from_media_evidence(kind, content_type) {
-        return Routing { route, ctype: content_type.map(str::to_string) };
+    if is_torrent_like(url) {
+        return Routing::just(Route::Aria2);
     }
-    if is_direct_file_url(url) { return Routing::just(Route::Aria2); }
+    if is_stream_manifest(url) {
+        return Routing::just(Route::Ytdlp);
+    }
+    if let Some(route) = route_from_media_evidence(kind, content_type) {
+        return Routing {
+            route,
+            ctype: content_type.map(str::to_string),
+        };
+    }
+    if is_direct_file_url(url) {
+        return Routing::just(Route::Aria2);
+    }
     match elem {
         Some("img") | Some("image") => return Routing::just(Route::Aria2),
         Some("video-mse") | Some("audio-mse") => return Routing::just(Route::Ytdlp),
         _ => {}
     }
-    if has_stream || kind == "stream" { return Routing::just(Route::Ytdlp); }
+    if has_stream || kind == "stream" {
+        return Routing::just(Route::Ytdlp);
+    }
     let site_hint = is_known_ytdlp_host(url);
     let default = if kind == "page" || kind == "site" || (kind.is_empty() && site_hint) {
         Route::Ytdlp
     } else {
         Route::Aria2
     };
-    if !url.starts_with("http") { return Routing::just(default); }
+    if !url.starts_with("http") {
+        return Routing::just(default);
+    }
     match head_classify(url, referer).await {
-        Some((route, ct)) => Routing { route, ctype: Some(ct) },
+        Some((route, ct)) => Routing {
+            route,
+            ctype: Some(ct),
+        },
         None => Routing::just(default),
     }
 }
-
 
 fn site_jobs() -> &'static Mutex<Vec<Value>> {
     SITE_JOBS.get_or_init(|| Mutex::new(Vec::new()))
@@ -1707,7 +2629,10 @@ fn site_cancelled() -> &'static Mutex<HashSet<String>> {
 }
 
 fn signal_site_process(id: &str, signal: &str) -> Result<(), String> {
-    let pid = site_processes().lock().ok().and_then(|p| p.get(id).copied())
+    let pid = site_processes()
+        .lock()
+        .ok()
+        .and_then(|p| p.get(id).copied())
         .ok_or_else(|| "media process is no longer running".to_string())?;
     let status = Command::new("kill")
         .arg(format!("-{signal}"))
@@ -1715,14 +2640,27 @@ fn signal_site_process(id: &str, signal: &str) -> Result<(), String> {
         .arg(format!("-{pid}"))
         .status()
         .map_err(|e| format!("could not signal media process: {e}"))?;
-    if status.success() { Ok(()) } else { Err(format!("could not {signal} media process")) }
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("could not {signal} media process"))
+    }
 }
 
-fn signal_all_site_processes(signal: &str, status_from: &str, status_to: &str) -> Result<(), String> {
-    let ids: Vec<String> = site_jobs().lock().map(|jobs| jobs.iter()
-        .filter(|job| job.get("status").and_then(|s| s.as_str()) == Some(status_from))
-        .filter_map(|job| job.get("gid").and_then(|g| g.as_str()).map(String::from))
-        .collect()).unwrap_or_default();
+fn signal_all_site_processes(
+    signal: &str,
+    status_from: &str,
+    status_to: &str,
+) -> Result<(), String> {
+    let ids: Vec<String> = site_jobs()
+        .lock()
+        .map(|jobs| {
+            jobs.iter()
+                .filter(|job| job.get("status").and_then(|s| s.as_str()) == Some(status_from))
+                .filter_map(|job| job.get("gid").and_then(|g| g.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut last_error = None;
     for id in ids {
         match signal_site_process(&id, signal) {
@@ -1741,13 +2679,12 @@ fn now_ms() -> u128 {
 }
 
 fn update_site_job<F: FnOnce(&mut Value)>(id: &str, f: F) {
-    if let Ok(mut jobs) = site_jobs().lock() {
-        if let Some(j) = jobs
+    if let Ok(mut jobs) = site_jobs().lock()
+        && let Some(j) = jobs
             .iter_mut()
             .find(|j| j.get("gid").and_then(|g| g.as_str()) == Some(id))
-        {
-            f(j);
-        }
+    {
+        f(j);
     }
 }
 
@@ -1756,37 +2693,49 @@ fn update_site_job<F: FnOnce(&mut Value)>(id: &str, f: F) {
 fn ytdlp_user_path() -> std::path::PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/share"))
-        .join("DownMan").join("bin").join("yt-dlp")
+        .join("DownMan")
+        .join("bin")
+        .join("yt-dlp")
 }
 
 /// Resolve the yt-dlp binary: env override → user-updated copy → bundled sidecar
 /// (installed as `downman-ytdlp` next to the app binary) → resource dir → dev tree → PATH.
 fn ytdlp_bin() -> String {
-    if let Ok(p) = std::env::var("DOWNMAN_YTDLP") { return p; }
+    if let Ok(p) = std::env::var("DOWNMAN_YTDLP") {
+        return p;
+    }
     // A user-updated copy (via the in-app updater) wins so extractors stay working.
     let up = ytdlp_user_path();
-    if up.exists() { return up.display().to_string(); }
+    if up.exists() {
+        return up.display().to_string();
+    }
     // Installed .deb / AppImage: the sidecar sits next to the app binary as downman-ytdlp.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(d) = exe.parent() {
-            for rel in ["downman-ytdlp", "yt-dlp"] {
-                let p = d.join(rel);
-                if p.exists() { return p.display().to_string(); }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(d) = exe.parent()
+    {
+        for rel in ["downman-ytdlp", "yt-dlp"] {
+            let p = d.join(rel);
+            if p.exists() {
+                return p.display().to_string();
             }
         }
     }
     // Some Tauri layouts expose sidecars via the resource dir.
-    if let Some(app) = APP.get() {
-        if let Ok(res) = app.path().resource_dir() {
-            for name in ["downman-ytdlp", "yt-dlp"] {
-                let p = res.join(name);
-                if p.exists() { return p.display().to_string(); }
+    if let Some(app) = APP.get()
+        && let Ok(res) = app.path().resource_dir()
+    {
+        for name in ["downman-ytdlp", "yt-dlp"] {
+            let p = res.join(name);
+            if p.exists() {
+                return p.display().to_string();
             }
         }
     }
     // Dev tree.
     for c in ["src-tauri/binaries/yt-dlp", "binaries/yt-dlp"] {
-        if std::path::Path::new(c).exists() { return c.to_string(); }
+        if std::path::Path::new(c).exists() {
+            return c.to_string();
+        }
     }
     "yt-dlp".into()
 }
@@ -1796,7 +2745,9 @@ fn ytdlp_bin() -> String {
 /// this to yt-dlp lets it find a user-installed node/deno JS runtime.
 fn augmented_path() -> String {
     let mut parts: Vec<String> = Vec::new();
-    if let Ok(p) = std::env::var("PATH") { parts.push(p); }
+    if let Ok(p) = std::env::var("PATH") {
+        parts.push(p);
+    }
     let home = dirs::home_dir().unwrap_or_default();
     for extra in [
         home.join(".local/bin"),
@@ -1806,31 +2757,35 @@ fn augmented_path() -> String {
         std::path::PathBuf::from("/snap/bin"),
     ] {
         let s = extra.display().to_string();
-        if !parts.iter().any(|p| p.split(':').any(|seg| seg == s)) { parts.push(s); }
+        if !parts.iter().any(|p| p.split(':').any(|seg| seg == s)) {
+            parts.push(s);
+        }
     }
     parts.join(":")
 }
 
 fn bin_in_path(name: &str) -> bool {
-    augmented_path().split(':').any(|d| !d.is_empty() && std::path::Path::new(d).join(name).exists())
+    augmented_path()
+        .split(':')
+        .any(|d| !d.is_empty() && std::path::Path::new(d).join(name).exists())
 }
 
 /// A JavaScript runtime yt-dlp can use to solve player signature (nsig)
 /// challenges on some sites. Without one, yt-dlp falls back to limited player
 /// clients and many videos fail or only offer 360p.
 fn js_runtime() -> Option<&'static str> {
-    for rt in ["deno", "node", "bun"] {
-        if which(rt).is_some() || bin_in_path(rt) {
-            return Some(rt);
-        }
-    }
-    None
+    ["deno", "node", "bun"]
+        .into_iter()
+        .find(|&rt| which(rt).is_some() || bin_in_path(rt))
+        .map(|v| v as _)
 }
 
 /// Which JS runtime yt-dlp will use for signature challenges (or "none").
 #[tauri::command]
 fn js_runtime_status() -> String {
-    js_runtime().map(|s| s.to_string()).unwrap_or_else(|| "none".into())
+    js_runtime()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "none".into())
 }
 
 /// Version string of the yt-dlp the app currently resolves ("not found" if none).
@@ -1847,13 +2802,25 @@ fn ytdlp_version() -> String {
 async fn update_ytdlp() -> Result<String, String> {
     const BIN_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux";
     const SUM_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS";
-    let bytes = reqwest::get(BIN_URL).await.map_err(|e| format!("download failed: {e}"))?
-        .error_for_status().map_err(|e| e.to_string())?
-        .bytes().await.map_err(|e| e.to_string())?;
-    if bytes.len() < 1_000_000 { return Err("Download looked too small — aborted.".into()); }
-    let sums = reqwest::get(SUM_URL).await.map_err(|e| e.to_string())?
-        .text().await.map_err(|e| e.to_string())?;
-    let expected = sums.lines()
+    let bytes = reqwest::get(BIN_URL)
+        .await
+        .map_err(|e| format!("download failed: {e}"))?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .bytes()
+        .await
+        .map_err(|e| e.to_string())?;
+    if bytes.len() < 1_000_000 {
+        return Err("Download looked too small — aborted.".into());
+    }
+    let sums = reqwest::get(SUM_URL)
+        .await
+        .map_err(|e| e.to_string())?
+        .text()
+        .await
+        .map_err(|e| e.to_string())?;
+    let expected = sums
+        .lines()
         .find(|l| l.split_whitespace().nth(1) == Some("yt-dlp_linux"))
         .and_then(|l| l.split_whitespace().next())
         .map(|s| s.to_lowercase())
@@ -1862,15 +2829,26 @@ async fn update_ytdlp() -> Result<String, String> {
     std::fs::create_dir_all(dst.parent().ok_or("bad path")?).map_err(|e| e.to_string())?;
     let tmp = dst.with_extension("download");
     std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
-    let sum_out = Command::new("sha256sum").arg(&tmp).output().map_err(|e| e.to_string())?;
-    let got = String::from_utf8_lossy(&sum_out.stdout).split_whitespace().next().unwrap_or("").to_lowercase();
+    let sum_out = Command::new("sha256sum")
+        .arg(&tmp)
+        .output()
+        .map_err(|e| e.to_string())?;
+    let got = String::from_utf8_lossy(&sum_out.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
     if got != expected {
         let _ = std::fs::remove_file(&tmp);
         return Err("Checksum mismatch — download discarded for safety.".into());
     }
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
-    let ver_out = Command::new(&tmp).arg("--version").output().map_err(|e| e.to_string())?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| e.to_string())?;
+    let ver_out = Command::new(&tmp)
+        .arg("--version")
+        .output()
+        .map_err(|e| e.to_string())?;
     if !ver_out.status.success() {
         let _ = std::fs::remove_file(&tmp);
         return Err("The downloaded yt-dlp did not run.".into());
@@ -1882,7 +2860,10 @@ async fn update_ytdlp() -> Result<String, String> {
 
 /// Installed yt-dlp version (empty string if none is resolvable/runnable).
 fn installed_ytdlp_version() -> String {
-    Command::new(ytdlp_bin()).arg("--version").output().ok()
+    Command::new(ytdlp_bin())
+        .arg("--version")
+        .output()
+        .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default()
@@ -1893,14 +2874,14 @@ fn ytdlp_cfg_file() -> std::path::PathBuf {
 }
 
 fn load_ytdlp_cfg() {
-    if let Ok(s) = std::fs::read_to_string(ytdlp_cfg_file()) {
-        if let Ok(v) = serde_json::from_str::<Value>(&s) {
-            if let Some(a) = v.get("auto").and_then(|x| x.as_bool()) {
-                YTDLP_AUTO.store(a, Ordering::Relaxed);
-            }
-            if let Some(t) = v.get("last_check").and_then(|x| x.as_u64()) {
-                YTDLP_LAST_CHECK.store(t, Ordering::Relaxed);
-            }
+    if let Ok(s) = std::fs::read_to_string(ytdlp_cfg_file())
+        && let Ok(v) = serde_json::from_str::<Value>(&s)
+    {
+        if let Some(a) = v.get("auto").and_then(|x| x.as_bool()) {
+            YTDLP_AUTO.store(a, Ordering::Relaxed);
+        }
+        if let Some(t) = v.get("last_check").and_then(|x| x.as_u64()) {
+            YTDLP_LAST_CHECK.store(t, Ordering::Relaxed);
         }
     }
 }
@@ -1922,9 +2903,13 @@ async fn latest_ytdlp_tag() -> Result<String, String> {
         .map_err(|e| e.to_string())?;
     let resp = client
         .head("https://github.com/yt-dlp/yt-dlp/releases/latest")
-        .send().await
+        .send()
+        .await
         .map_err(|e| e.to_string())?;
-    resp.url().path().rsplit('/').next()
+    resp.url()
+        .path()
+        .rsplit('/')
+        .next()
         .filter(|s| !s.is_empty() && *s != "latest")
         .map(|s| s.to_string())
         .ok_or_else(|| "could not resolve latest yt-dlp tag".into())
@@ -1934,12 +2919,16 @@ async fn latest_ytdlp_tag() -> Result<String, String> {
 /// a cheap tag check throttled to once a day that only downloads when a newer
 /// release exists. On first run with nothing usable, fetches one immediately.
 async fn ytdlp_autoupdate_tick() {
-    if !YTDLP_AUTO.load(Ordering::Relaxed) { return; }
+    if !YTDLP_AUTO.load(Ordering::Relaxed) {
+        return;
+    }
     let installed = installed_ytdlp_version();
     let first_time = installed.is_empty() && !ytdlp_user_path().exists();
     let now = (now_ms() / 1000) as u64;
     let due = now.saturating_sub(YTDLP_LAST_CHECK.load(Ordering::Relaxed)) >= 24 * 3600;
-    if !first_time && !due { return; }
+    if !first_time && !due {
+        return;
+    }
     if first_time {
         // Nothing runnable yet (no user copy, no system yt-dlp): grab one now.
         if let Ok(v) = update_ytdlp().await {
@@ -1977,16 +2966,9 @@ fn set_ytdlp_auto_update(enable: bool) {
     save_ytdlp_cfg();
 }
 
+#[cfg(test)]
 fn ytdlp_format(q: &str) -> Vec<String> {
-    let s = |v: &str| v.to_string();
-    match q {
-        "audio" => vec![s("-f"), s("ba/b"), s("-x"), s("--audio-format"), s("mp3")],
-        "1080" => vec![s("-f"), s("bv*[height<=1080]+ba/b[height<=1080]/b"), s("--merge-output-format"), s("mp4")],
-        "720" => vec![s("-f"), s("bv*[height<=720]+ba/b[height<=720]/b"), s("--merge-output-format"), s("mp4")],
-        "best" | "" => vec![s("-f"), s("bv*+ba/b"), s("--merge-output-format"), s("mp4")],
-        // Anything else is a raw yt-dlp -f selector (a specific format the user picked).
-        raw => vec![s("-f"), raw.to_string(), s("--merge-output-format"), s("mp4")],
-    }
+    media_policy::legacy_format_args(q)
 }
 
 fn human_size(b: u64) -> String {
@@ -2018,7 +3000,11 @@ struct Fmt {
 }
 
 /// Query yt-dlp for the real, per-video list of available qualities.
-fn fetch_formats(url: String, referer: Option<String>, cookies: Option<String>) -> Result<Value, String> {
+fn fetch_formats(
+    url: String,
+    referer: Option<String>,
+    cookies: Option<String>,
+) -> Result<Value, String> {
     if url.is_empty() {
         return Err("no url".into());
     }
@@ -2041,7 +3027,11 @@ fn fetch_formats(url: String, referer: Option<String>, cookies: Option<String>) 
         return Err(err.lines().last().unwrap_or("yt-dlp failed").to_string());
     }
     let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| format!("parse: {e}"))?;
-    let title = v.get("title").and_then(|t| t.as_str()).unwrap_or("video").to_string();
+    let title = v
+        .get("title")
+        .and_then(|t| t.as_str())
+        .unwrap_or("video")
+        .to_string();
 
     use std::collections::BTreeMap;
     let mut by_height: BTreeMap<u64, (f64, Fmt)> = BTreeMap::new();
@@ -2073,11 +3063,32 @@ fn fetch_formats(url: String, referer: Option<String>, cookies: Option<String>) 
 
             if has_v && height > 0 {
                 let kind = if has_a { "av" } else { "video" };
-                let selector = if has_a { id.clone() } else { format!("{id}+bestaudio/{id}") };
-                let fpss = if fps >= 50.0 { format!("{}", fps.round() as u64) } else { String::new() };
+                // A raw YouTube format_id is tied to one extractor response/client
+                // session and can disappear by the time the user clicks Download.
+                // Re-resolve by height at download time, with lower-quality fallback.
+                let selector = format!("quality:{height}");
+                let fpss = if fps >= 50.0 {
+                    format!("{}", fps.round() as u64)
+                } else {
+                    String::new()
+                };
                 let sz = human_size(size);
-                let label = format!("{height}p{fpss} · {ext}{}", if sz.is_empty() { String::new() } else { format!(" · {sz}") });
-                let fmt = Fmt { selector, label, kind: kind.into(), height, ext: ext.into(), size };
+                let label = format!(
+                    "{height}p{fpss} · {ext}{}",
+                    if sz.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {sz}")
+                    }
+                );
+                let fmt = Fmt {
+                    selector,
+                    label,
+                    kind: kind.into(),
+                    height,
+                    ext: ext.into(),
+                    size,
+                };
                 let better = match by_height.get(&height) {
                     Some((t, existing)) => tbr > *t || (existing.ext != "mp4" && ext == "mp4"),
                     None => true,
@@ -2087,8 +3098,22 @@ fn fetch_formats(url: String, referer: Option<String>, cookies: Option<String>) 
                 }
             } else if has_a {
                 let sz = human_size(size);
-                let label = format!("Audio · {ext}{}", if sz.is_empty() { String::new() } else { format!(" · {sz}") });
-                let fmt = Fmt { selector: id.clone(), label, kind: "audio".into(), height: 0, ext: ext.into(), size };
+                let label = format!(
+                    "Audio · {ext}{}",
+                    if sz.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {sz}")
+                    }
+                );
+                let fmt = Fmt {
+                    selector: id.clone(),
+                    label,
+                    kind: "audio".into(),
+                    height: 0,
+                    ext: ext.into(),
+                    size,
+                };
                 let better = match &best_audio {
                     Some((a, _)) => abr > *a,
                     None => true,
@@ -2101,7 +3126,14 @@ fn fetch_formats(url: String, referer: Option<String>, cookies: Option<String>) 
     }
 
     let mut list: Vec<Fmt> = Vec::new();
-    list.push(Fmt { selector: "bv*+ba/b".into(), label: "Best available".into(), kind: "av".into(), height: 99999, ext: "mp4".into(), size: 0 });
+    list.push(Fmt {
+        selector: "bv*+ba/b".into(),
+        label: "Best available".into(),
+        kind: "av".into(),
+        height: 99999,
+        ext: "mp4".into(),
+        size: 0,
+    });
     for (_h, (_t, fmt)) in by_height.iter().rev() {
         list.push(fmt.clone());
     }
@@ -2117,9 +3149,14 @@ fn fetch_formats(url: String, referer: Option<String>, cookies: Option<String>) 
 /// to the real file URL.
 fn unwrap_media_url(url: &str) -> String {
     if let Some(pos) = url.find("/media?url=") {
-        let enc = url[pos + "/media?url=".len()..].split('&').next().unwrap_or("");
+        let enc = url[pos + "/media?url=".len()..]
+            .split('&')
+            .next()
+            .unwrap_or("");
         let dec = percent_decode(enc);
-        if dec.starts_with("http") { return dec; }
+        if dec.starts_with("http") {
+            return dec;
+        }
     }
     url.to_string()
 }
@@ -2127,10 +3164,12 @@ fn unwrap_media_url(url: &str) -> String {
 /// True if the URL points straight at a downloadable file (video or image).
 fn is_direct_file_url(url: &str) -> bool {
     let path = url.split(['?', '#']).next().unwrap_or(url).to_lowercase();
-    [".mp4", ".m4v", ".webm", ".mkv", ".mov", ".m4a", ".mp3", ".aac", ".flac",
-     ".ogg", ".wav", ".opus", ".ts", ".gif", ".jpg", ".jpeg", ".png", ".webp",
-     ".avif", ".bmp", ".svg"]
-        .iter().any(|e| path.ends_with(e))
+    [
+        ".mp4", ".m4v", ".webm", ".mkv", ".mov", ".m4a", ".mp3", ".aac", ".flac", ".ogg", ".wav",
+        ".opus", ".ts", ".gif", ".jpg", ".jpeg", ".png", ".webp", ".avif", ".bmp", ".svg",
+    ]
+    .iter()
+    .any(|e| path.ends_with(e))
 }
 
 /// Turn a user-chosen name into a yt-dlp output stem (no path separators or
@@ -2153,13 +3192,27 @@ fn unique_ytdlp_stem(dir: &std::path::Path, name: &str) -> (String, String) {
     let base = ytdlp_out_stem(name);
     let mut index = 0;
     loop {
-        let stem = if index == 0 { base.clone() } else { format!("{base} ({index})") };
+        let stem = if index == 0 {
+            base.clone()
+        } else {
+            format!("{base} ({index})")
+        };
         let prefix = format!("{stem}.");
-        let exists = std::fs::read_dir(dir).ok().into_iter().flatten().filter_map(Result::ok)
+        let exists = std::fs::read_dir(dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
             .filter_map(|entry| entry.file_name().into_string().ok())
             .any(|filename| filename.starts_with(&prefix));
-        let reservation = dir.join(format!("{stem}.__dm_ytdlp__")).display().to_string();
-        let reserved_now = reserved().lock().map(|paths| paths.contains(&reservation)).unwrap_or(false);
+        let reservation = dir
+            .join(format!("{stem}.__dm_ytdlp__"))
+            .display()
+            .to_string();
+        let reserved_now = reserved()
+            .lock()
+            .map(|paths| paths.contains(&reservation))
+            .unwrap_or(false);
         if !exists && !reserved_now {
             if let Ok(mut paths) = reserved().lock() {
                 paths.insert(reservation.clone());
@@ -2194,18 +3247,44 @@ fn decide_media_route(candidate: &MediaCandidate, options: &MediaDownloadOptions
     rx.recv().unwrap_or_else(|_| Routing::just(fallback_route))
 }
 
-fn start_direct_media(candidate: &MediaCandidate, options: &MediaDownloadOptions, routing: &Routing) -> Result<String, String> {
-    let fname = options.out_name.as_deref().map(str::trim).filter(|s| !s.is_empty())
+fn start_direct_media(
+    candidate: &MediaCandidate,
+    options: &MediaDownloadOptions,
+    routing: &Routing,
+) -> Result<String, String> {
+    let fname = options
+        .out_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| filename_with_ext(&candidate.url, routing.ctype.as_deref().or(candidate.content_type.as_deref())));
-    let tdir = options.out_dir.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            filename_with_ext(
+                &candidate.url,
+                routing
+                    .ctype
+                    .as_deref()
+                    .or(candidate.content_type.as_deref()),
+            )
+        });
+    let default_dir = if ORGANIZE.load(Ordering::Relaxed) {
+        category_of(&fname).1
+    } else {
+        download_dir()
+    };
+    let tdir = options
+        .out_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| if ORGANIZE.load(Ordering::Relaxed) { category_of(&fname).1 } else { download_dir() });
+        .unwrap_or_else(|| media_policy::output_dir(&options.profile, &default_dir));
     std::fs::create_dir_all(&tdir).ok();
     let out = unique_out(&tdir, &fname);
     let mut aria_options = serde_json::Map::new();
     aria_options.insert("dir".into(), json!(tdir.display().to_string()));
     aria_options.insert("out".into(), json!(out));
+    media_policy::apply_aria2_options(&options.profile, &mut aria_options, &tdir);
     if let Some(referer) = options.referer.as_deref().filter(|s| !s.is_empty()) {
         aria_options.insert("referer".into(), json!(referer));
     }
@@ -2217,34 +3296,36 @@ fn start_direct_media(candidate: &MediaCandidate, options: &MediaDownloadOptions
     std::thread::spawn(move || {
         let result = tauri::async_runtime::block_on(async move {
             let aria = ARIA2.get().ok_or_else(|| "aria2 not started".to_string())?;
-            aria.add_uri(vec![url], Value::Object(aria_options)).await.map_err(|e| e.to_string())
+            aria.add_uri(vec![url], Value::Object(aria_options))
+                .await
+                .map_err(|e| e.to_string())
         });
         let _ = tx.send(result);
     });
-    let gid = rx.recv().unwrap_or_else(|_| Err("aria2 add failed".into()))?;
+    let gid = rx
+        .recv()
+        .unwrap_or_else(|_| Err("aria2 add failed".into()))?;
     mark_download_added(&gid);
+    attach_profile_snapshot(&gid, &options.profile);
+    assign_profile_queue(&candidate.url, &options.profile);
     if let Ok(mut no_move) = no_organize().lock() {
         no_move.insert(gid.clone());
     }
     Ok(gid)
 }
 
-fn start_media_candidates(candidates: Vec<MediaCandidate>, options: MediaDownloadOptions) -> Result<String, String> {
+fn start_media_candidates(
+    candidates: Vec<MediaCandidate>,
+    options: MediaDownloadOptions,
+) -> Result<String, String> {
     let mut errors = Vec::new();
     for (index, candidate) in candidates.iter().enumerate() {
         let routing = decide_media_route(candidate, &options);
         if routing.route == Route::Ytdlp {
             return start_site_download_with_fallbacks(
                 candidate.url.clone(),
-                options.format.clone(),
-                options.referer.clone(),
-                options.cookies.clone(),
-                options.subs,
-                options.sponsorblock,
-                options.out_dir.clone(),
-                options.out_name.clone(),
+                options.clone(),
                 candidates[index + 1..].to_vec(),
-                options.elem.clone(),
             );
         }
         match start_direct_media(candidate, &options, &routing) {
@@ -2252,48 +3333,36 @@ fn start_media_candidates(candidates: Vec<MediaCandidate>, options: MediaDownloa
             Err(error) => errors.push(error),
         }
     }
-    Err(errors.pop().unwrap_or_else(|| "no viable media candidate".into()))
+    Err(errors
+        .pop()
+        .unwrap_or_else(|| "no viable media candidate".into()))
 }
 
-fn start_site_download(
-    url: String,
-    format: String,
-    referer: Option<String>,
-    cookies_browser: Option<String>,
-    subs: bool,
-    sponsorblock: bool,
-    out_dir: Option<String>,
-    out_name: Option<String>,
-) -> Result<String, String> {
-    start_site_download_with_fallbacks(
-        url, format, referer, cookies_browser, subs, sponsorblock, out_dir, out_name, Vec::new(), None,
-    )
+fn start_site_download(url: String, options: MediaDownloadOptions) -> Result<String, String> {
+    start_site_download_with_fallbacks(url, options, Vec::new())
 }
 
 fn start_site_download_with_fallbacks(
     url: String,
-    format: String,
-    referer: Option<String>,
-    cookies_browser: Option<String>,
-    subs: bool,
-    sponsorblock: bool,
-    out_dir: Option<String>,
-    out_name: Option<String>,
+    mut options: MediaDownloadOptions,
     fallback_candidates: Vec<MediaCandidate>,
-    fallback_elem: Option<String>,
 ) -> Result<String, String> {
     let url = unwrap_media_url(&url);
-    let fallback_options = MediaDownloadOptions {
-        format: format.clone(),
-        referer: referer.clone(),
-        cookies: cookies_browser.clone(),
+    // Site jobs are always started immediately; `paused` only applies to direct
+    // aria2 candidates. Preserve the historical behavior for media fallbacks.
+    options.paused = false;
+    let fallback_options = options.clone();
+    let MediaDownloadOptions {
+        format,
+        referer,
+        cookies: cookies_browser,
         subs,
         sponsorblock,
-        out_dir: out_dir.clone(),
-        out_name: out_name.clone(),
-        elem: fallback_elem,
-        paused: false,
-    };
+        out_dir,
+        out_name,
+        profile,
+        ..
+    } = options;
     // A direct file behind a viewer wrapper (e.g. a /media?url=…gif wrapper) isn't a
     // page yt-dlp can extract — hand it straight to aria2 (in a worker thread so we
     // never nest block_on inside an async caller).
@@ -2303,7 +3372,8 @@ fn start_site_download_with_fallbacks(
             kind: "file".into(),
             content_type: None,
         };
-        let result = start_direct_media(&candidate, &fallback_options, &Routing::just(Route::Aria2));
+        let result =
+            start_direct_media(&candidate, &fallback_options, &Routing::just(Route::Aria2));
         if result.is_err() && !fallback_candidates.is_empty() {
             return start_media_candidates(fallback_candidates, fallback_options);
         }
@@ -2314,19 +3384,46 @@ fn start_site_download_with_fallbacks(
         .map(str::trim)
         .filter(|d| !d.is_empty())
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| download_dir().join("Video"));
+        .unwrap_or_else(|| media_policy::output_dir(&profile, &download_dir().join("Video")));
     std::fs::create_dir_all(&out).ok();
-    let (out_template, output_reservation) = match out_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(name) => {
-            let (stem, reservation) = unique_ytdlp_stem(&out, name);
-            (out.join(format!("{stem}.%(ext)s")), Some(reservation))
-        }
-        None => {
-            let nonce = now_ms();
-            (out.join(format!("%(title).80s_[%(uploader_id).40s_%(id)s]_[%(resolution)s]_{nonce}.%(ext)s")), None)
-        }
-    };
+    let (out_template, output_reservation) =
+        match out_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(name) => {
+                let (stem, reservation) = unique_ytdlp_stem(&out, name);
+                (out.join(format!("{stem}.%(ext)s")), Some(reservation))
+            }
+            None if !profile.filename_template.trim().is_empty() => {
+                let template = profile.filename_template.trim().replace(['/', '\\'], "_");
+                let template = if template.contains("%(ext)s") {
+                    template
+                } else {
+                    format!("{template}.%(ext)s")
+                };
+                (out.join(template), None)
+            }
+            None => {
+                let nonce = now_ms();
+                (
+                    out.join(format!(
+                        "%(title).80s_[%(uploader_id).40s_%(id)s]_[%(resolution)s]_{nonce}.%(ext)s"
+                    )),
+                    None,
+                )
+            }
+        };
     let id = format!("site-{}", now_ms());
+
+    mark_download_added(&id);
+    attach_profile_snapshot(&id, &profile);
+    let job_network = dl_meta()
+        .lock()
+        .ok()
+        .and_then(|metadata| {
+            metadata
+                .get(&id)
+                .map(|entry| entry.network_override.clone())
+        })
+        .unwrap_or_default();
 
     site_jobs().lock().unwrap().push(json!({
         "gid": id, "status": "active",
@@ -2336,8 +3433,10 @@ fn start_site_download_with_fallbacks(
         "files": [{ "path": url.clone(), "uris": [{ "uri": url.clone() }] }], "dmKind": "site",
         "dmFormat": format.clone(), "dmReferer": referer.clone(), "dmCookies": cookies_browser.clone(),
         "dmSubs": subs, "dmSponsorblock": sponsorblock,
-        "dmOutDir": out_dir.clone(), "dmOutName": out_name.clone()
+        "dmOutDir": out_dir.clone(), "dmOutName": out_name.clone(),
+        "dmProfileId": profile.id, "dmProfile": profile
     }));
+    assign_profile_queue(&url, &profile);
 
     let mut cmd = Command::new(ytdlp_bin());
     // PYTHONUNBUFFERED forces yt-dlp (a frozen Python binary) to flush stdout per line,
@@ -2357,25 +3456,78 @@ fn start_site_download_with_fallbacks(
         .arg("--no-simulate")
         .arg("--print")
         .arg("after_move:DMFILE\u{a7}%(filepath)s");
-    if out_name.as_deref().map(str::trim).filter(|name| !name.is_empty()).is_none() {
+    if out_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .is_none()
+    {
         cmd.arg("--restrict-filenames");
     }
     if let Some(rt) = js_runtime() {
         cmd.arg("--js-runtimes").arg(rt);
     }
-    for a in ytdlp_format(&format) {
+    for a in media_policy::command_args(
+        &profile,
+        (!format.trim().is_empty()).then_some(format.as_str()),
+        subs,
+        sponsorblock,
+    ) {
         cmd.arg(a);
     }
-    if subs {
-        cmd.arg("--embed-subs").arg("--sub-langs").arg("en.*,en");
+    let proxy = if job_network.proxy.is_empty() {
+        profile.proxy.as_str()
+    } else {
+        job_network.proxy.as_str()
+    };
+    if !proxy.trim().is_empty() {
+        cmd.arg("--proxy").arg(proxy.trim());
     }
-    if sponsorblock {
-        cmd.arg("--sponsorblock-remove").arg("default");
+    let user_agent = if job_network.user_agent.is_empty() {
+        profile.user_agent.as_str()
+    } else {
+        job_network.user_agent.as_str()
+    };
+    if !user_agent.trim().is_empty() {
+        cmd.arg("--user-agent").arg(user_agent.trim());
+    }
+    let headers = if job_network.headers.is_empty() {
+        &profile.headers
+    } else {
+        &job_network.headers
+    };
+    for header in headers {
+        cmd.arg("--add-header").arg(header);
+    }
+    let speed_limit = if job_network.max_download_limit.is_empty() {
+        profile.max_download_limit.as_str()
+    } else {
+        job_network.max_download_limit.as_str()
+    };
+    if !speed_limit.trim().is_empty() {
+        cmd.arg("--limit-rate").arg(speed_limit.trim());
+    }
+    let connections = if job_network.connections > 0 {
+        job_network.connections
+    } else {
+        profile.connections
+    };
+    if connections > 0 {
+        cmd.arg("--concurrent-fragments")
+            .arg(connections.to_string());
+    }
+    if profile.retries > 0 {
+        cmd.arg("--retries").arg(profile.retries.to_string());
     }
     let referer_fb = referer.clone();
     if let Some(r) = referer.filter(|r| !r.is_empty()) {
         cmd.arg("--referer").arg(r);
     }
+    let cookies_browser = if job_network.cookies_browser.is_empty() {
+        cookies_browser
+    } else {
+        Some(job_network.cookies_browser.clone())
+    };
     if let Some(b) = cookies_browser.filter(|b| !b.is_empty() && b != "none") {
         cmd.arg("--cookies-from-browser").arg(b);
     }
@@ -2388,13 +3540,14 @@ fn start_site_download_with_fallbacks(
             if let Some(path) = output_reservation.as_deref() {
                 unreserve(path);
             }
-            if !fallback_candidates.is_empty() {
-                if let Ok(fallback_id) = start_media_candidates(fallback_candidates, fallback_options) {
-                    if let Ok(mut jobs) = site_jobs().lock() {
-                        jobs.retain(|j| j.get("gid").and_then(|g| g.as_str()) != Some(id.as_str()));
-                    }
-                    return Ok(fallback_id);
+            if !fallback_candidates.is_empty()
+                && let Ok(fallback_id) =
+                    start_media_candidates(fallback_candidates, fallback_options)
+            {
+                if let Ok(mut jobs) = site_jobs().lock() {
+                    jobs.retain(|j| j.get("gid").and_then(|g| g.as_str()) != Some(id.as_str()));
                 }
+                return Ok(fallback_id);
             }
             update_site_job(&id, |j| {
                 j["status"] = json!("error");
@@ -2443,7 +3596,8 @@ fn start_site_download_with_fallbacks(
                         update_site_job(&id2, |j| {
                             j["totalLength"] = json!(size.to_string());
                             j["completedLength"] = json!(size.to_string());
-                            j["files"] = json!([{ "path": full, "uris": [{ "uri": url_log.clone() }] }]);
+                            j["files"] =
+                                json!([{ "path": full, "uris": [{ "uri": url_log.clone() }] }]);
                         });
                     }
                     continue;
@@ -2470,7 +3624,10 @@ fn start_site_download_with_fallbacks(
                         let cum_total = phase_base + total;
                         update_site_job(&id2, |j| {
                             j["completedLength"] = json!(cum_done.to_string());
-                            let prev = j["totalLength"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                            let prev = j["totalLength"]
+                                .as_str()
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .unwrap_or(0);
                             j["totalLength"] = json!(cum_total.max(prev).to_string());
                             j["downloadSpeed"] = json!(speed.to_string());
                             if !title.is_empty() && title != "NA" {
@@ -2489,7 +3646,10 @@ fn start_site_download_with_fallbacks(
         if let Ok(mut processes) = site_processes().lock() {
             processes.remove(&id2);
         }
-        let cancelled = site_cancelled().lock().map(|mut ids| ids.remove(&id2)).unwrap_or(false);
+        let cancelled = site_cancelled()
+            .lock()
+            .map(|mut ids| ids.remove(&id2))
+            .unwrap_or(false);
         if cancelled {
             return;
         }
@@ -2499,14 +3659,22 @@ fn start_site_download_with_fallbacks(
             // URL is really a direct file — a known media extension, or (extensionless CDN
             // links) the server reports a media/binary content-type — hand it to aria2,
             // which downloads files yt-dlp refuses, instead of a dead-end error.
-            let bad = errlines.iter().rev().find_map(|l| {
-                l.split("Unsupported URL:").nth(1)
-                    .map(|s| s.trim().split_whitespace().next().unwrap_or("").to_string())
-            }).map(|u| unwrap_media_url(&u)).filter(|u| u.starts_with("http"));
+            let bad = errlines
+                .iter()
+                .rev()
+                .find_map(|l| {
+                    l.split("Unsupported URL:")
+                        .nth(1)
+                        .map(|s| s.split_whitespace().next().unwrap_or("").to_string())
+                })
+                .map(|u| unwrap_media_url(&u))
+                .filter(|u| u.starts_with("http"));
             let direct = bad.filter(|u| {
                 is_direct_file_url(u) || {
                     let (u2, r2) = (u.clone(), referer_fb.clone());
-                    tauri::async_runtime::block_on(async move { url_is_media(&u2, r2.as_deref()).await })
+                    tauri::async_runtime::block_on(
+                        async move { url_is_media(&u2, r2.as_deref()).await },
+                    )
                 }
             });
             if let Some(furl) = direct {
@@ -2515,10 +3683,14 @@ fn start_site_download_with_fallbacks(
                     kind: "file".into(),
                     content_type: None,
                 };
-                if start_direct_media(&candidate, &fallback_options, &Routing::just(Route::Aria2)).is_ok() {
+                if start_direct_media(&candidate, &fallback_options, &Routing::just(Route::Aria2))
+                    .is_ok()
+                {
                     // The aria2 task now represents this download; drop the pseudo-task.
                     if let Ok(mut jobs) = site_jobs().lock() {
-                        jobs.retain(|j| j.get("gid").and_then(|g| g.as_str()) != Some(id2.as_str()));
+                        jobs.retain(|j| {
+                            j.get("gid").and_then(|g| g.as_str()) != Some(id2.as_str())
+                        });
                     }
                     return;
                 }
@@ -2533,7 +3705,11 @@ fn start_site_download_with_fallbacks(
             }
             // Persist the stderr tail so the user can troubleshoot a failed capture.
             let logp = download_dir().join("downman-ytdlp.log");
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&logp) {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&logp)
+            {
                 use std::io::Write;
                 let _ = writeln!(f, "\n=== {id2} | -f {fmt_log} | {url_log} ===");
                 for l in &errlines {
@@ -2558,17 +3734,32 @@ fn start_site_download_with_fallbacks(
                 j["completedLength"] = t;
                 done_path = j["files"][0]["path"].as_str().unwrap_or("").to_string();
             } else if !reason.is_empty() {
-                let mut msg: String = reason.trim().trim_start_matches("ERROR: ").chars().take(200).collect();
+                let mut msg: String = reason
+                    .trim()
+                    .trim_start_matches("ERROR: ")
+                    .chars()
+                    .take(200)
+                    .collect();
                 let low = msg.to_lowercase();
                 // The #1 extractor failure: media fetch is bot-gated. Cookies fix it.
-                if low.contains("sign in to confirm") || low.contains("not a bot") || low.contains(" 403") || low.contains("http error 403") {
-                    msg.push_str("  — tip: enable “cookies from browser” in the DownMan extension options.");
+                if low.contains("sign in to confirm")
+                    || low.contains("not a bot")
+                    || low.contains(" 403")
+                    || low.contains("http error 403")
+                {
+                    msg.push_str(
+                        "  — tip: enable “cookies from browser” in the DownMan extension options.",
+                    );
                 }
                 j["errorMessage"] = json!(msg);
             }
         });
         if success && !done_path.is_empty() {
-            let dname = std::path::Path::new(&done_path).file_name().and_then(|s| s.to_str()).unwrap_or("video").to_string();
+            let dname = std::path::Path::new(&done_path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("video")
+                .to_string();
             notify(&format!("✓ Downloaded: {dname}"), &done_path);
         }
     });
@@ -2578,27 +3769,63 @@ fn start_site_download_with_fallbacks(
 fn handle_media_bridge(value: &Value) -> Result<String, String> {
     let candidates = media_candidates(value)?;
     let opts = value.get("options").cloned().unwrap_or_else(|| json!({}));
+    let profile = resolve_download_profile(opts.get("profileId").and_then(|v| v.as_str()))?;
     let options = MediaDownloadOptions {
-        format: opts.get("format").and_then(|v| v.as_str()).unwrap_or("best").to_string(),
-        referer: opts.get("referer").and_then(|v| v.as_str()).map(String::from),
-        cookies: opts.get("cookies").and_then(|v| v.as_str()).map(String::from),
+        format: opts
+            .get("format")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        referer: opts
+            .get("referer")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        cookies: opts
+            .get("cookies")
+            .and_then(|v| v.as_str())
+            .map(String::from),
         subs: opts.get("subs").and_then(|v| v.as_bool()).unwrap_or(false),
-        sponsorblock: opts.get("sponsorblock").and_then(|v| v.as_bool()).unwrap_or(false),
+        sponsorblock: opts
+            .get("sponsorblock")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
         out_dir: None,
         out_name: None,
         elem: opts.get("elem").and_then(|v| v.as_str()).map(String::from),
         paused: false,
+        profile,
     };
-    let prompt = value.get("prompt").and_then(|v| v.as_bool()).unwrap_or(true);
+    let prompt = value
+        .get("prompt")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     if prompt && ASK_BEFORE.load(Ordering::Relaxed) {
-        let first = candidates.first().ok_or_else(|| "media resolver found no usable source".to_string())?;
+        let first = candidates
+            .first()
+            .ok_or_else(|| "media resolver found no usable source".to_string())?;
         let routing = decide_media_route(first, &options);
         let id = format!("pend-{}", now_ms());
-        let name = opts.get("title").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty())
+        let name = opts
+            .get("title")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
             .map(String::from)
-            .unwrap_or_else(|| filename_with_ext(&first.url, routing.ctype.as_deref().or(first.content_type.as_deref())));
-        let category = if routing.route == Route::Ytdlp { "Video".to_string() } else { category_of(&name).0 };
-        let quality = opts.get("quality").and_then(|v| v.as_str()).unwrap_or("Best available").to_string();
+            .unwrap_or_else(|| {
+                filename_with_ext(
+                    &first.url,
+                    routing.ctype.as_deref().or(first.content_type.as_deref()),
+                )
+            });
+        let category = if routing.route == Route::Ytdlp {
+            "Video".to_string()
+        } else {
+            category_of(&name).0
+        };
+        let quality = opts
+            .get("quality")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Best available")
+            .to_string();
         notify("DownMan — confirm media", &name);
         if let Ok(mut pending_items) = pending().lock() {
             pending_items.push(json!({
@@ -2616,6 +3843,8 @@ fn handle_media_bridge(value: &Value) -> Result<String, String> {
                 "cookies": options.cookies,
                 "subs": options.subs,
                 "sponsorblock": options.sponsorblock,
+                "profileId": options.profile.id,
+                "profile": options.profile,
                 "status": "ready"
             }));
         }
@@ -2626,6 +3855,73 @@ fn handle_media_bridge(value: &Value) -> Result<String, String> {
 }
 
 struct EngineProc(#[allow(dead_code)] Mutex<Option<Child>>);
+
+fn terminate_owned_process_groups() {
+    let mut pids: HashSet<u32> = site_processes()
+        .lock()
+        .map(|processes| processes.values().copied().collect())
+        .unwrap_or_default();
+    if let Ok(aux) = aux_processes().lock() {
+        pids.extend(aux.iter().copied());
+    }
+    pids.extend(collections::process_ids());
+    for pid in &pids {
+        let _ = Command::new("kill")
+            .args(["-TERM", "--", &format!("-{pid}")])
+            .status();
+    }
+    if !pids.is_empty() {
+        std::thread::sleep(Duration::from_millis(100));
+        for pid in pids {
+            let _ = Command::new("kill")
+                .args(["-KILL", "--", &format!("-{pid}")])
+                .status();
+        }
+    }
+    if let Ok(mut guard) = inhibitor().lock()
+        && let Some(child) = guard.take()
+    {
+        stop_process_group(child);
+    }
+}
+
+fn stop_process_group(mut child: Child) {
+    let pid = child.id();
+    let _ = Command::new("kill")
+        .args(["-TERM", "--", &format!("-{pid}")])
+        .status();
+    for _ in 0..20 {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = Command::new("kill")
+        .args(["-KILL", "--", &format!("-{pid}")])
+        .status();
+    let _ = child.wait();
+}
+
+fn stop_engine(app: &tauri::AppHandle) {
+    terminate_owned_process_groups();
+    if let Some(client) = ARIA2.get() {
+        let _ = tauri::async_runtime::block_on(client.save_session());
+        let _ = tauri::async_runtime::block_on(client.shutdown());
+    }
+    if let Some(engine) = app.try_state::<EngineProc>()
+        && let Ok(mut guard) = engine.0.lock()
+        && let Some(mut child) = guard.take()
+    {
+        for _ in 0..20 {
+            if child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
 
 fn client() -> Result<&'static Aria2, String> {
     ARIA2.get().ok_or_else(|| "aria2 not started".into())
@@ -2649,18 +3945,801 @@ fn state_dir() -> std::path::PathBuf {
     default_dl_dir()
 }
 
+#[tauri::command]
+fn list_download_profiles() -> Result<Vec<DownloadProfile>, String> {
+    profiles::list(&state_dir())
+}
+
+#[tauri::command]
+fn active_download_profile() -> Result<DownloadProfile, String> {
+    profiles::active(&state_dir())
+}
+
+#[tauri::command]
+fn save_download_profile(profile: DownloadProfile) -> Result<DownloadProfile, String> {
+    media_policy::ensure_valid(&profile)?;
+    profiles::upsert(&state_dir(), profile)
+}
+
+#[tauri::command]
+fn media_policy_validate(profile: DownloadProfile) -> media_policy::PolicyValidation {
+    media_policy::validate(&profile)
+}
+
+#[tauri::command]
+fn extractor_archive_status() -> Result<archive::ArchiveStatus, String> {
+    archive::status(&state_dir())
+}
+
+#[tauri::command]
+fn extractor_archive_export(path: String) -> Result<u64, String> {
+    if path.trim().is_empty() {
+        return Err("choose an archive export path".into());
+    }
+    archive::export_ytdlp(&state_dir(), std::path::Path::new(path.trim()))
+}
+
+#[tauri::command]
+fn archive_export_m3u(path: String) -> Result<u64, String> {
+    if path.trim().is_empty() {
+        return Err("choose an M3U export path".into());
+    }
+    archive::export_m3u(&state_dir(), std::path::Path::new(path.trim()))
+}
+
+async fn preflight_context(
+    profile: &DownloadProfile,
+    input_urls: &[String],
+    estimate_sizes: bool,
+) -> preflight::PreflightContext {
+    let mut existing_urls = HashSet::new();
+    if let Some(client) = ARIA2.get() {
+        for tasks in [
+            client.tell_active().await,
+            client.tell_waiting().await,
+            client.tell_stopped().await,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            existing_urls.extend(
+                tasks
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(url_of_task)
+                    .filter(|url| !url.is_empty()),
+            );
+        }
+    }
+    if let Ok(items) = history().lock() {
+        existing_urls.extend(items.iter().map(url_of_task).filter(|url| !url.is_empty()));
+    }
+    if let Ok(items) = site_jobs().lock() {
+        existing_urls.extend(items.iter().map(url_of_task).filter(|url| !url.is_empty()));
+    }
+    let archived_urls = archive::canonical_urls(&state_dir()).unwrap_or_default();
+    let mut conflict_paths = HashMap::new();
+    for raw_url in input_urls {
+        let Ok(url) = preflight::normalize_url(raw_url) else {
+            continue;
+        };
+        if preflight::classify(&url) != "direct" {
+            continue;
+        }
+        let filename = url_filename(&url);
+        let default = if ORGANIZE.load(Ordering::Relaxed) {
+            category_of(&filename).1
+        } else {
+            download_dir()
+        };
+        let path = media_policy::output_dir(profile, &default).join(&filename);
+        if path.exists() {
+            conflict_paths.insert(url, path.display().to_string());
+        }
+    }
+    let speed_bytes_per_second = profile
+        .max_download_limit
+        .trim()
+        .strip_suffix(['K', 'k'])
+        .and_then(|value| value.parse::<f64>().ok())
+        .map(|value| (value * 1024.0) as u64)
+        .or_else(|| {
+            profile
+                .max_download_limit
+                .trim()
+                .strip_suffix(['M', 'm'])
+                .and_then(|value| value.parse::<f64>().ok())
+                .map(|value| (value * 1024.0 * 1024.0) as u64)
+        })
+        .unwrap_or(0);
+    preflight::PreflightContext {
+        profile_id: profile.id.clone(),
+        existing_urls,
+        archived_urls,
+        conflict_paths,
+        estimate_sizes,
+        speed_bytes_per_second,
+    }
+}
+
+#[tauri::command]
+async fn preflight_batch(
+    urls: Vec<String>,
+    profile_id: Option<String>,
+    estimate_sizes: Option<bool>,
+) -> Result<preflight::PreflightPage, String> {
+    let profile = resolve_download_profile(profile_id.as_deref())?;
+    let context = preflight_context(&profile, &urls, estimate_sizes.unwrap_or(false)).await;
+    preflight::create(&state_dir(), urls, context).await
+}
+
+#[tauri::command]
+fn preflight_get(
+    id: String,
+    offset: u32,
+    limit: u32,
+    filter: Option<String>,
+) -> Result<preflight::PreflightPage, String> {
+    preflight::page(&state_dir(), &id, offset, limit, filter.as_deref())
+}
+
+#[tauri::command]
+fn preflight_select(id: String, indices: Vec<u32>, selected: bool) -> Result<u32, String> {
+    preflight::set_selected(&state_dir(), &id, &indices, selected)
+}
+
+async fn commit_preflight_item(
+    item: &preflight::PreflightItem,
+    profile: &DownloadProfile,
+) -> Result<(), String> {
+    if item.kind == "media" {
+        start_site_download(
+            item.url.clone(),
+            MediaDownloadOptions {
+                format: String::new(),
+                referer: None,
+                cookies: None,
+                subs: false,
+                sponsorblock: false,
+                out_dir: None,
+                out_name: None,
+                elem: None,
+                paused: false,
+                profile: profile.clone(),
+            },
+        )?;
+        return Ok(());
+    }
+    add_download(vec![item.url.clone()], json!({ "dmProfileId": profile.id }))
+        .await
+        .map(|_| ())
+}
+
+#[tauri::command]
+async fn preflight_commit(id: String) -> Result<Value, String> {
+    let profile_id = preflight::profile_id(&state_dir(), &id)?;
+    let profile = resolve_download_profile(Some(&profile_id))?;
+    let items = preflight::selected_items(&state_dir(), &id)?;
+    if items.is_empty() {
+        return Err("select at least one accepted URL".into());
+    }
+    let mut added = 0u32;
+    let mut failed = 0u32;
+    for item in items {
+        match commit_preflight_item(&item, &profile).await {
+            Ok(()) => {
+                added += 1;
+                preflight::mark_commit(&state_dir(), &id, item.index, "complete", "")?;
+            }
+            Err(error) => {
+                failed += 1;
+                preflight::mark_commit(&state_dir(), &id, item.index, "error", &error)?;
+            }
+        }
+    }
+    Ok(json!({ "added": added, "failed": failed }))
+}
+
+#[tauri::command]
+fn set_active_download_profile(id: String) -> Result<DownloadProfile, String> {
+    profiles::set_active(&state_dir(), &id)
+}
+
+#[tauri::command]
+fn delete_download_profile(id: String) -> Result<(), String> {
+    profiles::delete(&state_dir(), &id)
+}
+
+fn collection_extractor(cookies_browser: Option<String>) -> collections::ExtractorConfig {
+    collections::ExtractorConfig {
+        binary: ytdlp_bin(),
+        path: augmented_path(),
+        js_runtime: js_runtime().map(String::from),
+        cookies_browser,
+    }
+}
+
+#[tauri::command]
+fn collection_inspect_start(
+    source_url: String,
+    profile_id: Option<String>,
+    page_size: Option<u32>,
+    cookies_browser: Option<String>,
+) -> Result<collections::CollectionSession, String> {
+    let profile = resolve_download_profile(profile_id.as_deref())?;
+    collections::start(
+        state_dir(),
+        source_url,
+        profile.id,
+        page_size,
+        collection_extractor(cookies_browser),
+    )
+}
+
+#[tauri::command]
+fn collection_inspect_page(
+    id: String,
+    offset: u32,
+    limit: u32,
+    query: Option<String>,
+    filter: Option<String>,
+) -> Result<collections::CollectionPage, String> {
+    collections::page(
+        &state_dir(),
+        &id,
+        offset,
+        limit,
+        query.as_deref(),
+        filter.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn collection_select_items(id: String, indices: Vec<u32>, selected: bool) -> Result<u32, String> {
+    collections::select(&state_dir(), &id, &indices, selected)
+}
+
+enum CollectionMediaOutcome {
+    Complete(String),
+    Error,
+    Cancelled,
+}
+
+fn job_output_path(job: &Value) -> String {
+    job.get("files")
+        .and_then(|files| files.get(0))
+        .and_then(|file| file.get("path"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn collection_media_outcome(collection_id: &str, gid: &str) -> CollectionMediaOutcome {
+    loop {
+        if collections::cancelled(&state_dir(), collection_id).unwrap_or(true) {
+            if let Ok(mut cancelled) = site_cancelled().lock() {
+                cancelled.insert(gid.to_string());
+            }
+            let _ = signal_site_process(gid, "KILL");
+            return CollectionMediaOutcome::Cancelled;
+        }
+        let job = site_jobs().lock().ok().and_then(|jobs| {
+            jobs.iter()
+                .find(|job| job.get("gid").and_then(Value::as_str) == Some(gid))
+                .cloned()
+        });
+        match job
+            .as_ref()
+            .and_then(|job| job.get("status"))
+            .and_then(Value::as_str)
+        {
+            Some("complete") => {
+                return CollectionMediaOutcome::Complete(
+                    job.as_ref().map(job_output_path).unwrap_or_default(),
+                );
+            }
+            Some("error") => return CollectionMediaOutcome::Error,
+            Some(_) => {}
+            None => {
+                let completed = history().lock().ok().and_then(|items| {
+                    items
+                        .iter()
+                        .find(|item| item.get("gid").and_then(Value::as_str) == Some(gid))
+                        .cloned()
+                });
+                if let Some(completed) = completed {
+                    return CollectionMediaOutcome::Complete(job_output_path(&completed));
+                }
+                let running = site_processes()
+                    .lock()
+                    .map(|processes| processes.contains_key(gid))
+                    .unwrap_or(false);
+                if !running {
+                    return CollectionMediaOutcome::Error;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn standalone_media_outcome(gid: &str) -> CollectionMediaOutcome {
+    loop {
+        let job = site_jobs().lock().ok().and_then(|jobs| {
+            jobs.iter()
+                .find(|job| job.get("gid").and_then(Value::as_str) == Some(gid))
+                .cloned()
+        });
+        match job
+            .as_ref()
+            .and_then(|job| job.get("status"))
+            .and_then(Value::as_str)
+        {
+            Some("complete") => {
+                return CollectionMediaOutcome::Complete(
+                    job.as_ref().map(job_output_path).unwrap_or_default(),
+                );
+            }
+            Some("error") => return CollectionMediaOutcome::Error,
+            Some(_) => {}
+            None => {
+                if let Some(completed) = history().lock().ok().and_then(|items| {
+                    items
+                        .iter()
+                        .find(|item| item.get("gid").and_then(Value::as_str) == Some(gid))
+                        .cloned()
+                }) {
+                    return CollectionMediaOutcome::Complete(job_output_path(&completed));
+                }
+                let running = site_processes()
+                    .lock()
+                    .map(|processes| processes.contains_key(gid))
+                    .unwrap_or(false);
+                if !running {
+                    return CollectionMediaOutcome::Error;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn download_media_identity(
+    extractor: String,
+    media_id: String,
+    url: String,
+    title: String,
+    profile: DownloadProfile,
+    cookies_browser: Option<String>,
+) -> bool {
+    let state = state_dir();
+    if archive::contains(&state, &extractor, &media_id, &url).unwrap_or(false) {
+        return true;
+    }
+    let Ok(gid) = start_site_download(
+        url.clone(),
+        MediaDownloadOptions {
+            format: String::new(),
+            referer: None,
+            cookies: cookies_browser,
+            subs: false,
+            sponsorblock: false,
+            out_dir: None,
+            out_name: None,
+            elem: None,
+            paused: false,
+            profile,
+        },
+    ) else {
+        return false;
+    };
+    let CollectionMediaOutcome::Complete(file_path) = standalone_media_outcome(&gid) else {
+        return false;
+    };
+    archive::record(
+        &state,
+        &archive::ArchiveRecord {
+            extractor,
+            media_id,
+            canonical_url: url.clone(),
+            title,
+            source_url: url,
+            file_path,
+        },
+    )
+    .is_ok()
+}
+
+fn run_collection_enqueue(
+    id: String,
+    items: Vec<collections::CollectionItem>,
+    profile: DownloadProfile,
+) {
+    let state = state_dir();
+    let mut cancelled = false;
+    for item in items {
+        if collections::cancelled(&state, &id).unwrap_or(true) {
+            cancelled = true;
+            break;
+        }
+        if archive::contains(&state, &item.extractor, &item.media_id, &item.url).unwrap_or(false) {
+            let _ = collections::mark_archived(&state, &id, item.index);
+            continue;
+        }
+        let _ = collections::mark_enqueue_item(&state, &id, item.index, "active");
+        let result = start_site_download(
+            item.url.clone(),
+            MediaDownloadOptions {
+                format: String::new(),
+                referer: None,
+                cookies: None,
+                subs: false,
+                sponsorblock: false,
+                out_dir: None,
+                out_name: None,
+                elem: None,
+                paused: false,
+                profile: profile.clone(),
+            },
+        );
+        let outcome = match result {
+            Ok(gid) => {
+                if let Ok(mut jobs) = collection_active_jobs().lock() {
+                    jobs.insert(id.clone(), gid.clone());
+                }
+                let outcome = collection_media_outcome(&id, &gid);
+                if let Ok(mut jobs) = collection_active_jobs().lock() {
+                    jobs.remove(&id);
+                }
+                outcome
+            }
+            Err(_) => CollectionMediaOutcome::Error,
+        };
+        match outcome {
+            CollectionMediaOutcome::Complete(file_path) => {
+                let archived = archive::record(
+                    &state,
+                    &archive::ArchiveRecord {
+                        extractor: item.extractor,
+                        media_id: item.media_id,
+                        canonical_url: item.url.clone(),
+                        title: item.title,
+                        source_url: item.url,
+                        file_path,
+                    },
+                );
+                let _ = collections::mark_enqueue_item(
+                    &state,
+                    &id,
+                    item.index,
+                    if archived.is_ok() {
+                        "complete"
+                    } else {
+                        "error"
+                    },
+                );
+            }
+            CollectionMediaOutcome::Error => {
+                let _ = collections::mark_enqueue_item(&state, &id, item.index, "error");
+            }
+            CollectionMediaOutcome::Cancelled => {
+                let _ = collections::mark_enqueue_item(&state, &id, item.index, "cancelled");
+                cancelled = true;
+                break;
+            }
+        }
+    }
+    let _ = collections::finish_enqueue(&state, &id, cancelled);
+}
+
+#[tauri::command]
+fn collection_enqueue_selected(
+    id: String,
+    profile_id: Option<String>,
+    queue_id: Option<String>,
+) -> Result<Value, String> {
+    let mut profile = resolve_download_profile(profile_id.as_deref())?;
+    if let Some(queue_id) = queue_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|queue_id| !queue_id.is_empty())
+    {
+        let known = queues()
+            .lock()
+            .map(|data| queue_ids(&data))
+            .map_err(|_| "queue settings unavailable")?;
+        if !known.contains(queue_id) {
+            return Err("queue does not exist".into());
+        }
+        profile.queue_id = queue_id.to_string();
+    }
+    let items = collections::selected_items(&state_dir(), &id)?;
+    collections::begin_enqueue(&state_dir(), &id, &profile.id)?;
+    let count = items.len();
+    let worker_id = id.clone();
+    std::thread::spawn(move || run_collection_enqueue(worker_id, items, profile));
+    Ok(json!({ "id": id, "queued": count }))
+}
+
+#[tauri::command]
+fn collection_cancel(id: String) -> Result<(), String> {
+    collections::cancel(&state_dir(), &id)?;
+    let gid = collection_active_jobs()
+        .lock()
+        .ok()
+        .and_then(|mut jobs| jobs.remove(&id));
+    if let Some(gid) = gid {
+        if let Ok(mut cancelled) = site_cancelled().lock() {
+            cancelled.insert(gid.clone());
+        }
+        let _ = signal_site_process(&gid, "KILL");
+        if let Ok(mut jobs) = site_jobs().lock() {
+            jobs.retain(|job| job.get("gid").and_then(Value::as_str) != Some(&gid));
+        }
+    }
+    Ok(())
+}
+
+fn poll_subscription(id: String, force: bool) -> Result<Value, String> {
+    let Some(subscription) = subscriptions::claim(&state_dir(), &id, force)? else {
+        return Err("subscription is already running or disabled".into());
+    };
+    let extractor = collection_extractor(
+        (!subscription.cookies_browser.is_empty()).then(|| subscription.cookies_browser.clone()),
+    );
+    let process_id = format!("subscription-{}", subscription.id);
+    let end = subscription.max_items_per_poll.clamp(1, 25);
+    let result =
+        collections::extract_flat_page(&subscription.source_url, 1, end, &process_id, &extractor);
+    let outcome = match result {
+        Ok(page) => subscriptions::ingest(&state_dir(), &subscription, &page.items),
+        Err(error) => {
+            subscriptions::finish(&state_dir(), &subscription, Some(&error))?;
+            return Err(error);
+        }
+    };
+    let ingest = match outcome {
+        Ok(ingest) => ingest,
+        Err(error) => {
+            subscriptions::finish(&state_dir(), &subscription, Some(&error))?;
+            return Err(error);
+        }
+    };
+    subscriptions::finish(&state_dir(), &subscription, None)?;
+    if ingest.review_count > 0 && subscription.notify {
+        notify(
+            "New followed media",
+            &format!(
+                "{} new item{} from {}",
+                ingest.review_count,
+                if ingest.review_count == 1 { "" } else { "s" },
+                subscription.name
+            ),
+        );
+    }
+    let auto_queued = ingest.new_items.len();
+    if auto_queued > 0 {
+        let mut profile = resolve_download_profile(Some(&subscription.profile_id))?;
+        if !subscription.live_policy_override.is_empty() {
+            profile.live_policy = subscription.live_policy_override.clone();
+        }
+        let items = ingest.new_items;
+        let cookies_browser = (!subscription.cookies_browser.is_empty())
+            .then(|| subscription.cookies_browser.clone());
+        std::thread::spawn(move || {
+            for item in items {
+                let _ = download_media_identity(
+                    item.extractor,
+                    item.media_id,
+                    item.url,
+                    item.title,
+                    profile.clone(),
+                    cookies_browser.clone(),
+                );
+            }
+        });
+    }
+    if !subscription.m3u_target.trim().is_empty() {
+        let _ = subscriptions::export_m3u(
+            &state_dir(),
+            &subscription.id,
+            std::path::Path::new(subscription.m3u_target.trim()),
+        );
+    }
+    Ok(json!({
+        "reviewed": ingest.review_count,
+        "autoQueued": auto_queued,
+        "archived": ingest.skipped_archived
+    }))
+}
+
+fn start_subscription_poller() {
+    let _ = subscriptions::reset_running(&state_dir());
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(Duration::from_secs(30));
+            if metered_now() == Some(true) {
+                continue;
+            }
+            let due = subscriptions::due_ids(&state_dir(), now_ms() as u64).unwrap_or_default();
+            for id in due {
+                std::thread::spawn(move || {
+                    if let Err(error) = poll_subscription(id, false) {
+                        eprintln!("DownMan subscription poll: {error}");
+                    }
+                });
+            }
+        }
+    });
+}
+
+#[tauri::command]
+fn subscription_list() -> Result<Vec<subscriptions::Subscription>, String> {
+    subscriptions::list(&state_dir())
+}
+
+#[tauri::command]
+fn subscription_upsert(
+    subscription: subscriptions::Subscription,
+) -> Result<subscriptions::Subscription, String> {
+    resolve_download_profile(Some(&subscription.profile_id))?;
+    subscriptions::upsert(&state_dir(), subscription)
+}
+
+#[tauri::command]
+fn subscription_delete(id: String) -> Result<(), String> {
+    subscriptions::delete(&state_dir(), &id)
+}
+
+#[tauri::command]
+async fn subscription_run_now(id: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || poll_subscription(id, true))
+        .await
+        .map_err(|error| format!("subscription poll worker failed: {error}"))?
+}
+
+#[tauri::command]
+fn subscription_export_m3u(id: String, path: String) -> Result<u64, String> {
+    if path.trim().is_empty() {
+        return Err("choose an M3U export path".into());
+    }
+    subscriptions::export_m3u(&state_dir(), &id, std::path::Path::new(path.trim()))
+}
+
+#[tauri::command]
+fn review_inbox_page(
+    offset: u32,
+    limit: u32,
+    status: Option<String>,
+) -> Result<subscriptions::ReviewPage, String> {
+    subscriptions::review_page(&state_dir(), offset, limit, status.as_deref())
+}
+
+#[tauri::command]
+fn review_inbox_select(ids: Vec<String>, selected: bool) -> Result<u32, String> {
+    subscriptions::review_select(&state_dir(), &ids, selected)
+}
+
+#[tauri::command]
+fn review_inbox_dismiss(ids: Vec<String>) -> Result<u32, String> {
+    let mut changed = 0;
+    for id in ids {
+        subscriptions::mark_review(&state_dir(), &id, "dismissed")?;
+        changed += 1;
+    }
+    Ok(changed)
+}
+
+#[tauri::command]
+fn review_inbox_download(ids: Vec<String>) -> Result<Value, String> {
+    let items = if ids.is_empty() {
+        subscriptions::selected_review(&state_dir())?
+    } else {
+        subscriptions::review_items(&state_dir(), &ids)?
+    };
+    if items.is_empty() {
+        return Err("select at least one review item".into());
+    }
+    let count = items.len();
+    std::thread::spawn(move || {
+        for item in items {
+            let result = resolve_download_profile(Some(&item.profile_id)).map(|mut profile| {
+                let subscription = subscriptions::get(&state_dir(), &item.subscription_id)
+                    .ok()
+                    .flatten();
+                if let Some(source) = &subscription
+                    && !source.live_policy_override.is_empty()
+                {
+                    profile.live_policy = source.live_policy_override.clone();
+                }
+                download_media_identity(
+                    item.extractor,
+                    item.media_id,
+                    item.url,
+                    item.title,
+                    profile,
+                    subscription.and_then(|source| {
+                        (!source.cookies_browser.is_empty()).then_some(source.cookies_browser)
+                    }),
+                )
+            });
+            let status = if result == Ok(true) {
+                "downloaded"
+            } else {
+                "error"
+            };
+            let _ = subscriptions::mark_review(&state_dir(), &item.id, status);
+        }
+    });
+    Ok(json!({ "queued": count }))
+}
+
+#[tauri::command]
+fn yt_search_start(
+    query: String,
+    page_size: Option<u32>,
+    total_limit: Option<u32>,
+    cookies_browser: Option<String>,
+) -> Result<search::SearchSession, String> {
+    search::start(
+        state_dir(),
+        query,
+        page_size,
+        total_limit,
+        collection_extractor(cookies_browser),
+    )
+}
+
+#[tauri::command]
+fn yt_search_page(id: String, offset: u32, limit: u32) -> Result<search::SearchPage, String> {
+    search::page(&state_dir(), &id, offset, limit)
+}
+
+#[tauri::command]
+fn yt_search_select(id: String, indices: Vec<u32>, selected: bool) -> Result<u32, String> {
+    search::select(&state_dir(), &id, &indices, selected)
+}
+
+#[tauri::command]
+fn yt_search_cancel(id: String) -> Result<(), String> {
+    search::cancel(&state_dir(), &id)
+}
+
+#[tauri::command]
+fn yt_search_download(id: String, profile_id: Option<String>) -> Result<Value, String> {
+    let profile = resolve_download_profile(profile_id.as_deref())?;
+    let items = search::selected(&state_dir(), &id)?;
+    if items.is_empty() {
+        return Err("select at least one search result".into());
+    }
+    let count = items.len();
+    std::thread::spawn(move || {
+        for item in items {
+            let _ = download_media_identity(
+                item.extractor,
+                item.media_id,
+                item.url,
+                item.title,
+                profile.clone(),
+                None,
+            );
+        }
+    });
+    Ok(json!({ "queued": count }))
+}
+
 fn dldir() -> &'static Mutex<Option<String>> {
     DLDIR.get_or_init(|| Mutex::new(None))
 }
 
 /// Where downloads are saved (user override, else the default).
 fn download_dir() -> std::path::PathBuf {
-    if let Ok(g) = dldir().lock() {
-        if let Some(p) = g.as_ref() {
-            if !p.trim().is_empty() {
-                return std::path::PathBuf::from(p);
-            }
-        }
+    if let Ok(g) = dldir().lock()
+        && let Some(p) = g.as_ref()
+        && !p.trim().is_empty()
+    {
+        return std::path::PathBuf::from(p);
     }
     default_dl_dir()
 }
@@ -2672,10 +4751,10 @@ fn dl_dir_file() -> std::path::PathBuf {
 fn load_dl_dir() {
     if let Ok(s) = std::fs::read_to_string(dl_dir_file()) {
         let s = s.trim().to_string();
-        if !s.is_empty() {
-            if let Ok(mut g) = dldir().lock() {
-                *g = Some(s);
-            }
+        if !s.is_empty()
+            && let Ok(mut g) = dldir().lock()
+        {
+            *g = Some(s);
         }
     }
 }
@@ -2706,26 +4785,25 @@ fn grabbed_file() -> std::path::PathBuf {
     state_dir().join(".downman-grabbed.json")
 }
 fn load_grabbed() {
-    if let Ok(s) = std::fs::read_to_string(grabbed_file()) {
-        if let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(&s) {
-            if let Ok(mut g) = grabbed().lock() {
-                *g = v;
-            }
-        }
+    if let Ok(s) = std::fs::read_to_string(grabbed_file())
+        && let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(&s)
+        && let Ok(mut g) = grabbed().lock()
+    {
+        *g = v;
     }
 }
 fn save_grabbed() {
-    if let Ok(g) = grabbed().lock() {
-        if let Ok(s) = serde_json::to_string(&*g) {
-            let _ = std::fs::write(grabbed_file(), s);
-        }
+    if let Ok(g) = grabbed().lock()
+        && let Ok(s) = serde_json::to_string(&*g)
+    {
+        let _ = std::fs::write(grabbed_file(), s);
     }
 }
 fn mark_grabbed(url: &str) {
-    if let Ok(mut g) = grabbed().lock() {
-        if let Value::Object(m) = &mut *g {
-            m.insert(url.to_string(), json!(true));
-        }
+    if let Ok(mut g) = grabbed().lock()
+        && let Value::Object(m) = &mut *g
+    {
+        m.insert(url.to_string(), json!(true));
     }
     save_grabbed();
 }
@@ -2741,7 +4819,11 @@ fn trackers_file() -> std::path::PathBuf {
 }
 fn load_trackers() {
     if let Ok(s) = std::fs::read_to_string(trackers_file()) {
-        let list: Vec<String> = s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+        let list: Vec<String> = s
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
         if let Ok(mut c) = custom_trackers().lock() {
             *c = list;
         }
@@ -2758,18 +4840,27 @@ async fn apply_trackers() {
     all.sort();
     all.dedup();
     if let Some(client) = ARIA2.get() {
-        let _ = client.change_global_option(json!({ "bt-tracker": all.join(",") })).await;
+        let _ = client
+            .change_global_option(json!({ "bt-tracker": all.join(",") }))
+            .await;
     }
 }
 
 #[tauri::command]
 fn get_trackers() -> String {
-    custom_trackers().lock().map(|c| c.join("\n")).unwrap_or_default()
+    custom_trackers()
+        .lock()
+        .map(|c| c.join("\n"))
+        .unwrap_or_default()
 }
 
 #[tauri::command]
 async fn set_trackers(text: String) -> Result<(), String> {
-    let list: Vec<String> = text.split(['\n', ',']).map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+    let list: Vec<String> = text
+        .split(['\n', ','])
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
     if let Ok(mut c) = custom_trackers().lock() {
         *c = list.clone();
     }
@@ -2780,7 +4871,11 @@ async fn set_trackers(text: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn add_trackers(gid: String, text: String) -> Result<(), String> {
-    let list: Vec<String> = text.split(['\n', ',', ' ']).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let list: Vec<String> = text
+        .split(['\n', ',', ' '])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     if list.is_empty() {
         return Ok(());
     }
@@ -2796,7 +4891,9 @@ async fn add_trackers(gid: String, text: String) -> Result<(), String> {
     apply_trackers().await;
     // Best-effort: also try to attach to the live torrent (works for paused/waiting ones).
     if let Some(client) = ARIA2.get() {
-        let _ = client.change_option(&gid, json!({ "bt-tracker": list.join(",") })).await;
+        let _ = client
+            .change_option(&gid, json!({ "bt-tracker": list.join(",") }))
+            .await;
     }
     Ok(())
 }
@@ -2818,18 +4915,11 @@ fn start_engine() -> Result<Child, String> {
     let dir = download_dir();
     std::fs::create_dir_all(&dir).ok();
 
-    // Best-effort: clear any stale aria2c bound to our RPC port (dev hot-reload).
-    let _ = Command::new("pkill").arg("-f").arg(format!("rpc-listen-port={port}")).status();
-    // Wait until the port is actually free before spawning (avoids bind races).
-    for _ in 0..40 {
-        match std::net::TcpListener::bind(("127.0.0.1", port)) {
-            Ok(l) => {
-                drop(l);
-                break;
-            }
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
-        }
-    }
+    // Never kill an arbitrary process that happens to use our port. Single-instance
+    // startup prevents two normal DownMan engines; a genuine conflict is reported.
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+        .map_err(|_| format!("aria2 RPC port {port} is already in use"))?;
+    drop(listener);
 
     // aria2c comes from the system `aria2` package (a declared dependency); we do NOT
     // bundle it, because that would collide with /usr/bin/aria2c owned by that package.
@@ -2841,6 +4931,7 @@ fn start_engine() -> Result<Child, String> {
         .arg("--rpc-listen-all=false")
         .arg(format!("--rpc-listen-port={port}"))
         .arg(format!("--rpc-secret={secret}"))
+        .arg(format!("--stop-with-process={}", std::process::id()))
         .arg(format!("--dir={}", dir.display()))
         .arg("--continue=true")
         .arg("--max-concurrent-downloads=5")
@@ -2868,6 +4959,471 @@ fn start_engine() -> Result<Child, String> {
     Ok(child)
 }
 
+const MAX_BRIDGE_BODY_BYTES: u64 = 1024 * 1024;
+const MAX_BRIDGE_WORKERS: usize = 32;
+static BRIDGE_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+struct BridgeWorkerGuard;
+
+impl Drop for BridgeWorkerGuard {
+    fn drop(&mut self) {
+        BRIDGE_WORKERS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn read_bridge_body(reader: &mut dyn std::io::Read) -> std::io::Result<Option<String>> {
+    let mut body = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            return String::from_utf8(body)
+                .map(Some)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+        }
+        if body.len() + read > MAX_BRIDGE_BODY_BYTES as usize {
+            return Ok(None);
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn handle_bridge_request(mut req: tiny_http::Request) {
+    // Local-security gate: a web page must not be able to drive the bridge.
+    // Browser fetches carry an Origin header — allow extension origins and
+    // header-less native callers; refuse anything http(s) or sandboxed.
+    let from_web = req
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Origin"))
+        .map(|h| {
+            let o = h.value.as_str().to_lowercase();
+            o.starts_with("http://") || o.starts_with("https://") || o == "null"
+        })
+        .unwrap_or(false);
+    if from_web {
+        let _ = req.respond(
+            tiny_http::Response::from_string("{\"ok\":false,\"error\":\"forbidden\"}")
+                .with_status_code(403),
+        );
+        return;
+    }
+    // Stamp ping time on every incoming request so the Settings card can show "last seen".
+    LAST_BRIDGE_PING.store(now_ms() as u64, Ordering::Relaxed);
+    let cors =
+        tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap();
+    let ctype =
+        tiny_http::Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type"[..])
+            .unwrap();
+    if req.method() == &tiny_http::Method::Options {
+        let _ = req.respond(
+            tiny_http::Response::empty(204)
+                .with_header(cors)
+                .with_header(ctype),
+        );
+        return;
+    }
+    let path = req.url().to_string();
+    // GET /rules -> interception rules the browser extension applies.
+    if path == "/rules" && req.method() == &tiny_http::Method::Get {
+        let out = rules()
+            .lock()
+            .map(|r| r.to_string())
+            .unwrap_or_else(|_| "{}".into());
+        let json_ct =
+            tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+        let _ = req.respond(
+            tiny_http::Response::from_string(out)
+                .with_header(cors)
+                .with_header(json_ct),
+        );
+        return;
+    }
+    // GET /list -> current downloads (extension popup; localhost bridge only).
+    if path == "/list" && req.method() == &tiny_http::Method::Get {
+        let out = remote_list_json().to_string();
+        let json_ct =
+            tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+        let _ = req.respond(
+            tiny_http::Response::from_string(out)
+                .with_header(cors)
+                .with_header(json_ct),
+        );
+        return;
+    }
+    let known_post = matches!(path.as_str(), "/rules" | "/grab" | "/formats" | "/add")
+        && req.method() == &tiny_http::Method::Post;
+    if !known_post {
+        let _ = req.respond(
+            tiny_http::Response::from_string("{\"ok\":false,\"error\":\"not found\"}")
+                .with_status_code(404)
+                .with_header(cors),
+        );
+        return;
+    }
+    let body = match read_bridge_body(req.as_reader()) {
+        Ok(Some(body)) => body,
+        Ok(None) => {
+            let _ = req.respond(
+                tiny_http::Response::from_string("{\"ok\":false,\"error\":\"request too large\"}")
+                    .with_status_code(413)
+                    .with_header(cors),
+            );
+            return;
+        }
+        Err(_) => {
+            let _ = req.respond(
+                tiny_http::Response::from_string(
+                    "{\"ok\":false,\"error\":\"invalid request body\"}",
+                )
+                .with_status_code(400)
+                .with_header(cors),
+            );
+            return;
+        }
+    };
+    if body.len() as u64 > MAX_BRIDGE_BODY_BYTES {
+        let _ = req.respond(
+            tiny_http::Response::from_string("{\"ok\":false,\"error\":\"request too large\"}")
+                .with_status_code(413)
+                .with_header(cors),
+        );
+        return;
+    }
+    let v: Value = serde_json::from_str(&body).unwrap_or(json!({}));
+    let json_ct =
+        tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+
+    // POST /rules { enabled } -> keep the extension's quick toggle and the
+    // in-app Browser interception setting on one persisted source of truth.
+    if path == "/rules" && req.method() == &tiny_http::Method::Post {
+        if let Some(enabled) = v.get("enabled").and_then(|value| value.as_bool()) {
+            if let Ok(mut current) = rules().lock() {
+                current["enabled"] = json!(enabled);
+            }
+            save_rules();
+        }
+        let out = rules()
+            .lock()
+            .map(|r| r.to_string())
+            .unwrap_or_else(|_| "{}".into());
+        let _ = req.respond(
+            tiny_http::Response::from_string(out)
+                .with_header(cors)
+                .with_header(json_ct),
+        );
+        return;
+    }
+
+    // POST /grab { url } -> open the Site Grabber in the app for this page.
+    if path == "/grab" && req.method() == &tiny_http::Method::Post {
+        let g = v
+            .get("url")
+            .and_then(|u| u.as_str())
+            .or_else(|| {
+                v.get("uris")
+                    .and_then(|a| a.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|x| x.as_str())
+            })
+            .unwrap_or("")
+            .to_string();
+        if !g.is_empty() {
+            if let Ok(mut gr) = grab_request().lock() {
+                *gr = Some(g);
+            }
+            focus_main();
+        }
+        let _ = req.respond(tiny_http::Response::from_string("{\"ok\":true}").with_header(cors));
+        return;
+    }
+    // POST /formats { url, referer?, cookies? } -> real per-video quality list.
+    if path == "/formats" && req.method() == &tiny_http::Method::Post {
+        let url0 = v
+            .get("url")
+            .and_then(|u| u.as_str())
+            .or_else(|| {
+                v.get("uris")
+                    .and_then(|a| a.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|x| x.as_str())
+            })
+            .unwrap_or("")
+            .to_string();
+        let opts = v.get("options").cloned().unwrap_or(json!({}));
+        let referer = opts
+            .get("referer")
+            .and_then(|r| r.as_str())
+            .map(String::from)
+            .or_else(|| v.get("referer").and_then(|r| r.as_str()).map(String::from));
+        let cookies = opts
+            .get("cookies")
+            .and_then(|r| r.as_str())
+            .map(String::from)
+            .or_else(|| v.get("cookies").and_then(|r| r.as_str()).map(String::from));
+        let out = match fetch_formats(url0, referer, cookies) {
+            Ok(val) => val.to_string(),
+            Err(e) => json!({ "error": e }).to_string(),
+        };
+        let _ = req.respond(
+            tiny_http::Response::from_string(out)
+                .with_header(cors)
+                .with_header(json_ct),
+        );
+        return;
+    }
+
+    if v.get("kind").and_then(|kind| kind.as_str()) == Some("local") {
+        let path = v
+            .get("paths")
+            .and_then(|paths| paths.as_array())
+            .and_then(|paths| paths.first())
+            .and_then(|path| path.as_str())
+            .unwrap_or("");
+        let source_url = v
+            .get("sourceUrl")
+            .and_then(|url| url.as_str())
+            .unwrap_or("");
+        let result = if ASK_BEFORE.load(Ordering::Relaxed) {
+            queue_browser_file(path, source_url)
+        } else {
+            import_browser_file(path, source_url, None, None)
+        };
+        let out = match result {
+            Ok(gid) => json!({ "ok": true, "gid": gid }),
+            Err(error) => json!({ "ok": false, "error": error }),
+        };
+        let _ = req.respond(
+            tiny_http::Response::from_string(out.to_string())
+                .with_header(cors)
+                .with_header(json_ct),
+        );
+        return;
+    }
+
+    if v.get("kind").and_then(|k| k.as_str()) == Some("media") {
+        let result = handle_media_bridge(&v);
+        let out = match result {
+            Ok(_) => json!({ "ok": true }),
+            Err(error) => json!({ "ok": false, "error": error }),
+        };
+        let _ = req.respond(
+            tiny_http::Response::from_string(out.to_string())
+                .with_header(cors)
+                .with_header(json_ct),
+        );
+        return;
+    }
+
+    let mut ok = false;
+    {
+        let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+        // Unwrap viewer wrappers (e.g. a /media?url=<file> wrapper) at the door so
+        // no downstream path can hand an unsupported wrapper to yt-dlp or aria2,
+        // regardless of which (possibly stale) caller sent it.
+        let uris: Vec<String> = v
+            .get("uris")
+            .and_then(|u| u.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(unwrap_media_url))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let opts = v.get("options").cloned().unwrap_or(json!({}));
+        let profile =
+            resolve_download_profile(opts.get("profileId").and_then(|value| value.as_str()))
+                .unwrap_or_default();
+        let url0 = uris.first().cloned().unwrap_or_default();
+        let format = opts
+            .get("format")
+            .and_then(|f| f.as_str())
+            .unwrap_or("best")
+            .to_string();
+        let referer = opts
+            .get("referer")
+            .and_then(|r| r.as_str())
+            .map(String::from);
+        let cookies = opts
+            .get("cookies")
+            .and_then(|r| r.as_str())
+            .map(String::from);
+        let elem = opts.get("elem").and_then(|e| e.as_str());
+        let has_stream = opts
+            .get("hasStream")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
+        let browser_filename = opts
+            .get("filename")
+            .and_then(|name| name.as_str())
+            .and_then(|name| name.rsplit(['/', '\\']).next())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(String::from);
+        // Smart routing: choose the engine by evidence (URL shape, DOM context,
+        // then a content-type probe) instead of defaulting unknowns to yt-dlp.
+        let routing = if kind == "browser" {
+            // chrome.downloads already identified this as a file. Keep the
+            // takeover path local and fast so filename finalization is never
+            // held behind a remote HEAD probe.
+            Routing::just(Route::Aria2)
+        } else {
+            tauri::async_runtime::block_on(decide_route(
+                &url0,
+                kind,
+                elem,
+                has_stream,
+                None,
+                referer.as_deref(),
+            ))
+        };
+
+        if routing.route == Route::Ytdlp && !url0.is_empty() {
+            // Page/stream captures via yt-dlp. Pop a confirmation dialog first
+            // (unless the caller opted out or confirmations are disabled).
+            let subs = opts.get("subs").and_then(|s| s.as_bool()).unwrap_or(false);
+            let sponsorblock = opts
+                .get("sponsorblock")
+                .and_then(|s| s.as_bool())
+                .unwrap_or(false);
+            let prompt = v.get("prompt").and_then(|p| p.as_bool()).unwrap_or(true);
+            if prompt && ASK_BEFORE.load(Ordering::Relaxed) {
+                let id = format!("pend-{}", now_ms());
+                let title = opts
+                    .get("title")
+                    .and_then(|t| t.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(String::from);
+                let quality = opts
+                    .get("quality")
+                    .and_then(|q| q.as_str())
+                    .unwrap_or(format.as_str())
+                    .to_string();
+                let name = title.unwrap_or_else(|| url_filename(&url0));
+                notify("DownMan — confirm video", &name);
+                if let Ok(mut p) = pending().lock() {
+                    p.push(json!({
+                        "id": id, "url": url0, "kind": "site",
+                        "filename": name, "size": "0", "category": "Video",
+                        "quality": quality, "format": format,
+                        "referer": referer, "cookies": cookies,
+                        "subs": subs, "sponsorblock": sponsorblock,
+                        "profileId": profile.id, "profile": profile,
+                        "status": "ready"
+                    }));
+                }
+                focus_main();
+            } else {
+                let _ = start_site_download(
+                    url0,
+                    MediaDownloadOptions {
+                        format,
+                        referer,
+                        cookies,
+                        subs,
+                        sponsorblock,
+                        out_dir: None,
+                        out_name: None,
+                        elem: None,
+                        paused: false,
+                        profile,
+                    },
+                );
+            }
+            ok = true;
+        } else {
+            // Direct files / torrents / magnets go to aria2. For ordinary http(s)
+            // files from the browser we first pop a confirmation dialog
+            // (unless the caller opted out, e.g. the batch image grabber).
+            let prompt = v.get("prompt").and_then(|p| p.as_bool()).unwrap_or(true);
+            let is_magnet = url0.starts_with("magnet:");
+            let is_torrent_url = url0
+                .split(['?', '#'])
+                .next()
+                .unwrap_or("")
+                .ends_with(".torrent");
+            let promptable = prompt
+                && ASK_BEFORE.load(Ordering::Relaxed)
+                && uris.len() == 1
+                && url0.starts_with("http")
+                && !is_magnet
+                && !is_torrent_url;
+            if promptable {
+                let id = format!("pend-{}", now_ms());
+                let fname = browser_filename
+                    .clone()
+                    .unwrap_or_else(|| filename_with_ext(&url0, routing.ctype.as_deref()));
+                let cat = category_of(&fname).0;
+                // Browser-initiated: the window often can't raise over the
+                // browser (Wayland), so notify so it never feels like nothing happened.
+                notify("DownMan — confirm download", &fname);
+                if let Ok(mut p) = pending().lock() {
+                    p.push(json!({
+                        "id": id, "url": url0, "filename": fname,
+                        "size": "0", "category": cat,
+                        "referer": referer, "status": "probing"
+                    }));
+                }
+                focus_main();
+                let id2 = id.clone();
+                let url2 = url0.clone();
+                let ref2 = referer.clone();
+                tauri::async_runtime::spawn(async move {
+                    let (fname_opt, size) = probe_url(url2, ref2).await;
+                    update_pending(&id2, |p| {
+                        p["size"] = json!(size.to_string());
+                        if let Some(f) = fname_opt
+                            && !f.trim().is_empty()
+                        {
+                            p["category"] = json!(category_of(&f).0);
+                            p["filename"] = json!(f);
+                        }
+                        p["status"] = json!("ready");
+                    });
+                });
+                ok = true;
+            } else if let Some(c) = ARIA2.get() {
+                let mut a2 = serde_json::Map::new();
+                if let Some(r) = opts.get("referer") {
+                    a2.insert("referer".into(), r.clone());
+                }
+                // Ordinary http file: place it in its final folder under a unique
+                // name so concurrent same-name downloads never clobber each other.
+                let direct_file = url0.starts_with("http") && !is_magnet && !is_torrent_url;
+                if direct_file {
+                    let fname = browser_filename
+                        .clone()
+                        .unwrap_or_else(|| filename_with_ext(&url0, routing.ctype.as_deref()));
+                    let tdir = if ORGANIZE.load(Ordering::Relaxed) {
+                        category_of(&fname).1
+                    } else {
+                        download_dir()
+                    };
+                    let out = unique_out(&tdir, &fname);
+                    a2.insert("dir".into(), json!(tdir.display().to_string()));
+                    a2.insert("out".into(), json!(out));
+                }
+                let res = tauri::async_runtime::block_on(c.add_uri(uris, Value::Object(a2)));
+                if let Ok(gid) = &res {
+                    mark_download_added(gid);
+                    if direct_file && let Ok(mut s) = no_organize().lock() {
+                        s.insert(gid.clone());
+                    }
+                }
+                ok = res.is_ok();
+            }
+        }
+    }
+    let _ = req.respond(
+        tiny_http::Response::from_string(if ok {
+            "{\"ok\":true}"
+        } else {
+            "{\"ok\":false}"
+        })
+        .with_header(cors),
+    );
+}
+
 /// Local HTTP bridge so browser extensions can POST downloads to DownMan.
 fn start_bridge() {
     std::thread::spawn(|| {
@@ -2875,241 +5431,19 @@ fn start_bridge() {
             Ok(s) => s,
             Err(_) => return,
         };
-        for mut req in server.incoming_requests() {
-            // Local-security gate: a web page must not be able to drive the bridge.
-            // Browser fetches carry an Origin header — allow extension origins and
-            // header-less native callers; refuse anything http(s) or sandboxed.
-            let from_web = req.headers().iter()
-                .find(|h| h.field.equiv("Origin"))
-                .map(|h| {
-                    let o = h.value.as_str().to_lowercase();
-                    o.starts_with("http://") || o.starts_with("https://") || o == "null"
-                })
-                .unwrap_or(false);
-            if from_web {
-                let _ = req.respond(tiny_http::Response::from_string("{\"ok\":false,\"error\":\"forbidden\"}").with_status_code(403));
-                continue;
-            }
-            // Stamp ping time on every incoming request so the Settings card can show "last seen".
-            LAST_BRIDGE_PING.store(now_ms() as u64, Ordering::Relaxed);
-            let cors = tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap();
-            let ctype = tiny_http::Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type"[..]).unwrap();
-            if req.method() == &tiny_http::Method::Options {
-                let _ = req.respond(tiny_http::Response::empty(204).with_header(cors).with_header(ctype));
-                continue;
-            }
-            let path = req.url().to_string();
-            // GET /rules -> interception rules the browser extension applies.
-            if path.starts_with("/rules") && req.method() == &tiny_http::Method::Get {
-                let out = rules().lock().map(|r| r.to_string()).unwrap_or_else(|_| "{}".into());
-                let json_ct = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
-                let _ = req.respond(tiny_http::Response::from_string(out).with_header(cors).with_header(json_ct));
-                continue;
-            }
-            // GET /list -> current downloads (extension popup; localhost bridge only).
-            if path.starts_with("/list") {
-                let out = remote_list_json().to_string();
-                let json_ct = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
-                let _ = req.respond(tiny_http::Response::from_string(out).with_header(cors).with_header(json_ct));
-                continue;
-            }
-            let mut body = String::new();
-            let _ = req.as_reader().read_to_string(&mut body);
-            let v: Value = serde_json::from_str(&body).unwrap_or(json!({}));
-            let json_ct = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
-
-            // POST /rules { enabled } -> keep the extension's quick toggle and the
-            // in-app Browser interception setting on one persisted source of truth.
-            if path.starts_with("/rules") && req.method() == &tiny_http::Method::Post {
-                if let Some(enabled) = v.get("enabled").and_then(|value| value.as_bool()) {
-                    if let Ok(mut current) = rules().lock() {
-                        current["enabled"] = json!(enabled);
-                    }
-                    save_rules();
-                }
-                let out = rules().lock().map(|r| r.to_string()).unwrap_or_else(|_| "{}".into());
-                let _ = req.respond(tiny_http::Response::from_string(out).with_header(cors).with_header(json_ct));
-                continue;
-            }
-
-            // POST /grab { url } -> open the Site Grabber in the app for this page.
-            if path.starts_with("/grab") {
-                let g = v.get("url").and_then(|u| u.as_str())
-                    .or_else(|| v.get("uris").and_then(|a| a.as_array()).and_then(|a| a.first()).and_then(|x| x.as_str()))
-                    .unwrap_or("").to_string();
-                if !g.is_empty() {
-                    if let Ok(mut gr) = grab_request().lock() {
-                        *gr = Some(g);
-                    }
-                    focus_main();
-                }
-                let _ = req.respond(tiny_http::Response::from_string("{\"ok\":true}").with_header(cors));
-                continue;
-            }
-            // POST /formats { url, referer?, cookies? } -> real per-video quality list.
-            if path.starts_with("/formats") {
-                let url0 = v.get("url").and_then(|u| u.as_str())
-                    .or_else(|| v.get("uris").and_then(|a| a.as_array()).and_then(|a| a.first()).and_then(|x| x.as_str()))
-                    .unwrap_or("").to_string();
-                let opts = v.get("options").cloned().unwrap_or(json!({}));
-                let referer = opts.get("referer").and_then(|r| r.as_str()).map(String::from)
-                    .or_else(|| v.get("referer").and_then(|r| r.as_str()).map(String::from));
-                let cookies = opts.get("cookies").and_then(|r| r.as_str()).map(String::from)
-                    .or_else(|| v.get("cookies").and_then(|r| r.as_str()).map(String::from));
-                let out = match fetch_formats(url0, referer, cookies) {
-                    Ok(val) => val.to_string(),
-                    Err(e) => json!({ "error": e }).to_string(),
-                };
-                let _ = req.respond(tiny_http::Response::from_string(out).with_header(cors).with_header(json_ct));
-                continue;
-            }
-
-            if v.get("kind").and_then(|kind| kind.as_str()) == Some("local") {
-                let path = v.get("paths").and_then(|paths| paths.as_array()).and_then(|paths| paths.first())
-                    .and_then(|path| path.as_str()).unwrap_or("");
-                let source_url = v.get("sourceUrl").and_then(|url| url.as_str()).unwrap_or("");
-                let result = if ASK_BEFORE.load(Ordering::Relaxed) {
-                    queue_browser_file(path, source_url)
-                } else {
-                    import_browser_file(path, source_url, None, None)
-                };
-                let out = match result {
-                    Ok(gid) => json!({ "ok": true, "gid": gid }),
-                    Err(error) => json!({ "ok": false, "error": error }),
-                };
-                let _ = req.respond(tiny_http::Response::from_string(out.to_string()).with_header(cors).with_header(json_ct));
-                continue;
-            }
-
-            if v.get("kind").and_then(|k| k.as_str()) == Some("media") {
-                let result = handle_media_bridge(&v);
-                let out = match result {
-                    Ok(_) => json!({ "ok": true }),
-                    Err(error) => json!({ "ok": false, "error": error }),
-                };
-                let _ = req.respond(tiny_http::Response::from_string(out.to_string()).with_header(cors).with_header(json_ct));
-                continue;
-            }
-
-            let mut ok = false;
-            {
-                let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-                // Unwrap viewer wrappers (e.g. a /media?url=<file> wrapper) at the door so
-                // no downstream path can hand an unsupported wrapper to yt-dlp or aria2,
-                // regardless of which (possibly stale) caller sent it.
-                let uris: Vec<String> = v.get("uris").and_then(|u| u.as_array())
-                    .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| unwrap_media_url(s))).collect())
-                    .unwrap_or_default();
-                let opts = v.get("options").cloned().unwrap_or(json!({}));
-                let url0 = uris.first().cloned().unwrap_or_default();
-                let format = opts.get("format").and_then(|f| f.as_str()).unwrap_or("best").to_string();
-                let referer = opts.get("referer").and_then(|r| r.as_str()).map(String::from);
-                let cookies = opts.get("cookies").and_then(|r| r.as_str()).map(String::from);
-                let elem = opts.get("elem").and_then(|e| e.as_str());
-                let has_stream = opts.get("hasStream").and_then(|b| b.as_bool()).unwrap_or(false);
-                // Smart routing: choose the engine by evidence (URL shape, DOM context,
-                // then a content-type probe) instead of defaulting unknowns to yt-dlp.
-                let routing = tauri::async_runtime::block_on(
-                    decide_route(&url0, kind, elem, has_stream, None, referer.as_deref())
+        for req in server.incoming_requests() {
+            if BRIDGE_WORKERS.fetch_add(1, Ordering::Relaxed) >= MAX_BRIDGE_WORKERS {
+                BRIDGE_WORKERS.fetch_sub(1, Ordering::Relaxed);
+                let _ = req.respond(
+                    tiny_http::Response::from_string("{\"ok\":false,\"error\":\"bridge busy\"}")
+                        .with_status_code(503),
                 );
-
-                if routing.route == Route::Ytdlp && !url0.is_empty() {
-                    // Page/stream captures via yt-dlp. Pop a confirmation dialog first
-                    // (unless the caller opted out or confirmations are disabled).
-                    let subs = opts.get("subs").and_then(|s| s.as_bool()).unwrap_or(false);
-                    let sponsorblock = opts.get("sponsorblock").and_then(|s| s.as_bool()).unwrap_or(false);
-                    let prompt = v.get("prompt").and_then(|p| p.as_bool()).unwrap_or(true);
-                    if prompt && ASK_BEFORE.load(Ordering::Relaxed) {
-                        let id = format!("pend-{}", now_ms());
-                        let title = opts.get("title").and_then(|t| t.as_str()).filter(|s| !s.is_empty()).map(String::from);
-                        let quality = opts.get("quality").and_then(|q| q.as_str()).unwrap_or(format.as_str()).to_string();
-                        let name = title.unwrap_or_else(|| url_filename(&url0));
-                        notify("DownMan — confirm video", &name);
-                        if let Ok(mut p) = pending().lock() {
-                            p.push(json!({
-                                "id": id, "url": url0, "kind": "site",
-                                "filename": name, "size": "0", "category": "Video",
-                                "quality": quality, "format": format,
-                                "referer": referer, "cookies": cookies,
-                                "subs": subs, "sponsorblock": sponsorblock,
-                                "status": "ready"
-                            }));
-                        }
-                        focus_main();
-                    } else {
-                        let _ = start_site_download(url0, format, referer, cookies, subs, sponsorblock, None, None);
-                    }
-                    ok = true;
-                } else {
-                    // Direct files / torrents / magnets go to aria2. For ordinary http(s)
-                    // files from the browser we first pop a confirmation dialog
-                    // (unless the caller opted out, e.g. the batch image grabber).
-                    let prompt = v.get("prompt").and_then(|p| p.as_bool()).unwrap_or(true);
-                    let is_magnet = url0.starts_with("magnet:");
-                    let is_torrent_url = url0.split(['?', '#']).next().unwrap_or("").ends_with(".torrent");
-                    let promptable = prompt
-                        && ASK_BEFORE.load(Ordering::Relaxed)
-                        && uris.len() == 1
-                        && url0.starts_with("http")
-                        && !is_magnet
-                        && !is_torrent_url;
-                    if promptable {
-                        let id = format!("pend-{}", now_ms());
-                        let fname = filename_with_ext(&url0, routing.ctype.as_deref());
-                        let cat = category_of(&fname).0;
-                        // Browser-initiated: the window often can't raise over the
-                        // browser (Wayland), so notify so it never feels like nothing happened.
-                        notify("DownMan — confirm download", &fname);
-                        if let Ok(mut p) = pending().lock() {
-                            p.push(json!({
-                                "id": id, "url": url0, "filename": fname,
-                                "size": "0", "category": cat,
-                                "referer": referer, "status": "probing"
-                            }));
-                        }
-                        focus_main();
-                        let id2 = id.clone();
-                        let url2 = url0.clone();
-                        let ref2 = referer.clone();
-                        tauri::async_runtime::spawn(async move {
-                            let (fname_opt, size) = probe_url(url2, ref2).await;
-                            update_pending(&id2, |p| {
-                                p["size"] = json!(size.to_string());
-                                if let Some(f) = fname_opt {
-                                    if !f.trim().is_empty() {
-                                        p["category"] = json!(category_of(&f).0);
-                                        p["filename"] = json!(f);
-                                    }
-                                }
-                                p["status"] = json!("ready");
-                            });
-                        });
-                        ok = true;
-                    } else if let Some(c) = ARIA2.get() {
-                        let mut a2 = serde_json::Map::new();
-                        if let Some(r) = opts.get("referer") { a2.insert("referer".into(), r.clone()); }
-                        // Ordinary http file: place it in its final folder under a unique
-                        // name so concurrent same-name downloads never clobber each other.
-                        let direct_file = url0.starts_with("http") && !is_magnet && !is_torrent_url;
-                        if direct_file {
-                            let fname = filename_with_ext(&url0, routing.ctype.as_deref());
-                            let tdir = if ORGANIZE.load(Ordering::Relaxed) { category_of(&fname).1 } else { download_dir() };
-                            let out = unique_out(&tdir, &fname);
-                            a2.insert("dir".into(), json!(tdir.display().to_string()));
-                            a2.insert("out".into(), json!(out));
-                        }
-                        let res = tauri::async_runtime::block_on(c.add_uri(uris, Value::Object(a2)));
-                        if let Ok(gid) = &res {
-                            mark_download_added(gid);
-                            if direct_file {
-                                if let Ok(mut s) = no_organize().lock() { s.insert(gid.clone()); }
-                            }
-                        }
-                        ok = res.is_ok();
-                    }
-                }
+                continue;
             }
-            let _ = req.respond(tiny_http::Response::from_string(if ok { "{\"ok\":true}" } else { "{\"ok\":false}" }).with_header(cors));
+            std::thread::spawn(move || {
+                let _guard = BridgeWorkerGuard;
+                handle_bridge_request(req);
+            });
         }
     });
 }
@@ -3117,9 +5451,19 @@ fn start_bridge() {
 #[tauri::command]
 async fn add_download(uris: Vec<String>, options: Value) -> Result<String, String> {
     let mut opts = options.as_object().cloned().unwrap_or_default();
+    let profile_id = opts
+        .remove("dmProfileId")
+        .and_then(|value| value.as_str().map(String::from));
+    let profile = resolve_download_profile(profile_id.as_deref())?;
+    media_policy::apply_aria2_options(&profile, &mut opts, &download_dir());
     let url0 = uris.first().cloned().unwrap_or_default();
     // Magnets / .torrent links land in a dedicated Torrents folder.
-    let is_torrent = url0.starts_with("magnet:") || url0.split(['?', '#']).next().unwrap_or("").ends_with(".torrent");
+    let is_torrent = url0.starts_with("magnet:")
+        || url0
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("")
+            .ends_with(".torrent");
     if is_torrent && !opts.contains_key("dir") {
         let tdir = download_dir().join("Torrents");
         std::fs::create_dir_all(&tdir).ok();
@@ -3129,7 +5473,18 @@ async fn add_download(uris: Vec<String>, options: Value) -> Result<String, Strin
     let direct_file = uris.len() == 1 && url0.starts_with("http") && !opts.contains_key("out");
     if direct_file {
         let fname = url_filename(&url0);
-        let tdir = if ORGANIZE.load(Ordering::Relaxed) { category_of(&fname).1 } else { download_dir() };
+        let tdir = opts
+            .get("dir")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                if ORGANIZE.load(Ordering::Relaxed) {
+                    category_of(&fname).1
+                } else {
+                    download_dir()
+                }
+            });
         let existing = tdir.join(&fname);
         // File-exists conflict — return a typed error so the frontend can prompt.
         if existing.exists() && !opts.contains_key("dmForce") {
@@ -3142,12 +5497,20 @@ async fn add_download(uris: Vec<String>, options: Value) -> Result<String, Strin
     }
     // Extract caller-supplied expected checksum (not sent to aria2 directly here;
     // we store it in DL_META and aria2 uses its own --checksum flag format).
-    let user_checksum = opts.remove("dmChecksum").and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default();
+    let user_checksum = opts
+        .remove("dmChecksum")
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
     let _force_flag = opts.remove("dmForce"); // already consumed above in the conflict check
-    let gid = client()?.add_uri(uris, Value::Object(opts)).await.map_err(|e| e.to_string())?;
+    let gid = client()?
+        .add_uri(uris, Value::Object(opts))
+        .await
+        .map_err(|e| e.to_string())?;
     mark_download_added(&gid);
-    if direct_file {
-        if let Ok(mut s) = no_organize().lock() { s.insert(gid.clone()); }
+    attach_profile_snapshot(&gid, &profile);
+    assign_profile_queue(&url0, &profile);
+    if direct_file && let Ok(mut s) = no_organize().lock() {
+        s.insert(gid.clone());
     }
     // Persist metadata for this download.
     if !user_checksum.is_empty() {
@@ -3163,6 +5526,7 @@ async fn add_download(uris: Vec<String>, options: Value) -> Result<String, Strin
 
 #[tauri::command]
 async fn pause(gid: String) -> Result<(), String> {
+    set_scheduler_pause_owner(&gid, false);
     if gid.starts_with("site-") {
         signal_site_process(&gid, "STOP")?;
         update_site_job(&gid, |job| job["status"] = json!("paused"));
@@ -3173,6 +5537,7 @@ async fn pause(gid: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn resume(gid: String) -> Result<(), String> {
+    set_scheduler_pause_owner(&gid, false);
     if gid.starts_with("site-") {
         signal_site_process(&gid, "CONT")?;
         update_site_job(&gid, |job| job["status"] = json!("active"));
@@ -3183,6 +5548,13 @@ async fn resume(gid: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn pause_all() -> Result<(), String> {
+    let owned = scheduler_paused()
+        .lock()
+        .map(|paused| paused.iter().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for gid in owned {
+        set_scheduler_pause_owner(&gid, false);
+    }
     let aria_result = client()?.pause_all().await.map_err(|e| e.to_string());
     let site_result = signal_all_site_processes("STOP", "active", "paused");
     aria_result.and(site_result)
@@ -3190,6 +5562,13 @@ async fn pause_all() -> Result<(), String> {
 
 #[tauri::command]
 async fn resume_all() -> Result<(), String> {
+    let owned = scheduler_paused()
+        .lock()
+        .map(|paused| paused.iter().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for gid in owned {
+        set_scheduler_pause_owner(&gid, false);
+    }
     let aria_result = client()?.unpause_all().await.map_err(|e| e.to_string());
     let site_result = signal_all_site_processes("CONT", "paused", "active");
     aria_result.and(site_result)
@@ -3197,20 +5576,32 @@ async fn resume_all() -> Result<(), String> {
 
 #[tauri::command]
 async fn organize(gid: String) -> Result<String, String> {
-    let st = client()?.tell_status(&gid).await.map_err(|e| e.to_string())?;
-    let path = st.get("files").and_then(|f| f.get(0)).and_then(|f| f.get("path"))
-        .and_then(|p| p.as_str()).unwrap_or("").to_string();
-    if path.is_empty() { return Err("no path".into()); }
+    let st = client()?
+        .tell_status(&gid)
+        .await
+        .map_err(|e| e.to_string())?;
+    let path = st
+        .get("files")
+        .and_then(|f| f.get(0))
+        .and_then(|f| f.get("path"))
+        .and_then(|p| p.as_str())
+        .unwrap_or("")
+        .to_string();
+    if path.is_empty() {
+        return Err("no path".into());
+    }
     let src = std::path::PathBuf::from(&path);
-    let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+    let name = src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
     let dest_dir = category_of(&name).1;
     std::fs::create_dir_all(&dest_dir).ok();
     let dest = dest_dir.join(&name);
-    if src != dest && src.exists() {
-        if std::fs::rename(&src, &dest).is_err() {
-            std::fs::copy(&src, &dest).map_err(|e| e.to_string())?;
-            std::fs::remove_file(&src).ok();
-        }
+    if src != dest && src.exists() && std::fs::rename(&src, &dest).is_err() {
+        std::fs::copy(&src, &dest).map_err(|e| e.to_string())?;
+        std::fs::remove_file(&src).ok();
     }
     Ok(dest.display().to_string())
 }
@@ -3219,10 +5610,30 @@ async fn organize(gid: String) -> Result<String, String> {
 fn grab_hls(url: String, name: String) -> Result<(), String> {
     let out = download_dir().join("Video");
     std::fs::create_dir_all(&out).ok();
-    let safe = if name.ends_with(".mp4") { name } else { format!("{name}.mp4") };
-    Command::new("ffmpeg").arg("-y").arg("-i").arg(&url)
-        .arg("-c").arg("copy").arg(out.join(safe))
-        .spawn().map_err(|e| format!("ffmpeg: {e}"))?;
+    let safe = if name.ends_with(".mp4") {
+        name
+    } else {
+        format!("{name}.mp4")
+    };
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-y")
+        .arg("-i")
+        .arg(&url)
+        .arg("-c")
+        .arg("copy")
+        .arg(out.join(safe));
+    cmd.process_group(0);
+    let mut child = cmd.spawn().map_err(|e| format!("ffmpeg: {e}"))?;
+    let pid = child.id();
+    if let Ok(mut processes) = aux_processes().lock() {
+        processes.insert(pid);
+    }
+    std::thread::spawn(move || {
+        let _ = child.wait();
+        if let Ok(mut processes) = aux_processes().lock() {
+            processes.remove(&pid);
+        }
+    });
     Ok(())
 }
 
@@ -3230,7 +5641,11 @@ fn grab_hls(url: String, name: String) -> Result<(), String> {
 async fn remove(gid: String) -> Result<(), String> {
     remove_from_history(&gid);
     if gid.starts_with("site-") {
-        if site_processes().lock().map(|p| p.contains_key(&gid)).unwrap_or(false) {
+        if site_processes()
+            .lock()
+            .map(|p| p.contains_key(&gid))
+            .unwrap_or(false)
+        {
             if let Ok(mut cancelled) = site_cancelled().lock() {
                 cancelled.insert(gid.clone());
             }
@@ -3251,9 +5666,16 @@ async fn remove(gid: String) -> Result<(), String> {
 }
 
 fn retry_filename(task: &Value, url: &str) -> String {
-    let failed_path = task.get("files").and_then(|files| files.get(0)).and_then(|file| file.get("path"))
-        .and_then(|value| value.as_str()).unwrap_or("");
-    let failed_name = std::path::Path::new(failed_path).file_name().and_then(|value| value.to_str()).unwrap_or("");
+    let failed_path = task
+        .get("files")
+        .and_then(|files| files.get(0))
+        .and_then(|file| file.get("path"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let failed_name = std::path::Path::new(failed_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
     if failed_name.is_empty() || failed_name.starts_with('&') || failed_name.starts_with('?') {
         url_filename(url)
     } else {
@@ -3264,21 +5686,60 @@ fn retry_filename(task: &Value, url: &str) -> String {
 #[tauri::command]
 async fn retry_download(gid: String, cookies: Option<String>) -> Result<String, String> {
     if gid.starts_with("site-") {
-        let job = site_jobs().lock().ok()
-            .and_then(|jobs| jobs.iter().find(|job| job.get("gid").and_then(|value| value.as_str()) == Some(gid.as_str())).cloned())
+        let job = site_jobs()
+            .lock()
+            .ok()
+            .and_then(|jobs| {
+                jobs.iter()
+                    .find(|job| {
+                        job.get("gid").and_then(|value| value.as_str()) == Some(gid.as_str())
+                    })
+                    .cloned()
+            })
             .ok_or_else(|| "media job not found".to_string())?;
         let url = url_of_task(&job);
-        if url.is_empty() { return Err("no source url".into()); }
+        if url.is_empty() {
+            return Err("no source url".into());
+        }
         let new_gid = start_site_download(
             url,
-            job.get("dmFormat").and_then(|value| value.as_str()).unwrap_or("best").to_string(),
-            job.get("dmReferer").and_then(|value| value.as_str()).map(String::from),
-            cookies.or_else(|| job.get("dmCookies").and_then(|value| value.as_str()).map(String::from)),
-            job.get("dmSubs").and_then(|value| value.as_bool()).unwrap_or(false),
-            job.get("dmSponsorblock").and_then(|value| value.as_bool()).unwrap_or(false),
-            job.get("dmOutDir").and_then(|value| value.as_str()).map(String::from),
-            job.get("dmOutName").and_then(|value| value.as_str()).map(String::from),
+            MediaDownloadOptions {
+                format: job
+                    .get("dmFormat")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("best")
+                    .to_string(),
+                referer: job
+                    .get("dmReferer")
+                    .and_then(|value| value.as_str())
+                    .map(String::from),
+                cookies: cookies.or_else(|| {
+                    job.get("dmCookies")
+                        .and_then(|value| value.as_str())
+                        .map(String::from)
+                }),
+                subs: job
+                    .get("dmSubs")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                sponsorblock: job
+                    .get("dmSponsorblock")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                out_dir: job
+                    .get("dmOutDir")
+                    .and_then(|value| value.as_str())
+                    .map(String::from),
+                out_name: job
+                    .get("dmOutName")
+                    .and_then(|value| value.as_str())
+                    .map(String::from),
+                elem: None,
+                paused: false,
+                profile: profile_from_value(job.get("dmProfile"))?,
+            },
         )?;
+        transfer_job_metadata(&gid, &new_gid);
         remove(gid).await?;
         return Ok(new_gid);
     }
@@ -3289,38 +5750,51 @@ async fn retry_download(gid: String, cookies: Option<String>) -> Result<String, 
         return Err("only failed downloads can be retried".into());
     }
     let url = url_of_task(&task);
-    if !url.starts_with("http") { return Err("no retryable source url".into()); }
+    if !url.starts_with("http") {
+        return Err("no retryable source url".into());
+    }
     for group in [c.tell_active().await, c.tell_waiting().await] {
-        if let Ok(tasks) = group {
-            if let Some(existing_gid) = tasks.as_array().into_iter().flatten()
+        if let Ok(tasks) = group
+            && let Some(existing_gid) = tasks
+                .as_array()
+                .into_iter()
+                .flatten()
                 .find(|candidate| url_of_task(candidate) == url)
-                .and_then(|candidate| candidate.get("gid")).and_then(|value| value.as_str())
-            {
-                c.remove(&gid).await.map_err(|e| e.to_string())?;
-                return Ok(existing_gid.to_string());
-            }
+                .and_then(|candidate| candidate.get("gid"))
+                .and_then(|value| value.as_str())
+        {
+            c.remove(&gid).await.map_err(|e| e.to_string())?;
+            return Ok(existing_gid.to_string());
         }
     }
-    let dir = task.get("dir").and_then(|value| value.as_str()).filter(|value| !value.is_empty())
-        .map(std::path::PathBuf::from).unwrap_or_else(download_dir);
+    let dir = task
+        .get("dir")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(download_dir);
     let preferred_name = retry_filename(&task, &url);
     let out = unique_out(&dir, &preferred_name);
     let mut options = serde_json::Map::new();
     options.insert("dir".into(), json!(dir.display().to_string()));
     options.insert("out".into(), json!(out));
-    if let Some(referer) = task.get("options").and_then(|value| value.get("referer")).and_then(|value| value.as_str()) {
+    if let Some(referer) = task
+        .get("options")
+        .and_then(|value| value.get("referer"))
+        .and_then(|value| value.as_str())
+    {
         options.insert("referer".into(), json!(referer));
     }
-    let new_gid = c.add_uri(vec![url.clone()], Value::Object(options)).await.map_err(|e| e.to_string())?;
+    let new_gid = c
+        .add_uri(vec![url.clone()], Value::Object(options))
+        .await
+        .map_err(|e| e.to_string())?;
     mark_download_added(&new_gid);
-    if let Ok(mut metadata) = dl_meta().lock() {
-        if let Some(existing) = metadata.get(&gid).cloned() {
-            metadata.insert(new_gid.clone(), existing);
-        }
-        metadata.remove(&gid);
-    }
-    save_dl_meta();
-    retries().lock().ok().map(|mut attempts| attempts.remove(&url));
+    transfer_job_metadata(&gid, &new_gid);
+    retries()
+        .lock()
+        .ok()
+        .map(|mut attempts| attempts.remove(&url));
     c.remove(&gid).await.map_err(|e| e.to_string())?;
     Ok(new_gid)
 }
@@ -3330,17 +5804,35 @@ async fn retry_download(gid: String, cookies: Option<String>) -> Result<String, 
 /// the existing file). `path` is the original file's full path.
 #[tauri::command]
 async fn redownload(url: String, path: String) -> Result<String, String> {
-    if url.trim().is_empty() { return Err("no source url".into()); }
+    if url.trim().is_empty() {
+        return Err("no source url".into());
+    }
     let (dir, fname) = if !path.trim().is_empty() {
         let p = std::path::PathBuf::from(&path);
-        let d = p.parent().map(|x| x.to_path_buf()).filter(|d| !d.as_os_str().is_empty()).unwrap_or_else(download_dir);
-        let f = p.file_name().and_then(|s| s.to_str()).unwrap_or("download").to_string();
+        let d = p
+            .parent()
+            .map(|x| x.to_path_buf())
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or_else(download_dir);
+        let f = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("download")
+            .to_string();
         (d, f)
     } else {
         (download_dir(), url_filename(&url))
     };
-    let fname = if fname.trim().is_empty() { "download".to_string() } else { fname };
-    let ext = std::path::Path::new(&fname).extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+    let fname = if fname.trim().is_empty() {
+        "download".to_string()
+    } else {
+        fname
+    };
+    let ext = std::path::Path::new(&fname)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
     std::fs::create_dir_all(&dir).ok();
     let temp = format!("{fname}.dm-new");
     let _ = std::fs::remove_file(dir.join(&temp));
@@ -3349,8 +5841,13 @@ async fn redownload(url: String, path: String) -> Result<String, String> {
     opts.insert("dir".into(), json!(dir.display().to_string()));
     opts.insert("out".into(), json!(temp));
     opts.insert("allow-overwrite".into(), json!("true"));
-    let gid = client()?.add_uri(vec![url], Value::Object(opts)).await.map_err(|e| e.to_string())?;
-    if let Ok(mut s) = no_organize().lock() { s.insert(gid.clone()); }
+    let gid = client()?
+        .add_uri(vec![url], Value::Object(opts))
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Ok(mut s) = no_organize().lock() {
+        s.insert(gid.clone());
+    }
     if let Ok(mut m) = redl_target().lock() {
         m.insert(gid.clone(), (dir.join(&fname).display().to_string(), ext));
     }
@@ -3364,30 +5861,43 @@ async fn clear_gone() -> Result<u64, String> {
     let c = client()?;
     let is_gone = |t: &Value| -> bool {
         let status = t.get("status").and_then(|s| s.as_str()).unwrap_or("");
-        if status == "error" || status == "removed" { return true; }
-        let path = t.get("files").and_then(|f| f.get(0)).and_then(|f| f.get("path")).and_then(|p| p.as_str()).unwrap_or("");
-        status == "complete" && !path.is_empty()
-            && std::path::Path::new(path).is_absolute() && !std::path::Path::new(path).exists()
+        if status == "error" || status == "removed" {
+            return true;
+        }
+        let path = t
+            .get("files")
+            .and_then(|f| f.get(0))
+            .and_then(|f| f.get("path"))
+            .and_then(|p| p.as_str())
+            .unwrap_or("");
+        status == "complete"
+            && !path.is_empty()
+            && std::path::Path::new(path).is_absolute()
+            && !std::path::Path::new(path).exists()
     };
     let mut cleared: HashSet<String> = HashSet::new();
-    if let Ok(stopped) = c.tell_stopped().await {
-        if let Some(arr) = stopped.as_array() {
-            for t in arr {
-                if is_gone(t) {
-                    if let Some(gid) = t.get("gid").and_then(|g| g.as_str()) {
-                        let _ = c.remove(gid).await;
-                        cleared.insert(gid.to_string());
-                    }
-                }
+    if let Ok(stopped) = c.tell_stopped().await
+        && let Some(arr) = stopped.as_array()
+    {
+        for t in arr {
+            if is_gone(t)
+                && let Some(gid) = t.get("gid").and_then(|g| g.as_str())
+            {
+                let _ = c.remove(gid).await;
+                cleared.insert(gid.to_string());
             }
         }
     }
     if let Ok(mut h) = history().lock() {
         h.retain(|t| {
             if is_gone(t) {
-                if let Some(gid) = t.get("gid").and_then(|g| g.as_str()) { cleared.insert(gid.to_string()); }
+                if let Some(gid) = t.get("gid").and_then(|g| g.as_str()) {
+                    cleared.insert(gid.to_string());
+                }
                 false
-            } else { true }
+            } else {
+                true
+            }
         });
     }
     save_history();
@@ -3403,14 +5913,16 @@ async fn clear_cache() -> Result<Value, String> {
     // Paths of downloads still in progress (active/waiting/paused) — never touch these.
     let mut keep: HashSet<String> = HashSet::new();
     for res in [c.tell_active().await, c.tell_waiting().await] {
-        if let Ok(v) = res {
-            if let Some(arr) = v.as_array() {
-                for t in arr {
-                    if let Some(files) = t.get("files").and_then(|f| f.as_array()) {
-                        for f in files {
-                            if let Some(p) = f.get("path").and_then(|p| p.as_str()) {
-                                if !p.is_empty() { keep.insert(p.to_string()); }
-                            }
+        if let Ok(v) = res
+            && let Some(arr) = v.as_array()
+        {
+            for t in arr {
+                if let Some(files) = t.get("files").and_then(|f| f.as_array()) {
+                    for f in files {
+                        if let Some(p) = f.get("path").and_then(|p| p.as_str())
+                            && !p.is_empty()
+                        {
+                            keep.insert(p.to_string());
                         }
                     }
                 }
@@ -3422,28 +5934,47 @@ async fn clear_cache() -> Result<Value, String> {
     let base = download_dir();
     let mut dirs = vec![base.clone()];
     if let Ok(rd) = std::fs::read_dir(&base) {
-        for e in rd.flatten() { if e.path().is_dir() { dirs.push(e.path()); } }
+        for e in rd.flatten() {
+            if e.path().is_dir() {
+                dirs.push(e.path());
+            }
+        }
     }
     for d in dirs {
-        let rd = match std::fs::read_dir(&d) { Ok(r) => r, Err(_) => continue };
+        let rd = match std::fs::read_dir(&d) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
         for entry in rd.flatten() {
             let path = entry.path();
-            if path.is_dir() { continue; }
+            if path.is_dir() {
+                continue;
+            }
             let full = path.display().to_string();
             let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
             let is_temp = name.ends_with(".dm-new") || name.ends_with(".dm-new.aria2");
             let is_ctrl = name.ends_with(".aria2");
-            if !is_temp && !is_ctrl { continue; }
+            if !is_temp && !is_ctrl {
+                continue;
+            }
             let controlled = full.strip_suffix(".aria2").unwrap_or(&full).to_string();
-            if keep.contains(&full) || keep.contains(&controlled) { continue; }
+            if keep.contains(&full) || keep.contains(&controlled) {
+                continue;
+            }
             let sz = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            if std::fs::remove_file(&path).is_ok() { freed += sz; removed += 1; }
+            if std::fs::remove_file(&path).is_ok() {
+                freed += sz;
+                removed += 1;
+            }
             // For an orphaned .aria2, also drop its stalled partial file.
             if is_ctrl {
                 let partial = std::path::PathBuf::from(&controlled);
                 if partial.exists() && !keep.contains(&controlled) {
                     let psz = std::fs::metadata(&partial).map(|m| m.len()).unwrap_or(0);
-                    if std::fs::remove_file(&partial).is_ok() { freed += psz; removed += 1; }
+                    if std::fs::remove_file(&partial).is_ok() {
+                        freed += psz;
+                        removed += 1;
+                    }
                 }
             }
         }
@@ -3451,13 +5982,75 @@ async fn clear_cache() -> Result<Value, String> {
     Ok(json!({ "bytes": freed, "files": removed }))
 }
 
-#[tauri::command]
-fn grab_site(url: String, format: Option<String>, referer: Option<String>, cookies: Option<String>, subs: Option<bool>, sponsorblock: Option<bool>) -> Result<String, String> {
-    start_site_download(url, format.unwrap_or_else(|| "best".into()), referer, cookies, subs.unwrap_or(false), sponsorblock.unwrap_or(false), None, None)
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct GrabSitePolicy {
+    profile_id: Option<String>,
+    clip_start: Option<String>,
+    clip_end: Option<String>,
+    live_policy: Option<String>,
 }
 
 #[tauri::command]
-fn list_formats(url: String, referer: Option<String>, cookies: Option<String>) -> Result<Value, String> {
+fn grab_site(
+    url: String,
+    format: Option<String>,
+    referer: Option<String>,
+    cookies: Option<String>,
+    subs: Option<bool>,
+    sponsorblock: Option<bool>,
+    policy: Option<GrabSitePolicy>,
+) -> Result<String, String> {
+    let policy = policy.unwrap_or_default();
+    let mut profile = resolve_download_profile(policy.profile_id.as_deref())?;
+    if let Some(value) = policy
+        .clip_start
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        profile.clip_start = value.into();
+    }
+    if let Some(value) = policy
+        .clip_end
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        profile.clip_end = value.into();
+    }
+    if let Some(value) = policy
+        .live_policy
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        profile.live_policy = value.into();
+    }
+    media_policy::ensure_valid(&profile)?;
+    start_site_download(
+        url,
+        MediaDownloadOptions {
+            format: format.unwrap_or_default(),
+            referer,
+            cookies,
+            subs: subs.unwrap_or(false),
+            sponsorblock: sponsorblock.unwrap_or(false),
+            out_dir: None,
+            out_name: None,
+            elem: None,
+            paused: false,
+            profile,
+        },
+    )
+}
+
+#[tauri::command]
+fn list_formats(
+    url: String,
+    referer: Option<String>,
+    cookies: Option<String>,
+) -> Result<Value, String> {
     fetch_formats(url, referer, cookies)
 }
 
@@ -3473,14 +6066,18 @@ fn enrich_torrent_history(history: &mut Value, live: &[&Value]) {
                 if t.get("bittorrent").is_none() {
                     continue;
                 }
-                let n = t.get("files").and_then(|f| f.as_array()).map(|a| a.len()).unwrap_or(0);
+                let n = t
+                    .get("files")
+                    .and_then(|f| f.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
                 if n <= 1 {
                     continue;
                 }
-                if let Some(h) = t.get("infoHash").and_then(|h| h.as_str()) {
-                    if let Some(files) = t.get("files").cloned() {
-                        by_hash.entry(h.to_string()).or_insert(files);
-                    }
+                if let Some(h) = t.get("infoHash").and_then(|h| h.as_str())
+                    && let Some(files) = t.get("files").cloned()
+                {
+                    by_hash.entry(h.to_string()).or_insert(files);
                 }
             }
         }
@@ -3493,14 +6090,18 @@ fn enrich_torrent_history(history: &mut Value, live: &[&Value]) {
             if h.get("bittorrent").is_none() {
                 continue;
             }
-            let cur = h.get("files").and_then(|f| f.as_array()).map(|a| a.len()).unwrap_or(0);
+            let cur = h
+                .get("files")
+                .and_then(|f| f.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
             if cur > 1 {
                 continue;
             }
-            if let Some(hash) = h.get("infoHash").and_then(|s| s.as_str()).map(String::from) {
-                if let Some(files) = by_hash.get(&hash) {
-                    h["files"] = files.clone();
-                }
+            if let Some(hash) = h.get("infoHash").and_then(|s| s.as_str()).map(String::from)
+                && let Some(files) = by_hash.get(&hash)
+            {
+                h["files"] = files.clone();
             }
         }
     }
@@ -3511,10 +6112,20 @@ fn enrich_torrent_history(history: &mut Value, live: &[&Value]) {
 fn mark_missing(arr: &mut Value) {
     if let Some(a) = arr.as_array_mut() {
         for t in a.iter_mut() {
-            if t.get("status").and_then(|s| s.as_str()) != Some("complete") { continue; }
-            let path = t.get("files").and_then(|f| f.as_array()).and_then(|f| f.first())
-                .and_then(|f| f.get("path")).and_then(|p| p.as_str()).unwrap_or("");
-            if path.len() > 1 && std::path::Path::new(path).is_absolute() && !std::path::Path::new(path).exists() {
+            if t.get("status").and_then(|s| s.as_str()) != Some("complete") {
+                continue;
+            }
+            let path = t
+                .get("files")
+                .and_then(|f| f.as_array())
+                .and_then(|f| f.first())
+                .and_then(|f| f.get("path"))
+                .and_then(|p| p.as_str())
+                .unwrap_or("");
+            if path.len() > 1
+                && std::path::Path::new(path).is_absolute()
+                && !std::path::Path::new(path).exists()
+            {
                 t["dmMissing"] = json!(true);
             }
         }
@@ -3526,33 +6137,51 @@ fn mark_missing(arr: &mut Value) {
 fn overlay_redl(arr: &mut Value, targets: &HashMap<String, (String, String)>) {
     if let Some(a) = arr.as_array_mut() {
         for task in a.iter_mut() {
-            let gid = match task.get("gid").and_then(|g| g.as_str()) { Some(g) => g.to_string(), None => continue };
-            if let Some((final_path, _)) = targets.get(&gid) {
-                if let Some(f0) = task.get_mut("files").and_then(|f| f.as_array_mut()).and_then(|f| f.get_mut(0)) {
-                    f0["path"] = json!(final_path);
-                }
+            let gid = match task.get("gid").and_then(|g| g.as_str()) {
+                Some(g) => g.to_string(),
+                None => continue,
+            };
+            if let Some((final_path, _)) = targets.get(&gid)
+                && let Some(f0) = task
+                    .get_mut("files")
+                    .and_then(|f| f.as_array_mut())
+                    .and_then(|f| f.get_mut(0))
+            {
+                f0["path"] = json!(final_path);
             }
         }
     }
 }
 
 fn collapse_retry_predecessors(stopped: &mut Value, live: &[&Value]) -> Vec<String> {
-    let mut successor_urls: HashSet<String> = live.iter().filter_map(|group| group.as_array()).flatten()
-        .map(url_of_task).filter(|url| !url.is_empty()).collect();
-    let Some(tasks) = stopped.as_array_mut() else { return Vec::new() };
-    successor_urls.extend(tasks.iter()
-        .filter(|task| task.get("status").and_then(|value| value.as_str()) != Some("error"))
-        .map(url_of_task).filter(|url| !url.is_empty()));
+    let mut successor_urls: HashSet<String> = live
+        .iter()
+        .filter_map(|group| group.as_array())
+        .flatten()
+        .map(url_of_task)
+        .filter(|url| !url.is_empty())
+        .collect();
+    let Some(tasks) = stopped.as_array_mut() else {
+        return Vec::new();
+    };
+    successor_urls.extend(
+        tasks
+            .iter()
+            .filter(|task| task.get("status").and_then(|value| value.as_str()) != Some("error"))
+            .map(url_of_task)
+            .filter(|url| !url.is_empty()),
+    );
     let mut seen_failed_urls = HashSet::new();
     let mut removed = Vec::new();
     tasks.retain(|task| {
-        if task.get("status").and_then(|value| value.as_str()) != Some("error") { return true; }
+        if task.get("status").and_then(|value| value.as_str()) != Some("error") {
+            return true;
+        }
         let url = url_of_task(task);
-        let keep = !url.is_empty() && !successor_urls.contains(&url) && seen_failed_urls.insert(url);
-        if !keep {
-            if let Some(gid) = task.get("gid").and_then(|value| value.as_str()) {
-                removed.push(gid.to_string());
-            }
+        let keep =
+            !url.is_empty() && !successor_urls.contains(&url) && seen_failed_urls.insert(url);
+        if !keep && let Some(gid) = task.get("gid").and_then(|value| value.as_str()) {
+            removed.push(gid.to_string());
         }
         keep
     });
@@ -3575,7 +6204,12 @@ async fn snapshot() -> Result<Snapshot, String> {
     let mut removed_metadata = false;
     for gid in retry_predecessors {
         let _ = c.remove(&gid).await;
-        if dl_meta().lock().ok().and_then(|mut metadata| metadata.remove(&gid)).is_some() {
+        if dl_meta()
+            .lock()
+            .ok()
+            .and_then(|mut metadata| metadata.remove(&gid))
+            .is_some()
+        {
             removed_metadata = true;
         }
     }
@@ -3597,26 +6231,37 @@ async fn snapshot() -> Result<Snapshot, String> {
     fn inject_meta(arr: &mut Value, meta: &HashMap<String, DlMeta>) {
         if let Some(a) = arr.as_array_mut() {
             for t in a.iter_mut() {
-                if let Some(gid) = t.get("gid").and_then(|g| g.as_str()).map(|s| s.to_string()) {
-                    if let Some(m) = meta.get(&gid) {
-                        t["dmChecksum"] = json!(m.checksum);
-                        t["dmVerify"] = json!(m.verify);
-                        t["dmOnComplete"] = json!(m.oncomplete_action);
-                        if m.added_at > 0 {
-                            t["addedAt"] = json!(m.added_at);
-                        }
+                if let Some(gid) = t.get("gid").and_then(|g| g.as_str()).map(|s| s.to_string())
+                    && let Some(m) = meta.get(&gid)
+                {
+                    t["dmChecksum"] = json!(m.checksum);
+                    t["dmVerify"] = json!(m.verify);
+                    t["dmOnComplete"] = json!(m.oncomplete_action);
+                    t["dmProfileId"] = json!(m.profile_id);
+                    if let Some(profile) = &m.profile_snapshot {
+                        t["dmProfile"] = json!(profile);
+                    }
+                    t["dmSchedule"] = json!(m.schedule);
+                    t["dmNetworkOverride"] = json!(m.network_override);
+                    if m.added_at > 0 {
+                        t["addedAt"] = json!(m.added_at);
                     }
                 }
             }
         }
     }
-    let mut active = active; let mut waiting = waiting;
+    let mut active = active;
+    let mut waiting = waiting;
     inject_meta(&mut active, &meta_map);
     inject_meta(&mut waiting, &meta_map);
     inject_meta(&mut stopped, &meta_map);
     inject_meta(&mut history, &meta_map);
     // While a re-download runs, show the real filename instead of the .dm-new temp.
-    let redl_t = redl_target().lock().ok().map(|m| m.clone()).unwrap_or_default();
+    let redl_t = redl_target()
+        .lock()
+        .ok()
+        .map(|m| m.clone())
+        .unwrap_or_default();
     overlay_redl(&mut active, &redl_t);
     overlay_redl(&mut waiting, &redl_t);
     // Badge tasks the auto-retry loop is nursing ("retry n/3" in the UI); the map
@@ -3642,16 +6287,37 @@ async fn snapshot() -> Result<Snapshot, String> {
     mark_missing(&mut stopped);
     mark_missing(&mut site);
     mark_missing(&mut history);
-    let queues = queues().lock().map(|q| q.clone()).unwrap_or_else(|_| default_queues());
+    let queues = queues()
+        .lock()
+        .map(|q| q.clone())
+        .unwrap_or_else(|_| default_queues());
     let queue_map = qmember().lock().map(|m| m.clone()).unwrap_or(json!({}));
     let grabbed = grabbed().lock().map(|g| g.clone()).unwrap_or(json!({}));
-    let grab_request = grab_request().lock().map(|g| g.clone().map(Value::String).unwrap_or(Value::Null)).unwrap_or(Value::Null);
-    Ok(Snapshot { active, waiting, stopped, stat, site, pending, history, queues, queue_map, grabbed, grab_request })
+    let grab_request = grab_request()
+        .lock()
+        .map(|g| g.clone().map(Value::String).unwrap_or(Value::Null))
+        .unwrap_or(Value::Null);
+    Ok(Snapshot {
+        active,
+        waiting,
+        stopped,
+        stat,
+        site,
+        pending,
+        history,
+        queues,
+        queue_map,
+        grabbed,
+        grab_request,
+    })
 }
 
 #[tauri::command]
 async fn set_global_option(options: Value) -> Result<(), String> {
-    client()?.change_global_option(options).await.map_err(|e| e.to_string())
+    client()?
+        .change_global_option(options)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -3687,7 +6353,11 @@ async fn reorder(gid: String, how: String) -> Result<(), String> {
 #[tauri::command]
 async fn set_selected_files(gid: String, indices: String) -> Result<(), String> {
     // `indices` is a 1-based aria2 list, e.g. "1,3,5"; empty means all.
-    let sel = if indices.trim().is_empty() { "1-1024".to_string() } else { indices };
+    let sel = if indices.trim().is_empty() {
+        "1-1024".to_string()
+    } else {
+        indices
+    };
     client()?
         .change_option(&gid, json!({ "select-file": sel }))
         .await
@@ -3728,12 +6398,15 @@ async fn add_torrent(data: String, options: Value) -> Result<String, String> {
     // Snapshot existing .torrent files so we can find — and auto-delete on
     // completion — the copy aria2 saves for this upload.
     let before = scan_torrent_files();
-    let gid = client()?.add_torrent(data, Value::Object(opts)).await.map_err(|e| e.to_string())?;
+    let gid = client()?
+        .add_torrent(data, Value::Object(opts))
+        .await
+        .map_err(|e| e.to_string())?;
     mark_download_added(&gid);
-    if let Some(f) = scan_torrent_files().difference(&before).next().cloned() {
-        if let Ok(mut m) = torrent_meta().lock() {
-            m.insert(gid.clone(), f);
-        }
+    if let Some(f) = scan_torrent_files().difference(&before).next().cloned()
+        && let Ok(mut m) = torrent_meta().lock()
+    {
+        m.insert(gid.clone(), f);
     }
     Ok(gid)
 }
@@ -3744,7 +6417,10 @@ async fn add_metalink(data: String, options: Value) -> Result<Value, String> {
     if !opts.contains_key("dir") {
         opts.insert("dir".into(), json!(download_dir().display().to_string()));
     }
-    let gids = client()?.add_metalink(data, Value::Object(opts)).await.map_err(|e| e.to_string())?;
+    let gids = client()?
+        .add_metalink(data, Value::Object(opts))
+        .await
+        .map_err(|e| e.to_string())?;
     if let Some(items) = gids.as_array() {
         for gid in items.iter().filter_map(|value| value.as_str()) {
             mark_download_added(gid);
@@ -3791,10 +6467,10 @@ fn set_power_block(enable: bool) {
 #[tauri::command]
 fn set_speed_limit_state(on: bool, value: String) {
     LIMIT_ON.store(on, Ordering::Relaxed);
-    if !value.trim().is_empty() {
-        if let Ok(mut v) = limit_val().lock() {
-            *v = value.trim().to_string();
-        }
+    if !value.trim().is_empty()
+        && let Ok(mut v) = limit_val().lock()
+    {
+        *v = value.trim().to_string();
     }
     if let Some(item) = TRAY_LIMIT.get() {
         let _ = item.set_checked(on);
@@ -3803,7 +6479,12 @@ fn set_speed_limit_state(on: bool, value: String) {
 
 /// Approve a queued download with the user's chosen name, folder, and timing.
 #[tauri::command]
-async fn confirm_pending(id: String, filename: String, dir: String, paused: bool) -> Result<String, String> {
+async fn confirm_pending(
+    id: String,
+    filename: String,
+    dir: String,
+    paused: bool,
+) -> Result<String, String> {
     let item = {
         let mut p = pending().lock().map_err(|_| "lock")?;
         let idx = p
@@ -3813,20 +6494,38 @@ async fn confirm_pending(id: String, filename: String, dir: String, paused: bool
         p.remove(idx)
     };
     let kind = item.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-    let url = item.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
+    let url = item
+        .get("url")
+        .and_then(|u| u.as_str())
+        .unwrap_or("")
+        .to_string();
     if kind == "browser-local" {
-        let path = item.get("localPath").and_then(|value| value.as_str()).unwrap_or("");
+        let path = item
+            .get("localPath")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
         return import_browser_file(
             path,
             &url,
-            if dir.trim().is_empty() { None } else { Some(dir.as_str()) },
-            if filename.trim().is_empty() { None } else { Some(filename.as_str()) },
+            if dir.trim().is_empty() {
+                None
+            } else {
+                Some(dir.as_str())
+            },
+            if filename.trim().is_empty() {
+                None
+            } else {
+                Some(filename.as_str())
+            },
         );
     }
     if url.is_empty() {
         return Err("no url".into());
     }
-    let referer = item.get("referer").and_then(|r| r.as_str()).map(String::from);
+    let referer = item
+        .get("referer")
+        .and_then(|r| r.as_str())
+        .map(String::from);
 
     // Site/stream captures run through yt-dlp, honouring the chosen folder + name.
     if kind == "media" {
@@ -3835,32 +6534,97 @@ async fn confirm_pending(id: String, filename: String, dir: String, paused: bool
             "candidates": item.get("mediaCandidates").cloned().unwrap_or_else(|| json!([])),
         });
         let candidates = media_candidates(&request)?;
-        return start_media_candidates(candidates, MediaDownloadOptions {
-            format: item.get("format").and_then(|f| f.as_str()).unwrap_or("best").to_string(),
-            referer,
-            cookies: item.get("cookies").and_then(|c| c.as_str()).map(String::from),
-            subs: item.get("subs").and_then(|s| s.as_bool()).unwrap_or(false),
-            sponsorblock: item.get("sponsorblock").and_then(|s| s.as_bool()).unwrap_or(false),
-            out_dir: if dir.trim().is_empty() { None } else { Some(dir) },
-            out_name: if filename.trim().is_empty() { None } else { Some(filename) },
-            elem: item.get("mediaElem").and_then(|e| e.as_str()).map(String::from),
-            paused,
-        });
+        return start_media_candidates(
+            candidates,
+            MediaDownloadOptions {
+                format: item
+                    .get("format")
+                    .and_then(|f| f.as_str())
+                    .unwrap_or("best")
+                    .to_string(),
+                referer,
+                cookies: item
+                    .get("cookies")
+                    .and_then(|c| c.as_str())
+                    .map(String::from),
+                subs: item.get("subs").and_then(|s| s.as_bool()).unwrap_or(false),
+                sponsorblock: item
+                    .get("sponsorblock")
+                    .and_then(|s| s.as_bool())
+                    .unwrap_or(false),
+                out_dir: if dir.trim().is_empty() {
+                    None
+                } else {
+                    Some(dir)
+                },
+                out_name: if filename.trim().is_empty() {
+                    None
+                } else {
+                    Some(filename)
+                },
+                elem: item
+                    .get("mediaElem")
+                    .and_then(|e| e.as_str())
+                    .map(String::from),
+                paused,
+                profile: profile_from_value(item.get("profile"))?,
+            },
+        );
     }
     if kind == "site" || kind == "stream" {
-        let format = item.get("format").and_then(|f| f.as_str()).unwrap_or("best").to_string();
-        let cookies = item.get("cookies").and_then(|c| c.as_str()).map(String::from);
+        let format = item
+            .get("format")
+            .and_then(|f| f.as_str())
+            .unwrap_or("best")
+            .to_string();
+        let cookies = item
+            .get("cookies")
+            .and_then(|c| c.as_str())
+            .map(String::from);
         let subs = item.get("subs").and_then(|s| s.as_bool()).unwrap_or(false);
-        let sponsorblock = item.get("sponsorblock").and_then(|s| s.as_bool()).unwrap_or(false);
-        let out_dir = if dir.trim().is_empty() { None } else { Some(dir) };
-        let out_name = if filename.trim().is_empty() { None } else { Some(filename) };
-        return start_site_download(url, format, referer, cookies, subs, sponsorblock, out_dir, out_name);
+        let sponsorblock = item
+            .get("sponsorblock")
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false);
+        let out_dir = if dir.trim().is_empty() {
+            None
+        } else {
+            Some(dir)
+        };
+        let out_name = if filename.trim().is_empty() {
+            None
+        } else {
+            Some(filename)
+        };
+        return start_site_download(
+            url,
+            MediaDownloadOptions {
+                format,
+                referer,
+                cookies,
+                subs,
+                sponsorblock,
+                out_dir,
+                out_name,
+                elem: None,
+                paused: false,
+                profile: profile_from_value(item.get("profile"))?,
+            },
+        );
     }
 
     let mut opts = serde_json::Map::new();
     // Resolve the destination folder, then pick a non-colliding name within it.
-    let tdir = if dir.trim().is_empty() { download_dir() } else { std::path::PathBuf::from(dir.trim()) };
-    let base_name = if filename.trim().is_empty() { url_filename(&url) } else { filename.trim().to_string() };
+    let tdir = if dir.trim().is_empty() {
+        download_dir()
+    } else {
+        std::path::PathBuf::from(dir.trim())
+    };
+    let base_name = if filename.trim().is_empty() {
+        url_filename(&url)
+    } else {
+        filename.trim().to_string()
+    };
     let out = unique_out(&tdir, &base_name);
     opts.insert("dir".into(), json!(tdir.display().to_string()));
     opts.insert("out".into(), json!(out));
@@ -3953,7 +6717,8 @@ fn torrent_root_path(v: &Value) -> Option<String> {
             let path = std::path::Path::new(p);
             // The deepest ancestor named `info_name` is the torrent's root.
             for anc in path.ancestors() {
-                if anc.is_absolute() && anc.file_name().and_then(|n| n.to_str()) == Some(info_name) {
+                if anc.is_absolute() && anc.file_name().and_then(|n| n.to_str()) == Some(info_name)
+                {
                     return Some(anc.display().to_string());
                 }
             }
@@ -3966,26 +6731,27 @@ fn torrent_root_path(v: &Value) -> Option<String> {
 /// whole folder (all files + sub-folders); other downloads remove the single
 /// output file. Only ever touches absolute paths.
 fn delete_task_files(v: &Value) {
-    if v.get("bittorrent").is_some() {
-        if let Some(root) = torrent_root_path(v) {
-            let p = std::path::PathBuf::from(&root);
-            if p.is_dir() {
-                let _ = std::fs::remove_dir_all(&p);
-            } else {
-                let _ = std::fs::remove_file(&p);
-            }
-            let _ = std::fs::remove_file(format!("{root}.aria2"));
-            return;
+    if v.get("bittorrent").is_some()
+        && let Some(root) = torrent_root_path(v)
+    {
+        let p = std::path::PathBuf::from(&root);
+        if p.is_dir() {
+            let _ = std::fs::remove_dir_all(&p);
+        } else {
+            let _ = std::fs::remove_file(&p);
         }
-        // Fall through: delete each listed file if the root couldn't be derived.
+        let _ = std::fs::remove_file(format!("{root}.aria2"));
+        return;
     }
+    // Fall through: delete each listed file if the root couldn't be derived.
     if let Some(files) = v.get("files").and_then(|f| f.as_array()) {
         for f in files {
-            if let Some(p) = f.get("path").and_then(|p| p.as_str()) {
-                if !p.is_empty() && std::path::Path::new(p).is_absolute() {
-                    let _ = std::fs::remove_file(p);
-                    let _ = std::fs::remove_file(format!("{p}.aria2"));
-                }
+            if let Some(p) = f.get("path").and_then(|p| p.as_str())
+                && !p.is_empty()
+                && std::path::Path::new(p).is_absolute()
+            {
+                let _ = std::fs::remove_file(p);
+                let _ = std::fs::remove_file(format!("{p}.aria2"));
             }
         }
     }
@@ -3999,15 +6765,18 @@ async fn delete_file(gid: String) -> Result<(), String> {
     if gid.starts_with("site-") {
         if let Ok(mut jobs) = site_jobs().lock() {
             if rec.is_none() {
-                rec = jobs.iter().find(|j| j.get("gid").and_then(|g| g.as_str()) == Some(gid.as_str())).cloned();
+                rec = jobs
+                    .iter()
+                    .find(|j| j.get("gid").and_then(|g| g.as_str()) == Some(gid.as_str()))
+                    .cloned();
             }
             jobs.retain(|j| j.get("gid").and_then(|g| g.as_str()) != Some(gid.as_str()));
         }
     } else if !gid.starts_with("pend-") {
-        if rec.is_none() {
-            if let Ok(st) = client()?.tell_status(&gid).await {
-                rec = Some(st);
-            }
+        if rec.is_none()
+            && let Ok(st) = client()?.tell_status(&gid).await
+        {
+            rec = Some(st);
         }
         let _ = client()?.remove(&gid).await;
     }
@@ -4032,8 +6801,18 @@ fn rename_file(gid: String, new_name: String) -> Result<String, String> {
     let new_path = dest.display().to_string();
     let np = new_path.clone();
     update_history(&gid, move |j| {
-        let len = j.get("files").and_then(|f| f.get(0)).and_then(|f| f.get("length")).cloned().unwrap_or(json!("0"));
-        let uris = j.get("files").and_then(|f| f.get(0)).and_then(|f| f.get("uris")).cloned().unwrap_or(json!([]));
+        let len = j
+            .get("files")
+            .and_then(|f| f.get(0))
+            .and_then(|f| f.get("length"))
+            .cloned()
+            .unwrap_or(json!("0"));
+        let uris = j
+            .get("files")
+            .and_then(|f| f.get(0))
+            .and_then(|f| f.get("uris"))
+            .cloned()
+            .unwrap_or(json!([]));
         j["files"] = json!([{ "path": np, "length": len, "uris": uris }]);
     });
     Ok(new_path)
@@ -4058,8 +6837,18 @@ fn move_file(gid: String, new_dir: String) -> Result<String, String> {
     let new_path = dest.display().to_string();
     let np = new_path.clone();
     update_history(&gid, move |j| {
-        let len = j.get("files").and_then(|f| f.get(0)).and_then(|f| f.get("length")).cloned().unwrap_or(json!("0"));
-        let uris = j.get("files").and_then(|f| f.get(0)).and_then(|f| f.get("uris")).cloned().unwrap_or(json!([]));
+        let len = j
+            .get("files")
+            .and_then(|f| f.get(0))
+            .and_then(|f| f.get("length"))
+            .cloned()
+            .unwrap_or(json!("0"));
+        let uris = j
+            .get("files")
+            .and_then(|f| f.get(0))
+            .and_then(|f| f.get("uris"))
+            .cloned()
+            .unwrap_or(json!([]));
         j["files"] = json!([{ "path": np, "length": len, "uris": uris }]);
     });
     Ok(new_path)
@@ -4072,16 +6861,31 @@ fn set_organize(enable: bool) {
 
 // ---- Autostart on login (P5) ----
 
+fn desktop_exec_arg(path: &std::path::Path) -> String {
+    let escaped = path
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('`', "\\`")
+        .replace('$', "\\$")
+        .replace('%', "%%");
+    format!("\"{escaped}\"")
+}
+
 #[tauri::command]
 fn set_autostart(enable: bool) -> Result<(), String> {
     let dir = dirs::config_dir().ok_or("no config dir")?.join("autostart");
     let file = dir.join("downman.desktop");
     if enable {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let exe = std::env::var_os("APPIMAGE")
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_file())
+            .unwrap_or(std::env::current_exe().map_err(|e| e.to_string())?);
         let content = format!(
             "[Desktop Entry]\nType=Application\nName=DownMan\nComment=Download manager\nExec={} --hidden\nIcon=downman\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
-            exe.display()
+            desktop_exec_arg(&exe)
         );
         std::fs::write(&file, content).map_err(|e| e.to_string())?;
     } else {
@@ -4107,7 +6911,11 @@ async fn fetch_and_apply_trackers() -> Result<usize, String> {
         .text()
         .await
         .map_err(|e| e.to_string())?;
-    let list: Vec<&str> = txt.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+    let list: Vec<&str> = txt
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
     let count = list.len();
     if count == 0 {
         return Err("empty tracker list".into());
@@ -4126,7 +6934,12 @@ async fn update_trackers() -> Result<usize, String> {
 
 /// Resolve a human-friendly file name from an aria2 task value.
 fn task_name(t: &Value) -> String {
-    if let Some(n) = t.get("bittorrent").and_then(|b| b.get("info")).and_then(|i| i.get("name")).and_then(|n| n.as_str()) {
+    if let Some(n) = t
+        .get("bittorrent")
+        .and_then(|b| b.get("info"))
+        .and_then(|i| i.get("name"))
+        .and_then(|n| n.as_str())
+    {
         return n.to_string();
     }
     let p = t
@@ -4146,7 +6959,11 @@ fn task_name(t: &Value) -> String {
 /// shown or recorded: a magnet's metadata fetch (which spawns the real torrent,
 /// exposed via `followedBy`) or any `[METADATA]…` placeholder.
 fn is_superseded(t: &Value) -> bool {
-    if t.get("followedBy").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false) {
+    if t.get("followedBy")
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false)
+    {
         return true;
     }
     if task_name(t).starts_with("[METADATA]") {
@@ -4178,11 +6995,22 @@ fn av_scan_path(path: &str) {
     }
     let p = path.to_string();
     std::thread::spawn(move || {
-        if let Ok(out) = Command::new("clamscan").arg("--no-summary").arg("-i").arg(&p).output() {
+        if let Ok(out) = Command::new("clamscan")
+            .arg("--no-summary")
+            .arg("-i")
+            .arg(&p)
+            .output()
+        {
             // clamscan exits 1 when an infection is found.
             if out.status.code() == Some(1) {
-                let name = std::path::Path::new(&p).file_name().and_then(|n| n.to_str()).unwrap_or(&p);
-                notify("⚠ Threat detected", &format!("{name} was flagged by ClamAV"));
+                let name = std::path::Path::new(&p)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&p);
+                notify(
+                    "⚠ Threat detected",
+                    &format!("{name} was flagged by ClamAV"),
+                );
             }
         }
     });
@@ -4212,15 +7040,24 @@ fn fmt_speed(b: u64) -> String {
 
 /// Offer a copied link as a pending download (confirm sheet + probe).
 fn offer_clipboard_download(url: String) {
-    if let Ok(p) = pending().lock() {
-        if p.iter().any(|x| x.get("url").and_then(|u| u.as_str()) == Some(url.as_str())) {
-            return;
-        }
+    if let Ok(p) = pending().lock()
+        && p.iter()
+            .any(|x| x.get("url").and_then(|u| u.as_str()) == Some(url.as_str()))
+    {
+        return;
     }
     let id = format!("pend-{}", now_ms());
     let is_magnet = url.starts_with("magnet:");
-    let fname = if is_magnet { "Magnet link".to_string() } else { url_filename(&url) };
-    let cat = if is_magnet { "Torrents".to_string() } else { category_of(&fname).0 };
+    let fname = if is_magnet {
+        "Magnet link".to_string()
+    } else {
+        url_filename(&url)
+    };
+    let cat = if is_magnet {
+        "Torrents".to_string()
+    } else {
+        category_of(&fname).0
+    };
     notify("DownMan — copied link", &fname);
     if let Ok(mut p) = pending().lock() {
         p.push(json!({
@@ -4235,11 +7072,11 @@ fn offer_clipboard_download(url: String) {
             let (fname_opt, size) = probe_url(url, None).await;
             update_pending(&id2, |p| {
                 p["size"] = json!(size.to_string());
-                if let Some(f) = fname_opt {
-                    if !f.trim().is_empty() {
-                        p["category"] = json!(category_of(&f).0);
-                        p["filename"] = json!(f);
-                    }
+                if let Some(f) = fname_opt
+                    && !f.trim().is_empty()
+                {
+                    p["category"] = json!(category_of(&f).0);
+                    p["filename"] = json!(f);
                 }
                 p["status"] = json!("ready");
             });
@@ -4274,7 +7111,10 @@ fn start_clipboard_watch() {
                 continue; // a copied document, not a link
             }
             let first = txt.split_whitespace().next().unwrap_or("");
-            if !(first.starts_with("http://") || first.starts_with("https://") || first.starts_with("magnet:?")) {
+            if !(first.starts_with("http://")
+                || first.starts_with("https://")
+                || first.starts_with("magnet:?"))
+            {
                 continue;
             }
             // Only offer clearly-downloadable links (files, magnets, torrents) —
@@ -4290,8 +7130,13 @@ fn start_clipboard_watch() {
 /// True when NetworkManager says the active connection is (probably) metered.
 fn metered_now() -> Option<bool> {
     let out = Command::new("busctl")
-        .args(["get-property", "org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager",
-               "org.freedesktop.NetworkManager", "Metered"])
+        .args([
+            "get-property",
+            "org.freedesktop.NetworkManager",
+            "/org/freedesktop/NetworkManager",
+            "org.freedesktop.NetworkManager",
+            "Metered",
+        ])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -4304,35 +7149,47 @@ fn metered_now() -> Option<bool> {
 
 /// Pause everything while on a metered connection; resume when it clears.
 fn start_metered_watch() {
-    std::thread::spawn(|| loop {
-        std::thread::sleep(Duration::from_secs(15));
-        if !METERED_PAUSE.load(Ordering::Relaxed) {
-            if PAUSED_BY_METER.swap(false, Ordering::Relaxed) {
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(Duration::from_secs(15));
+            if !METERED_PAUSE.load(Ordering::Relaxed) {
+                if PAUSED_BY_METER.swap(false, Ordering::Relaxed)
+                    && let Some(c) = ARIA2.get()
+                {
+                    let _ = tauri::async_runtime::block_on(c.unpause_all());
+                }
+                continue;
+            }
+            let Some(metered) = metered_now() else {
+                continue;
+            };
+            let was = PAUSED_BY_METER.load(Ordering::Relaxed);
+            if metered && !was {
+                if let Some(c) = ARIA2.get() {
+                    let active = tauri::async_runtime::block_on(c.global_stat())
+                        .ok()
+                        .and_then(|s| {
+                            s.get("numActive")
+                                .and_then(|v| v.as_str())
+                                .and_then(|x| x.parse::<u64>().ok())
+                        })
+                        .unwrap_or(0);
+                    if active > 0 {
+                        let _ = tauri::async_runtime::block_on(c.pause_all());
+                        PAUSED_BY_METER.store(true, Ordering::Relaxed);
+                        notify(
+                            "⏸ Paused — metered connection",
+                            "Downloads resume automatically off the metered network.",
+                        );
+                    }
+                }
+            } else if !metered && was {
                 if let Some(c) = ARIA2.get() {
                     let _ = tauri::async_runtime::block_on(c.unpause_all());
                 }
+                PAUSED_BY_METER.store(false, Ordering::Relaxed);
+                notify("▶ Resumed", "Connection is no longer metered.");
             }
-            continue;
-        }
-        let Some(metered) = metered_now() else { continue };
-        let was = PAUSED_BY_METER.load(Ordering::Relaxed);
-        if metered && !was {
-            if let Some(c) = ARIA2.get() {
-                let active = tauri::async_runtime::block_on(c.global_stat()).ok()
-                    .and_then(|s| s.get("numActive").and_then(|v| v.as_str()).and_then(|x| x.parse::<u64>().ok()))
-                    .unwrap_or(0);
-                if active > 0 {
-                    let _ = tauri::async_runtime::block_on(c.pause_all());
-                    PAUSED_BY_METER.store(true, Ordering::Relaxed);
-                    notify("⏸ Paused — metered connection", "Downloads resume automatically off the metered network.");
-                }
-            }
-        } else if !metered && was {
-            if let Some(c) = ARIA2.get() {
-                let _ = tauri::async_runtime::block_on(c.unpause_all());
-            }
-            PAUSED_BY_METER.store(false, Ordering::Relaxed);
-            notify("▶ Resumed", "Connection is no longer metered.");
         }
     });
 }
@@ -4349,12 +7206,24 @@ fn start_telemetry() {
         loop {
             std::thread::sleep(Duration::from_secs(2));
             let Some(c) = ARIA2.get() else { continue };
-            let Ok(stat) = tauri::async_runtime::block_on(c.global_stat()) else { continue };
-            let num = |k: &str| stat.get(k).and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            let Ok(stat) = tauri::async_runtime::block_on(c.global_stat()) else {
+                continue;
+            };
+            let num = |k: &str| {
+                stat.get(k)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0)
+            };
             #[cfg(not(target_os = "linux"))]
             let speed = num("downloadSpeed");
-            let site_active = site_jobs().lock()
-                .map(|j| j.iter().filter(|x| x.get("status").and_then(|s| s.as_str()) == Some("active")).count() as u64)
+            let site_active = site_jobs()
+                .lock()
+                .map(|j| {
+                    j.iter()
+                        .filter(|x| x.get("status").and_then(|s| s.as_str()) == Some("active"))
+                        .count() as u64
+                })
                 .unwrap_or(0);
             let busy = num("numActive") + site_active;
 
@@ -4382,20 +7251,29 @@ fn start_telemetry() {
             if has_gdbus {
                 let mut done = 0u64;
                 let mut total = 0u64;
-                if let Ok(act) = tauri::async_runtime::block_on(c.tell_active()) {
-                    if let Some(arr) = act.as_array() {
-                        for t in arr {
-                            let g = |k: &str| t.get(k).and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-                            let tl = g("totalLength");
-                            if tl > 0 {
-                                total += tl;
-                                done += g("completedLength");
-                            }
+                if let Ok(act) = tauri::async_runtime::block_on(c.tell_active())
+                    && let Some(arr) = act.as_array()
+                {
+                    for t in arr {
+                        let g = |k: &str| {
+                            t.get(k)
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .unwrap_or(0)
+                        };
+                        let tl = g("totalLength");
+                        if tl > 0 {
+                            total += tl;
+                            done += g("completedLength");
                         }
                     }
                 }
                 let visible = busy > 0 && total > 0;
-                let pct = if total > 0 { ((done as f64 / total as f64) * 100.0) as i64 } else { -1 };
+                let pct = if total > 0 {
+                    ((done as f64 / total as f64) * 100.0) as i64
+                } else {
+                    -1
+                };
                 if (visible, pct) != last_dock {
                     last_dock = (visible, pct);
                     let frac = (pct.max(0) as f64) / 100.0;
@@ -4404,10 +7282,18 @@ fn start_telemetry() {
                         busy > 0
                     );
                     let _ = Command::new("gdbus")
-                        .args(["emit", "--session", "--object-path", "/app/downman/LauncherEntry",
-                               "--signal", "com.canonical.Unity.LauncherEntry.Update",
-                               "application://downman.desktop", &props])
-                        .stdout(Stdio::null()).stderr(Stdio::null())
+                        .args([
+                            "emit",
+                            "--session",
+                            "--object-path",
+                            "/app/downman/LauncherEntry",
+                            "--signal",
+                            "com.canonical.Unity.LauncherEntry.Update",
+                            "application://downman.desktop",
+                            &props,
+                        ])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
                         .status();
                 }
             }
@@ -4416,14 +7302,23 @@ fn start_telemetry() {
             let mut guard = inhibitor().lock().unwrap_or_else(|e| e.into_inner());
             if has_inhibit && POWER_BLOCK.load(Ordering::Relaxed) && busy > 0 {
                 if guard.is_none() {
-                    *guard = Command::new("systemd-inhibit")
-                        .args(["--what=sleep:idle", "--who=DownMan", "--why=Downloads in progress", "--mode=block", "sleep", "infinity"])
-                        .stdout(Stdio::null()).stderr(Stdio::null())
-                        .spawn().ok();
+                    let mut command = Command::new("systemd-inhibit");
+                    command
+                        .args([
+                            "--what=sleep:idle",
+                            "--who=DownMan",
+                            "--why=Downloads in progress",
+                            "--mode=block",
+                            "sleep",
+                            "infinity",
+                        ])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null());
+                    command.process_group(0);
+                    *guard = command.spawn().ok();
                 }
-            } else if let Some(mut ch) = guard.take() {
-                let _ = ch.kill();
-                let _ = ch.wait();
+            } else if let Some(child) = guard.take() {
+                stop_process_group(child);
             }
         }
     });
@@ -4480,128 +7375,187 @@ fn start_watcher() {
             // aria2 finished downloads.
             if let Some(c) = ARIA2.get() {
                 if let Ok(stat) = tauri::async_runtime::block_on(c.global_stat()) {
-                    let a = stat.get("numActive").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-                    let w = stat.get("numWaiting").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                    let a = stat
+                        .get("numActive")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    let w = stat
+                        .get("numWaiting")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0);
                     active_count += a + w;
                 }
-                if let Ok(stopped) = tauri::async_runtime::block_on(c.tell_stopped()) {
-                    if let Some(arr) = stopped.as_array() {
-                        for t in arr {
-                            if t.get("status").and_then(|s| s.as_str()) != Some("complete") {
-                                continue;
-                            }
-                            let gid = t.get("gid").and_then(|g| g.as_str()).unwrap_or("").to_string();
-                            if gid.is_empty() || seen.contains(&gid) {
-                                continue;
-                            }
-                            seen.insert(gid.clone());
-                            let name = task_name(t);
-                            // A finished download clears its auto-retry history.
-                            if let Ok(mut m) = retries().lock() {
-                                m.remove(&url_of_task(t));
-                            }
-                            // A magnet's metadata fetch is superseded by the real torrent it
-                            // spawns (via `followedBy`); never record the placeholder as a
-                            // finished download.
-                            if is_superseded(t) {
-                                continue;
-                            }
-                            // A re-download landed in a temp file: validate + swap it, drop the
-                            // ephemeral task, and skip history/notify — the original entry
-                            // already represents this file (so no duplicate/junk row lingers).
-                            if let Some((final_path, ext)) = redl_target().lock().ok().and_then(|mut m| m.remove(&gid)) {
-                                let temp_path = t.get("files").and_then(|f| f.get(0)).and_then(|f| f.get("path")).and_then(|p| p.as_str()).unwrap_or("").to_string();
-                                finish_redownload(&temp_path, &final_path, &ext);
-                                let _ = tauri::async_runtime::block_on(c.remove(&gid));
-                                continue;
-                            }
-                            let mut path = t.get("files").and_then(|f| f.get(0)).and_then(|f| f.get("path")).and_then(|p| p.as_str()).unwrap_or("").to_string();
-                            let is_torrent = t.get("bittorrent").is_some();
-                            let skip_org = no_organize().lock().map(|s| s.contains(&gid)).unwrap_or(false);
-                            if ORGANIZE.load(Ordering::Relaxed) && !is_torrent && !skip_org && !path.is_empty() {
-                                path = organize_path(&path);
-                            }
-                            // Snapshot the finished download into persistent history.
-                            let mut rec = t.clone();
-                            rec["status"] = json!("complete");
-                            rec["completedAt"] = json!(now_ms() as u64);
-                            if is_torrent {
-                                // Keep aria2's full multi-file list (per-file path/size/progress)
-                                // so the details view shows every file and sub-folder. Torrents
-                                // aren't reorganized, so the original absolute paths stay valid.
-                            } else {
-                                // Single-file downloads may have been moved into a category folder;
-                                // store one entry reflecting the final on-disk path.
-                                let uris = t.get("files").and_then(|f| f.get(0)).and_then(|f| f.get("uris")).cloned().unwrap_or(json!([]));
-                                let len = t.get("totalLength").cloned().unwrap_or(json!("0"));
-                                rec["files"] = json!([{ "path": path, "length": len, "uris": uris }]);
-                            }
-                            record_history(rec);
-                            unreserve(&path);
-                            // Auto-remove aria2's saved upload-metadata .torrent now it's done.
-                            if let Some(meta) = torrent_meta().lock().ok().and_then(|mut m| m.remove(&gid)) {
-                                let _ = std::fs::remove_file(&meta);
-                            }
-                            if primed {
-                                notify("✓ Download complete", &name);
-                                av_scan_path(&path);
-                                maybe_extract(&path);
-                                run_on_complete(&gid, &path, &name);
-                            }
+                if let Ok(stopped) = tauri::async_runtime::block_on(c.tell_stopped())
+                    && let Some(arr) = stopped.as_array()
+                {
+                    for t in arr {
+                        if t.get("status").and_then(|s| s.as_str()) != Some("complete") {
+                            continue;
                         }
-                        // ---- Auto-retry transient failures ----
-                        // Network-ish errors get re-added with backoff (max 3 tries);
-                        // hard failures (404, disk full, duplicate) stay as errors.
-                        for t in arr {
-                            if t.get("status").and_then(|s| s.as_str()) != Some("error") {
-                                continue;
-                            }
-                            let gid = t.get("gid").and_then(|g| g.as_str()).unwrap_or("").to_string();
-                            if gid.is_empty() || retried.contains(&gid) {
-                                continue;
-                            }
-                            retried.insert(gid.clone());
-                            if !primed {
-                                continue; // failures that pre-date this session aren't ours to retry
-                            }
-                            let code = t.get("errorCode").and_then(|x| x.as_str()).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
-                            if !matches!(code, 1 | 2 | 5 | 6 | 19 | 22 | 23) {
-                                continue;
-                            }
-                            let url = url_of_task(t);
-                            if !url.starts_with("http") {
-                                continue;
-                            }
-                            let n = {
-                                let mut m = retries().lock().unwrap_or_else(|e| e.into_inner());
-                                let e = m.entry(url.clone()).or_insert(0);
-                                *e += 1;
-                                *e
-                            };
-                            if n > 3 {
-                                continue;
-                            }
-                            let dir = t.get("dir").and_then(|d| d.as_str()).unwrap_or("").to_string();
-                            let out = t.get("files").and_then(|f| f.get(0)).and_then(|f| f.get("path")).and_then(|p| p.as_str())
-                                .and_then(|p| p.strip_prefix(&format!("{dir}/")).map(String::from))
-                                .filter(|s| !s.is_empty() && !s.contains('/'));
-                            let gid2 = gid.clone();
-                            std::thread::spawn(move || {
-                                std::thread::sleep(Duration::from_secs(5u64 << (n - 1).min(3)));
-                                let Some(c) = ARIA2.get() else { return };
-                                let mut opts = serde_json::Map::new();
-                                if !dir.is_empty() {
-                                    opts.insert("dir".into(), json!(dir));
-                                }
-                                if let Some(o) = out {
-                                    opts.insert("out".into(), json!(o));
-                                }
-                                if let Ok(new_gid) = tauri::async_runtime::block_on(c.add_uri(vec![url], Value::Object(opts))) {
-                                    mark_download_added(&new_gid);
-                                    let _ = tauri::async_runtime::block_on(c.remove(&gid2));
-                                }
-                            });
+                        let gid = t
+                            .get("gid")
+                            .and_then(|g| g.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if gid.is_empty() || seen.contains(&gid) {
+                            continue;
                         }
+                        seen.insert(gid.clone());
+                        let name = task_name(t);
+                        // A finished download clears its auto-retry history.
+                        if let Ok(mut m) = retries().lock() {
+                            m.remove(&url_of_task(t));
+                        }
+                        // A magnet's metadata fetch is superseded by the real torrent it
+                        // spawns (via `followedBy`); never record the placeholder as a
+                        // finished download.
+                        if is_superseded(t) {
+                            continue;
+                        }
+                        // A re-download landed in a temp file: validate + swap it, drop the
+                        // ephemeral task, and skip history/notify — the original entry
+                        // already represents this file (so no duplicate/junk row lingers).
+                        if let Some((final_path, ext)) =
+                            redl_target().lock().ok().and_then(|mut m| m.remove(&gid))
+                        {
+                            let temp_path = t
+                                .get("files")
+                                .and_then(|f| f.get(0))
+                                .and_then(|f| f.get("path"))
+                                .and_then(|p| p.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            finish_redownload(&temp_path, &final_path, &ext);
+                            let _ = tauri::async_runtime::block_on(c.remove(&gid));
+                            continue;
+                        }
+                        let mut path = t
+                            .get("files")
+                            .and_then(|f| f.get(0))
+                            .and_then(|f| f.get("path"))
+                            .and_then(|p| p.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let is_torrent = t.get("bittorrent").is_some();
+                        let skip_org = no_organize()
+                            .lock()
+                            .map(|s| s.contains(&gid))
+                            .unwrap_or(false);
+                        if ORGANIZE.load(Ordering::Relaxed)
+                            && !is_torrent
+                            && !skip_org
+                            && !path.is_empty()
+                        {
+                            path = organize_path(&path);
+                        }
+                        // Snapshot the finished download into persistent history.
+                        let mut rec = t.clone();
+                        rec["status"] = json!("complete");
+                        rec["completedAt"] = json!(now_ms() as u64);
+                        if is_torrent {
+                            // Keep aria2's full multi-file list (per-file path/size/progress)
+                            // so the details view shows every file and sub-folder. Torrents
+                            // aren't reorganized, so the original absolute paths stay valid.
+                        } else {
+                            // Single-file downloads may have been moved into a category folder;
+                            // store one entry reflecting the final on-disk path.
+                            let uris = t
+                                .get("files")
+                                .and_then(|f| f.get(0))
+                                .and_then(|f| f.get("uris"))
+                                .cloned()
+                                .unwrap_or(json!([]));
+                            let len = t.get("totalLength").cloned().unwrap_or(json!("0"));
+                            rec["files"] = json!([{ "path": path, "length": len, "uris": uris }]);
+                        }
+                        record_history(rec);
+                        unreserve(&path);
+                        // Auto-remove aria2's saved upload-metadata .torrent now it's done.
+                        if let Some(meta) =
+                            torrent_meta().lock().ok().and_then(|mut m| m.remove(&gid))
+                        {
+                            let _ = std::fs::remove_file(&meta);
+                        }
+                        if primed {
+                            notify("✓ Download complete", &name);
+                            av_scan_path(&path);
+                            maybe_extract(&path);
+                            run_on_complete(&gid, &path, &name);
+                        }
+                    }
+                    // ---- Auto-retry transient failures ----
+                    // Network-ish errors get re-added with backoff (max 3 tries);
+                    // hard failures (404, disk full, duplicate) stay as errors.
+                    for t in arr {
+                        if t.get("status").and_then(|s| s.as_str()) != Some("error") {
+                            continue;
+                        }
+                        let gid = t
+                            .get("gid")
+                            .and_then(|g| g.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if gid.is_empty() || retried.contains(&gid) {
+                            continue;
+                        }
+                        retried.insert(gid.clone());
+                        if !primed {
+                            continue; // failures that pre-date this session aren't ours to retry
+                        }
+                        let code = t
+                            .get("errorCode")
+                            .and_then(|x| x.as_str())
+                            .and_then(|s| s.parse::<u32>().ok())
+                            .unwrap_or(0);
+                        if !matches!(code, 1 | 2 | 5 | 6 | 19 | 22 | 23) {
+                            continue;
+                        }
+                        let url = url_of_task(t);
+                        if !url.starts_with("http") {
+                            continue;
+                        }
+                        let n = {
+                            let mut m = retries().lock().unwrap_or_else(|e| e.into_inner());
+                            let e = m.entry(url.clone()).or_insert(0);
+                            *e += 1;
+                            *e
+                        };
+                        if n > 3 {
+                            continue;
+                        }
+                        let dir = t
+                            .get("dir")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let out = t
+                            .get("files")
+                            .and_then(|f| f.get(0))
+                            .and_then(|f| f.get("path"))
+                            .and_then(|p| p.as_str())
+                            .and_then(|p| p.strip_prefix(&format!("{dir}/")).map(String::from))
+                            .filter(|s| !s.is_empty() && !s.contains('/'));
+                        let gid2 = gid.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_secs(5u64 << (n - 1).min(3)));
+                            let Some(c) = ARIA2.get() else { return };
+                            let mut opts = serde_json::Map::new();
+                            if !dir.is_empty() {
+                                opts.insert("dir".into(), json!(dir));
+                            }
+                            if let Some(o) = out {
+                                opts.insert("out".into(), json!(o));
+                            }
+                            if let Ok(new_gid) = tauri::async_runtime::block_on(
+                                c.add_uri(vec![url], Value::Object(opts)),
+                            ) {
+                                mark_download_added(&new_gid);
+                                transfer_job_metadata(&gid2, &new_gid);
+                                let _ = tauri::async_runtime::block_on(c.remove(&gid2));
+                            }
+                        });
                     }
                 }
             }
@@ -4617,7 +7571,11 @@ fn start_watcher() {
                     if status != "complete" {
                         continue;
                     }
-                    let gid = j.get("gid").and_then(|g| g.as_str()).unwrap_or("").to_string();
+                    let gid = j
+                        .get("gid")
+                        .and_then(|g| g.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     if gid.is_empty() || seen.contains(&gid) {
                         continue;
                     }
@@ -4626,19 +7584,34 @@ fn start_watcher() {
                 }
             }
             for j in &newly_site {
-                let path = j.get("files").and_then(|f| f.get(0)).and_then(|f| f.get("path")).and_then(|p| p.as_str()).unwrap_or("").to_string();
+                let path = j
+                    .get("files")
+                    .and_then(|f| f.get(0))
+                    .and_then(|f| f.get("path"))
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let mut rec = j.clone();
                 rec["completedAt"] = json!(now_ms() as u64);
                 record_history(rec);
                 if primed {
-                    let name = std::path::Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or("video").to_string();
+                    let name = std::path::Path::new(&path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("video")
+                        .to_string();
                     notify("✓ Download complete", &name);
                 }
             }
             if !newly_site.is_empty() {
-                let gids: HashSet<String> = newly_site.iter().filter_map(|j| j.get("gid").and_then(|g| g.as_str()).map(String::from)).collect();
+                let gids: HashSet<String> = newly_site
+                    .iter()
+                    .filter_map(|j| j.get("gid").and_then(|g| g.as_str()).map(String::from))
+                    .collect();
                 if let Ok(mut jobs) = site_jobs().lock() {
-                    jobs.retain(|j| !gids.contains(j.get("gid").and_then(|g| g.as_str()).unwrap_or("")));
+                    jobs.retain(|j| {
+                        !gids.contains(j.get("gid").and_then(|g| g.as_str()).unwrap_or(""))
+                    });
                 }
             }
             primed = true;
@@ -4681,11 +7654,19 @@ fn grabs() -> &'static Mutex<HashMap<String, GrabState>> {
     GRABS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-static ANCHOR_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?is)<a\b[^>]*?href\s*=\s*["']([^"']+)["'][^>]*?>(.*?)</a>"#).unwrap());
-static HREF_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)href\s*=\s*["']([^"']+)["']"#).unwrap());
-static SRC_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)(?:src|data-src|data-original|poster)\s*=\s*["']([^"']+)["']"#).unwrap());
-static SRCSET_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)srcset\s*=\s*["']([^"']+)["']"#).unwrap());
-static JSURL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)["'](https?://[^"'\s]+\.[a-z0-9]{2,6}(?:\?[^"'\s]*)?)["']"#).unwrap());
+static ANCHOR_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?is)<a\b[^>]*?href\s*=\s*["']([^"']+)["'][^>]*?>(.*?)</a>"#).unwrap()
+});
+static HREF_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"(?i)href\s*=\s*["']([^"']+)["']"#).unwrap());
+static SRC_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?i)(?:src|data-src|data-original|poster)\s*=\s*["']([^"']+)["']"#).unwrap()
+});
+static SRCSET_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"(?i)srcset\s*=\s*["']([^"']+)["']"#).unwrap());
+static JSURL_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?i)["'](https?://[^"'\s]+\.[a-z0-9]{2,6}(?:\?[^"'\s]*)?)["']"#).unwrap()
+});
 
 fn strip_tags(s: &str) -> String {
     let mut out = String::new();
@@ -4698,11 +7679,19 @@ fn strip_tags(s: &str) -> String {
             _ => {}
         }
     }
-    out.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(80).collect()
+    out.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(80)
+        .collect()
 }
 
 fn host_of(url: &str) -> String {
-    reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(|h| h.to_string())).unwrap_or_default()
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_default()
 }
 
 fn registrable(host: &str) -> String {
@@ -4715,7 +7704,10 @@ fn registrable(host: &str) -> String {
 }
 
 fn ext_of(url: &str) -> String {
-    let path = reqwest::Url::parse(url).ok().map(|u| u.path().to_string()).unwrap_or_default();
+    let path = reqwest::Url::parse(url)
+        .ok()
+        .map(|u| u.path().to_string())
+        .unwrap_or_default();
     let seg = path.rsplit('/').next().unwrap_or("");
     if let Some(dot) = seg.rfind('.') {
         let e = &seg[dot + 1..];
@@ -4729,7 +7721,10 @@ fn ext_of(url: &str) -> String {
 fn grab_file_name(url: &str) -> String {
     reqwest::Url::parse(url)
         .ok()
-        .and_then(|u| u.path_segments().and_then(|s| s.last().map(|x| x.to_string())))
+        .and_then(|u| {
+            u.path_segments()
+                .and_then(|mut s| s.next_back().map(|x| x.to_string()))
+        })
         .filter(|s| !s.is_empty())
         .map(|s| percent_decode(&s))
         .unwrap_or_else(|| url.to_string())
@@ -4739,7 +7734,23 @@ fn grab_file_name(url: &str) -> String {
 fn sanitize_seg(s: &str) -> String {
     let t: String = s
         .chars()
-        .map(|c| if c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|' || c.is_control() { '_' } else { c })
+        .map(|c| {
+            if c == '/'
+                || c == '\\'
+                || c == ':'
+                || c == '*'
+                || c == '?'
+                || c == '"'
+                || c == '<'
+                || c == '>'
+                || c == '|'
+                || c.is_control()
+            {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
     let t = t.trim().trim_matches('.').to_string();
     if t == "." || t == ".." {
@@ -4751,17 +7762,17 @@ fn sanitize_seg(s: &str) -> String {
 
 /// The directory part of a URL path (everything but the filename), sanitized.
 fn url_path_dir(url: &str) -> String {
-    if let Ok(u) = reqwest::Url::parse(url) {
-        if let Some(segs) = u.path_segments() {
-            let parts: Vec<String> = segs.map(percent_decode).collect();
-            if parts.len() > 1 {
-                return parts[..parts.len() - 1]
-                    .iter()
-                    .map(|s| sanitize_seg(s))
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("/");
-            }
+    if let Ok(u) = reqwest::Url::parse(url)
+        && let Some(segs) = u.path_segments()
+    {
+        let parts: Vec<String> = segs.map(percent_decode).collect();
+        if parts.len() > 1 {
+            return parts[..parts.len() - 1]
+                .iter()
+                .map(|s| sanitize_seg(s))
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("/");
         }
     }
     String::new()
@@ -4772,7 +7783,12 @@ fn grab_filters(v: Option<&Value>) -> Vec<String> {
         .map(|a| {
             a.iter()
                 .filter_map(|x| x.as_str())
-                .map(|s| s.trim().trim_start_matches("*.").trim_start_matches('.').to_lowercase())
+                .map(|s| {
+                    s.trim()
+                        .trim_start_matches("*.")
+                        .trim_start_matches('.')
+                        .to_lowercase()
+                })
                 .filter(|s| !s.is_empty() && s != "*")
                 .collect()
         })
@@ -4793,12 +7809,28 @@ fn grab_filter_match(ext: &str, include: &[String], exclude: &[String]) -> bool 
 }
 
 fn is_page_ext(ext: &str) -> bool {
-    ext.is_empty() || matches!(ext, "html" | "htm" | "php" | "asp" | "aspx" | "jsp" | "cgi" | "xhtml" | "shtml")
+    ext.is_empty()
+        || matches!(
+            ext,
+            "html" | "htm" | "php" | "asp" | "aspx" | "jsp" | "cgi" | "xhtml" | "shtml"
+        )
 }
 
-fn push_link(base: &reqwest::Url, raw: &str, text: String, out: &mut Vec<(String, String)>, seen: &mut HashSet<String>) {
+fn push_link(
+    base: &reqwest::Url,
+    raw: &str,
+    text: String,
+    out: &mut Vec<(String, String)>,
+    seen: &mut HashSet<String>,
+) {
     let raw = raw.trim();
-    if raw.is_empty() || raw.starts_with('#') || raw.starts_with("mailto:") || raw.starts_with("javascript:") || raw.starts_with("data:") || raw.starts_with("tel:") {
+    if raw.is_empty()
+        || raw.starts_with('#')
+        || raw.starts_with("mailto:")
+        || raw.starts_with("javascript:")
+        || raw.starts_with("data:")
+        || raw.starts_with("tel:")
+    {
         return;
     }
     if let Ok(mut abs) = base.join(raw) {
@@ -4826,47 +7858,84 @@ fn extract_links(html: &str, base_url: &str, process_js: bool) -> Vec<(String, S
         push_link(&base, href, text, &mut out, &mut seen);
     }
     for cap in HREF_RE.captures_iter(html) {
-        push_link(&base, cap.get(1).map(|m| m.as_str()).unwrap_or(""), String::new(), &mut out, &mut seen);
+        push_link(
+            &base,
+            cap.get(1).map(|m| m.as_str()).unwrap_or(""),
+            String::new(),
+            &mut out,
+            &mut seen,
+        );
     }
     for cap in SRC_RE.captures_iter(html) {
-        push_link(&base, cap.get(1).map(|m| m.as_str()).unwrap_or(""), String::new(), &mut out, &mut seen);
+        push_link(
+            &base,
+            cap.get(1).map(|m| m.as_str()).unwrap_or(""),
+            String::new(),
+            &mut out,
+            &mut seen,
+        );
     }
     for cap in SRCSET_RE.captures_iter(html) {
         for part in cap.get(1).map(|m| m.as_str()).unwrap_or("").split(',') {
-            if let Some(u) = part.trim().split_whitespace().next() {
+            if let Some(u) = part.split_whitespace().next() {
                 push_link(&base, u, String::new(), &mut out, &mut seen);
             }
         }
     }
     if process_js {
         for cap in JSURL_RE.captures_iter(html) {
-            push_link(&base, cap.get(1).map(|m| m.as_str()).unwrap_or(""), String::new(), &mut out, &mut seen);
+            push_link(
+                &base,
+                cap.get(1).map(|m| m.as_str()).unwrap_or(""),
+                String::new(),
+                &mut out,
+                &mut seen,
+            );
         }
     }
     out
 }
 
-async fn fetch_text(client: &reqwest::Client, url: &str, referer: &Option<String>, cookies: &Option<String>) -> Result<String, String> {
+async fn fetch_text(
+    client: &reqwest::Client,
+    url: &str,
+    referer: &Option<String>,
+    cookies: &Option<String>,
+) -> Result<String, String> {
     let mut req = client.get(url);
-    if let Some(r) = referer {
-        if !r.is_empty() {
-            req = req.header(reqwest::header::REFERER, r.clone());
-        }
+    if let Some(r) = referer
+        && !r.is_empty()
+    {
+        req = req.header(reqwest::header::REFERER, r.clone());
     }
-    if let Some(c) = cookies {
-        if !c.is_empty() {
-            req = req.header(reqwest::header::COOKIE, c.clone());
-        }
+    if let Some(c) = cookies
+        && !c.is_empty()
+    {
+        req = req.header(reqwest::header::COOKIE, c.clone());
     }
-    let resp = req.send().await.map_err(|e| format!("Could not fetch page: {e}"))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("Could not fetch page: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("The site returned HTTP {}.", resp.status().as_u16()));
+        return Err(format!(
+            "The site returned HTTP {}.",
+            resp.status().as_u16()
+        ));
     }
-    let ct = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
+    let ct = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
     if !ct.is_empty() && !ct.contains("html") && !ct.contains("xml") && !ct.contains("text") {
         return Err(format!("The URL returned {ct}, not a web page."));
     }
-    let body = resp.text().await.map_err(|e| format!("Could not read page: {e}"))?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("Could not read page: {e}"))?;
     if body.len() > 4_000_000 {
         let mut n = 4_000_000;
         while n > 0 && !body.is_char_boundary(n) {
@@ -4878,24 +7947,46 @@ async fn fetch_text(client: &reqwest::Client, url: &str, referer: &Option<String
 }
 
 async fn run_crawl(id: String, project: Value, cancel: Arc<AtomicBool>) {
-    let start = project.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
+    let start = project
+        .get("url")
+        .and_then(|u| u.as_str())
+        .unwrap_or("")
+        .to_string();
     if start.is_empty() {
-        if let Ok(mut g) = grabs().lock() {
-            if let Some(st) = g.get_mut(&id) {
-                st.status = "error".into();
-            }
+        if let Ok(mut g) = grabs().lock()
+            && let Some(st) = g.get_mut(&id)
+        {
+            st.status = "error".into();
         }
         return;
     }
     let levels = project.get("levels").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
-    let other_levels = project.get("otherLevels").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-    let same_site_only = project.get("sameSiteOnly").and_then(|v| v.as_bool()).unwrap_or(false);
-    let whole_domain = project.get("wholeDomain").and_then(|v| v.as_bool()).unwrap_or(true);
-    let process_js = project.get("processJs").and_then(|v| v.as_bool()).unwrap_or(false);
+    let other_levels = project
+        .get("otherLevels")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    let same_site_only = project
+        .get("sameSiteOnly")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let whole_domain = project
+        .get("wholeDomain")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let process_js = project
+        .get("processJs")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let include = grab_filters(project.get("include"));
     let exclude = grab_filters(project.get("exclude"));
-    let referer = project.get("referer").and_then(|v| v.as_str()).map(String::from);
-    let cookies = project.get("cookies").and_then(|v| v.as_str()).map(String::from);
+    let referer = project
+        .get("referer")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let cookies = project
+        .get("cookies")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let base_host = host_of(&start);
     let reg_domain = registrable(&base_host);
 
@@ -4921,27 +8012,27 @@ async fn run_crawl(id: String, project: Value, cancel: Arc<AtomicBool>) {
         visited.insert(url.clone());
 
         let html = fetch_text(&client, &url, &referer, &cookies).await;
-        if let Ok(mut g) = grabs().lock() {
-            if let Some(st) = g.get_mut(&id) {
-                st.pages += 1;
-            }
+        if let Ok(mut g) = grabs().lock()
+            && let Some(st) = g.get_mut(&id)
+        {
+            st.pages += 1;
         }
         let html = match html {
             Ok(h) => h,
             Err(error) if depth == 0 => {
-                if let Ok(mut g) = grabs().lock() {
-                    if let Some(st) = g.get_mut(&id) {
-                        st.status = "error".into();
-                        st.error = error;
-                    }
+                if let Ok(mut g) = grabs().lock()
+                    && let Some(st) = g.get_mut(&id)
+                {
+                    st.status = "error".into();
+                    st.error = error;
                 }
                 return;
             }
             Err(_) => {
-                if let Ok(mut g) = grabs().lock() {
-                    if let Some(st) = g.get_mut(&id) {
-                        st.failed_pages += 1;
-                    }
+                if let Ok(mut g) = grabs().lock()
+                    && let Some(st) = g.get_mut(&id)
+                {
+                    st.failed_pages += 1;
                 }
                 continue;
             }
@@ -4956,25 +8047,24 @@ async fn run_crawl(id: String, project: Value, cancel: Arc<AtomicBool>) {
             };
             let ext = ext_of(&link);
 
-            if grab_filter_match(&ext, &include, &exclude) {
-                if let Ok(mut g) = grabs().lock() {
-                    if let Some(st) = g.get_mut(&id) {
-                        if st.files.len() < max_files && st.seen.insert(link.clone()) {
-                            st.files.push(json!({
-                                "url": link.clone(), "name": grab_file_name(&link),
-                                "type": ext.to_uppercase(), "size": -1,
-                                "linkText": text, "source": url.clone(), "host": lh.clone()
-                            }));
-                        }
-                    }
-                }
+            if grab_filter_match(&ext, &include, &exclude)
+                && let Ok(mut g) = grabs().lock()
+                && let Some(st) = g.get_mut(&id)
+                && st.files.len() < max_files
+                && st.seen.insert(link.clone())
+            {
+                st.files.push(json!({
+                    "url": link.clone(), "name": grab_file_name(&link),
+                    "type": ext.to_uppercase(), "size": -1,
+                    "linkText": text, "source": url.clone(), "host": lh.clone()
+                }));
             }
 
             if is_page_ext(&ext) {
                 let allow = if same_domain {
-                    depth + 1 <= levels
+                    depth < levels
                 } else {
-                    !same_site_only && depth + 1 <= other_levels
+                    !same_site_only && depth < other_levels
                 };
                 if allow && !visited.contains(&link) && frontier.len() < 8000 {
                     frontier.push_back((link, depth + 1));
@@ -4983,19 +8073,27 @@ async fn run_crawl(id: String, project: Value, cancel: Arc<AtomicBool>) {
         }
     }
 
-    if let Ok(mut g) = grabs().lock() {
-        if let Some(st) = g.get_mut(&id) {
-            if st.status == "exploring" {
-                st.status = if cancel.load(Ordering::Relaxed) { "cancelled".into() } else { "done".into() };
-            }
-        }
+    if let Ok(mut g) = grabs().lock()
+        && let Some(st) = g.get_mut(&id)
+        && st.status == "exploring"
+    {
+        st.status = if cancel.load(Ordering::Relaxed) {
+            "cancelled".into()
+        } else {
+            "done".into()
+        };
     }
 }
 
 #[tauri::command]
 fn grabber_start(project: Value) -> Result<String, String> {
-    let start = project.get("url").and_then(|u| u.as_str()).unwrap_or("").trim();
-    let parsed = reqwest::Url::parse(start).map_err(|_| "Enter a valid http(s) page URL.".to_string())?;
+    let start = project
+        .get("url")
+        .and_then(|u| u.as_str())
+        .unwrap_or("")
+        .trim();
+    let parsed =
+        reqwest::Url::parse(start).map_err(|_| "Enter a valid http(s) page URL.".to_string())?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err("Enter a valid http(s) page URL.".into());
     }
@@ -5003,14 +8101,27 @@ fn grabber_start(project: Value) -> Result<String, String> {
     let cancel = Arc::new(AtomicBool::new(false));
     if let Ok(mut g) = grabs().lock() {
         if g.len() > 8 {
-            let done: Vec<String> = g.iter().filter(|(_, s)| s.status != "exploring").map(|(k, _)| k.clone()).collect();
+            let done: Vec<String> = g
+                .iter()
+                .filter(|(_, s)| s.status != "exploring")
+                .map(|(k, _)| k.clone())
+                .collect();
             for k in done {
                 g.remove(&k);
             }
         }
         g.insert(
             id.clone(),
-            GrabState { status: "exploring".into(), error: String::new(), failed_pages: 0, pages: 0, files: vec![], seen: HashSet::new(), cancel: cancel.clone(), project: project.clone() },
+            GrabState {
+                status: "exploring".into(),
+                error: String::new(),
+                failed_pages: 0,
+                pages: 0,
+                files: vec![],
+                seen: HashSet::new(),
+                cancel: cancel.clone(),
+                project: project.clone(),
+            },
         );
     }
     let id2 = id.clone();
@@ -5022,22 +8133,22 @@ fn grabber_start(project: Value) -> Result<String, String> {
 
 #[tauri::command]
 fn grabber_get(id: String) -> Value {
-    if let Ok(g) = grabs().lock() {
-        if let Some(st) = g.get(&id) {
-            return json!({ "status": st.status, "error": st.error, "failedPages": st.failed_pages, "pages": st.pages, "total": st.files.len(), "files": st.files });
-        }
+    if let Ok(g) = grabs().lock()
+        && let Some(st) = g.get(&id)
+    {
+        return json!({ "status": st.status, "error": st.error, "failedPages": st.failed_pages, "pages": st.pages, "total": st.files.len(), "files": st.files });
     }
     json!({ "status": "unknown", "pages": 0, "total": 0, "files": [] })
 }
 
 #[tauri::command]
 fn grabber_cancel(id: String) {
-    if let Ok(mut g) = grabs().lock() {
-        if let Some(st) = g.get_mut(&id) {
-            st.cancel.store(true, Ordering::Relaxed);
-            if st.status == "exploring" {
-                st.status = "cancelled".into();
-            }
+    if let Ok(mut g) = grabs().lock()
+        && let Some(st) = g.get_mut(&id)
+    {
+        st.cancel.store(true, Ordering::Relaxed);
+        if st.status == "exploring" {
+            st.status = "cancelled".into();
         }
     }
 }
@@ -5048,9 +8159,19 @@ async fn grabber_download(id: String, urls: Vec<String>) -> Result<Value, String
         let g = grabs().lock().map_err(|_| "lock")?;
         let st = g.get(&id).ok_or("not found")?;
         (
-            st.project.get("referer").and_then(|v| v.as_str()).map(String::from),
-            st.project.get("cookies").and_then(|v| v.as_str()).map(String::from),
-            st.project.get("layout").and_then(|v| v.as_str()).unwrap_or("site").to_string(),
+            st.project
+                .get("referer")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            st.project
+                .get("cookies")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            st.project
+                .get("layout")
+                .and_then(|v| v.as_str())
+                .unwrap_or("site")
+                .to_string(),
         )
     };
     let c = client()?;
@@ -5058,19 +8179,23 @@ async fn grabber_download(id: String, urls: Vec<String>) -> Result<Value, String
     let mut failed_urls: Vec<String> = Vec::new();
     for url in urls {
         let mut opts = serde_json::Map::new();
-        if let Some(r) = &referer {
-            if !r.is_empty() {
-                opts.insert("referer".into(), json!(r));
-            }
+        if let Some(r) = &referer
+            && !r.is_empty()
+        {
+            opts.insert("referer".into(), json!(r));
         }
-        if let Some(ck) = &cookies {
-            if !ck.is_empty() {
-                opts.insert("header".into(), json!([format!("Cookie: {}", ck)]));
-            }
+        if let Some(ck) = &cookies
+            && !ck.is_empty()
+        {
+            opts.insert("header".into(), json!([format!("Cookie: {}", ck)]));
         }
         let fname = url_filename(&url);
         let host = sanitize_seg(&host_of(&url));
-        let base = download_dir().join("SiteGrab").join(if host.is_empty() { "site".to_string() } else { host });
+        let base = download_dir().join("SiteGrab").join(if host.is_empty() {
+            "site".to_string()
+        } else {
+            host
+        });
         let tdir = match layout.as_str() {
             "type" => base.join(category_of(&fname).0),
             "flat" => base,
@@ -5095,7 +8220,10 @@ async fn grabber_download(id: String, urls: Vec<String>) -> Result<Value, String
         }
     }
     if added == 0 && !failed_urls.is_empty() {
-        return Err(format!("None of the {} selected files could be added.", failed_urls.len()));
+        return Err(format!(
+            "None of the {} selected files could be added.",
+            failed_urls.len()
+        ));
     }
     Ok(json!({ "added": added, "failed": failed_urls.len(), "failedUrls": failed_urls }))
 }
@@ -5115,7 +8243,13 @@ fn unique_dir(parent: &std::path::Path, stem: &str) -> std::path::PathBuf {
 fn extract_archive(path: &str, lname: &str, dest: &std::path::Path) -> bool {
     std::fs::create_dir_all(dest).ok();
     let dest_s = dest.display().to_string();
-    let run = |bin: &str, args: &[&str]| Command::new(bin).args(args).status().map(|s| s.success()).unwrap_or(false);
+    let run = |bin: &str, args: &[&str]| {
+        Command::new(bin)
+            .args(args)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
     if lname.ends_with(".zip") {
         if which("unzip").is_some() {
             return run("unzip", &["-o", path, "-d", &dest_s]);
@@ -5134,10 +8268,14 @@ fn extract_archive(path: &str, lname: &str, dest: &std::path::Path) -> bool {
         if which("7z").is_some() {
             return run("7z", &["x", "-y", &format!("-o{dest_s}"), path]);
         }
-    } else if lname.ends_with(".tar.gz") || lname.ends_with(".tgz") || lname.ends_with(".tar.xz") || lname.ends_with(".tar.bz2") || lname.ends_with(".tar") {
-        if which("tar").is_some() {
-            return run("tar", &["xf", path, "-C", &dest_s]);
-        }
+    } else if (lname.ends_with(".tar.gz")
+        || lname.ends_with(".tgz")
+        || lname.ends_with(".tar.xz")
+        || lname.ends_with(".tar.bz2")
+        || lname.ends_with(".tar"))
+        && which("tar").is_some()
+    {
+        return run("tar", &["xf", path, "-C", &dest_s]);
     }
     false
 }
@@ -5147,8 +8285,16 @@ fn maybe_extract(path: &str) {
         return;
     }
     let p = std::path::PathBuf::from(path);
-    let lname = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
-    let is_archive = [".zip", ".rar", ".7z", ".tar.gz", ".tgz", ".tar.xz", ".tar.bz2", ".tar"].iter().any(|e| lname.ends_with(e));
+    let lname = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let is_archive = [
+        ".zip", ".rar", ".7z", ".tar.gz", ".tgz", ".tar.xz", ".tar.bz2", ".tar",
+    ]
+    .iter()
+    .any(|e| lname.ends_with(e));
     if !is_archive {
         return;
     }
@@ -5156,7 +8302,11 @@ fn maybe_extract(path: &str) {
         Some(d) => d.to_path_buf(),
         None => return,
     };
-    let mut stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("archive").to_string();
+    let mut stem = p
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("archive")
+        .to_string();
     if let Some(s) = stem.strip_suffix(".tar") {
         stem = s.to_string();
     }
@@ -5164,7 +8314,11 @@ fn maybe_extract(path: &str) {
     let path_s = path.to_string();
     std::thread::spawn(move || {
         if extract_archive(&path_s, &lname, &dest) {
-            let label = dest.file_name().and_then(|n| n.to_str()).unwrap_or("archive").to_string();
+            let label = dest
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("archive")
+                .to_string();
             notify("✓ Extracted", &label);
         }
     });
@@ -5179,7 +8333,10 @@ fn remote_token() -> &'static str {
     REMOTE_TOKEN.get_or_init(|| {
         let mut rng = rand::rng();
         (0..32)
-            .map(|_| b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[rng.random_range(0..62)] as char)
+            .map(|_| {
+                b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+                    [rng.random_range(0..62)] as char
+            })
             .collect()
     })
 }
@@ -5220,25 +8377,40 @@ fn bridge_info() -> Value {
 /// In dev mode falls back to the workspace `extensions/` folder.
 #[tauri::command]
 fn extension_paths() -> Value {
-    let app = match APP.get() { Some(a) => a, None => return json!({}) };
+    let app = match APP.get() {
+        Some(a) => a,
+        None => return json!({}),
+    };
     // In a dev (debug) build, always use the live source `extensions/` folder (from
     // the compile-time source tree) so edits are reflected without re-bundling — the
     // copy Tauri stages under target/ during a build goes stale between rebuilds. In
     // release, use the bundled resource copy, falling back to the dev tree.
-    let bundled = app.path().resource_dir().unwrap_or_default().join("extensions");
+    let bundled = app
+        .path()
+        .resource_dir()
+        .unwrap_or_default()
+        .join("extensions");
     let ext_dir = if cfg!(debug_assertions) {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../extensions")
-            .canonicalize().unwrap_or_else(|_| bundled.clone())
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../extensions")
+            .canonicalize()
+            .unwrap_or_else(|_| bundled.clone())
     } else if bundled.exists() {
         bundled
     } else {
-        std::env::current_dir().unwrap_or_default().join("extensions")
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join("extensions")
     };
     let crx = ext_dir.join("DownMan.zip");
     // Prefer the AMO-signed xpi (installs permanently); fall back to the unsigned build.
     let signed = ext_dir.join("DownMan-signed.xpi");
     let xpi_signed = signed.exists();
-    let xpi = if xpi_signed { signed } else { ext_dir.join("DownMan.xpi") };
+    let xpi = if xpi_signed {
+        signed
+    } else {
+        ext_dir.join("DownMan.xpi")
+    };
     json!({
         "dir": ext_dir.display().to_string(),
         "dirExists": ext_dir.exists(),
@@ -5271,18 +8443,18 @@ fn remote_list_json() -> Value {
         tauri::async_runtime::block_on(c.tell_stopped()),
     ];
     for f in fetches {
-        if let Ok(a) = f {
-            if let Some(list) = a.as_array() {
-                for t in list {
-                    items.push(json!({
-                        "gid": t.get("gid").and_then(|g| g.as_str()).unwrap_or(""),
-                        "name": task_name(t),
-                        "status": t.get("status").and_then(|s| s.as_str()).unwrap_or(""),
-                        "total": t.get("totalLength").and_then(|s| s.as_str()).unwrap_or("0"),
-                        "done": t.get("completedLength").and_then(|s| s.as_str()).unwrap_or("0"),
-                        "speed": t.get("downloadSpeed").and_then(|s| s.as_str()).unwrap_or("0")
-                    }));
-                }
+        if let Ok(a) = f
+            && let Some(list) = a.as_array()
+        {
+            for t in list {
+                items.push(json!({
+                    "gid": t.get("gid").and_then(|g| g.as_str()).unwrap_or(""),
+                    "name": task_name(t),
+                    "status": t.get("status").and_then(|s| s.as_str()).unwrap_or(""),
+                    "total": t.get("totalLength").and_then(|s| s.as_str()).unwrap_or("0"),
+                    "done": t.get("completedLength").and_then(|s| s.as_str()).unwrap_or("0"),
+                    "speed": t.get("downloadSpeed").and_then(|s| s.as_str()).unwrap_or("0")
+                }));
             }
         }
     }
@@ -5321,59 +8493,83 @@ fn start_remote_server() {
         for req in server.incoming_requests() {
             let url = req.url().to_string();
             let path = url.split('?').next().unwrap_or("/").to_string();
-            let authed = REMOTE_ENABLED.load(Ordering::Relaxed) && rq_param(&url, "t").as_deref() == Some(remote_token());
+            let authed = REMOTE_ENABLED.load(Ordering::Relaxed)
+                && rq_param(&url, "t").as_deref() == Some(remote_token());
             if !authed {
-                let _ = req.respond(tiny_http::Response::from_string("Forbidden").with_status_code(403));
+                let _ = req
+                    .respond(tiny_http::Response::from_string("Forbidden").with_status_code(403));
                 continue;
             }
-            let html_ct = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
-            let json_ct = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+            let html_ct = tiny_http::Header::from_bytes(
+                &b"Content-Type"[..],
+                &b"text/html; charset=utf-8"[..],
+            )
+            .unwrap();
+            let json_ct =
+                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                    .unwrap();
             match path.as_str() {
                 "/" => {
-                    let _ = req.respond(tiny_http::Response::from_string(REMOTE_HTML).with_header(html_ct));
+                    let _ = req.respond(
+                        tiny_http::Response::from_string(REMOTE_HTML).with_header(html_ct),
+                    );
                 }
                 "/list" => {
-                    let _ = req.respond(tiny_http::Response::from_string(remote_list_json().to_string()).with_header(json_ct));
+                    let _ = req.respond(
+                        tiny_http::Response::from_string(remote_list_json().to_string())
+                            .with_header(json_ct),
+                    );
                 }
                 "/pause" => {
                     if let Some(gid) = rq_param(&url, "gid") {
                         let _ = tauri::async_runtime::block_on(pause(gid));
                     }
-                    let _ = req.respond(tiny_http::Response::from_string("{}").with_header(json_ct));
+                    let _ =
+                        req.respond(tiny_http::Response::from_string("{}").with_header(json_ct));
                 }
                 "/resume" => {
                     if let Some(gid) = rq_param(&url, "gid") {
                         let _ = tauri::async_runtime::block_on(resume(gid));
                     }
-                    let _ = req.respond(tiny_http::Response::from_string("{}").with_header(json_ct));
+                    let _ =
+                        req.respond(tiny_http::Response::from_string("{}").with_header(json_ct));
                 }
                 "/pauseall" => {
                     let _ = tauri::async_runtime::block_on(pause_all());
-                    let _ = req.respond(tiny_http::Response::from_string("{}").with_header(json_ct));
+                    let _ =
+                        req.respond(tiny_http::Response::from_string("{}").with_header(json_ct));
                 }
                 "/resumeall" => {
                     let _ = tauri::async_runtime::block_on(resume_all());
-                    let _ = req.respond(tiny_http::Response::from_string("{}").with_header(json_ct));
+                    let _ =
+                        req.respond(tiny_http::Response::from_string("{}").with_header(json_ct));
                 }
                 "/add" => {
-                    if let (Some(c), Some(u)) = (ARIA2.get(), rq_param(&url, "uri")) {
-                        if u.starts_with("http") || u.starts_with("magnet:") {
-                            let fname = url_filename(&u);
-                            let tdir = if ORGANIZE.load(Ordering::Relaxed) { category_of(&fname).1 } else { download_dir() };
-                            let out = unique_out(&tdir, &fname);
-                            let opts = json!({ "dir": tdir.display().to_string(), "out": out });
-                            if let Ok(gid) = tauri::async_runtime::block_on(c.add_uri(vec![u], opts)) {
-                                mark_download_added(&gid);
-                                if let Ok(mut s) = no_organize().lock() {
-                                    s.insert(gid);
-                                }
+                    if let (Some(c), Some(u)) = (ARIA2.get(), rq_param(&url, "uri"))
+                        && (u.starts_with("http") || u.starts_with("magnet:"))
+                    {
+                        let fname = url_filename(&u);
+                        let tdir = if ORGANIZE.load(Ordering::Relaxed) {
+                            category_of(&fname).1
+                        } else {
+                            download_dir()
+                        };
+                        let out = unique_out(&tdir, &fname);
+                        let opts = json!({ "dir": tdir.display().to_string(), "out": out });
+                        if let Ok(gid) = tauri::async_runtime::block_on(c.add_uri(vec![u], opts)) {
+                            mark_download_added(&gid);
+                            if let Ok(mut s) = no_organize().lock() {
+                                s.insert(gid);
                             }
                         }
                     }
-                    let _ = req.respond(tiny_http::Response::from_string("{}").with_header(json_ct));
+                    let _ =
+                        req.respond(tiny_http::Response::from_string("{}").with_header(json_ct));
                 }
                 _ => {
-                    let _ = req.respond(tiny_http::Response::from_string("Not found").with_status_code(404));
+                    let _ = req.respond(
+                        tiny_http::Response::from_string("Not found").with_status_code(404),
+                    );
                 }
             }
         }
@@ -5382,14 +8578,24 @@ fn start_remote_server() {
 
 const REMOTE_HTML: &str = r##"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>DownMan Remote</title><style>body{font-family:system-ui,sans-serif;background:#0b0d17;color:#e2e8f0;margin:0;padding:12px}h1{font-size:18px;margin:0 0 12px}.row{background:#161a2b;border:1px solid #ffffff14;border-radius:10px;padding:10px;margin-bottom:8px}.bar{height:6px;background:#2a3050;border-radius:99px;overflow:hidden;margin-top:6px}.fill{height:100%;background:linear-gradient(90deg,#0a74f0,#cf2ea0)}.n{font-size:13px;word-break:break-all}.m{font-size:11px;color:#94a3b8;display:flex;justify-content:space-between;margin-top:4px}button{background:#0a74f0;color:#fff;border:0;border-radius:8px;padding:6px 10px;font-size:12px;margin-right:6px}input{background:#0b0d17;border:1px solid #ffffff22;color:#e2e8f0;border-radius:8px;padding:8px;width:100%;box-sizing:border-box;margin-bottom:8px}.top{display:flex;gap:6px;margin-bottom:10px}</style></head><body><h1>DownMan Remote</h1><input id=u placeholder="Paste a link to add…"><div class=top><button onclick=add()>Add</button><button onclick="api('/pauseall')">Pause all</button><button onclick="api('/resumeall')">Resume all</button></div><div id=list></div><script>var T=new URLSearchParams(location.search).get('t');function q(p){return p+(p.indexOf('?')<0?'?':'&')+'t='+encodeURIComponent(T)}function api(p){return fetch(q(p)).then(function(r){return r.json()}).catch(function(){})}function add(){var u=document.getElementById('u').value.trim();if(u){api('/add?uri='+encodeURIComponent(u));document.getElementById('u').value=''}}function esc(s){return (s||'').replace(/[&<>]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;'}[c]})}function hs(b){b=+b||0;if(!b)return'';var u=['B','KB','MB','GB','TB'],i=0;while(b>=1024&&i<4){b/=1024;i++}return b.toFixed(1)+u[i]}function load(){fetch(q('/list')).then(function(r){return r.json()}).then(function(d){var h='';(d.downloads||[]).forEach(function(t){var pct=+t.total>0?Math.min(100,100*t.done/t.total):0;var act=t.status=='active';h+='<div class=row><div class=n>'+esc(t.name)+'</div><div class=bar><div class=fill style="width:'+pct+'%"></div></div><div class=m><span>'+hs(t.done)+' / '+hs(t.total)+' · '+pct.toFixed(0)+'%</span><span>'+(act?hs(t.speed)+'/s':t.status)+'</span></div><div style=margin-top:6px>'+(act?'<button onclick="api(\'/pause?gid='+t.gid+'\').then(load)">Pause</button>':'<button onclick="api(\'/resume?gid='+t.gid+'\').then(load)">Resume</button>')+'</div></div>'});document.getElementById('list').innerHTML=h||'<p style=color:#94a3b8>No downloads.</p>'}).catch(function(){})}load();setInterval(load,1500);</script></body></html>"##;
 
+fn launch_requests_hidden<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter().any(|arg| arg.as_ref() == "--hidden")
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|_app, _argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|_app, argv, _cwd| {
             // Second launch: reveal the already-running (possibly hidden) window
             // instead of starting a second copy. This is the reliable way back in
             // when the tray isn't visible (GNOME without an indicator extension).
-            focus_main();
+            if !launch_requests_hidden(&argv) {
+                focus_main();
+            }
         }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
@@ -5406,6 +8612,8 @@ pub fn run() {
         })
         .setup(|app| {
             APP.set(app.handle().clone()).ok();
+            profiles::initialize(&state_dir())
+                .map_err(|error| format!("DownMan profile database: {error}"))?;
             load_dl_dir();
             load_history();
             load_rules();
@@ -5430,51 +8638,73 @@ pub fn run() {
             restore_paused();
 
             // Refresh BitTorrent trackers on launch and once a day after.
-            std::thread::spawn(|| loop {
-                std::thread::sleep(Duration::from_secs(5));
-                let _ = tauri::async_runtime::block_on(fetch_and_apply_trackers());
-                std::thread::sleep(Duration::from_secs(24 * 3600));
+            std::thread::spawn(|| {
+                loop {
+                    std::thread::sleep(Duration::from_secs(5));
+                    let _ = tauri::async_runtime::block_on(fetch_and_apply_trackers());
+                    std::thread::sleep(Duration::from_secs(24 * 3600));
+                }
             });
 
             // Keep yt-dlp current on our own schedule (independent of the distro
             // package): check on launch and once a day; only downloads when a newer
             // release exists. First run with nothing usable fetches one immediately.
-            std::thread::spawn(|| loop {
-                std::thread::sleep(Duration::from_secs(5));
-                tauri::async_runtime::block_on(ytdlp_autoupdate_tick());
-                std::thread::sleep(Duration::from_secs(24 * 3600));
+            std::thread::spawn(|| {
+                loop {
+                    std::thread::sleep(Duration::from_secs(5));
+                    tauri::async_runtime::block_on(ytdlp_autoupdate_tick());
+                    std::thread::sleep(Duration::from_secs(24 * 3600));
+                }
             });
 
             // Explicitly set the live window icon. On Linux the bundle/config icon is
             // only applied to the installed .desktop entry, not the running window, so
             // the titlebar/taskbar would otherwise show a generic icon in dev.
-            if let Some(win) = app.get_webview_window("main") {
-                if let Ok(img) = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png")) {
-                    let _ = win.set_icon(img);
-                }
+            if let Some(win) = app.get_webview_window("main")
+                && let Ok(img) =
+                    tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))
+            {
+                let _ = win.set_icon(img);
             }
 
-            // The window is created visible so its title-bar decorations initialise
-            // correctly on Linux/Wayland — a window that is hidden and later re-shown
-            // leaves min/max/close inert until its surface is reconfigured. So we only
-            // start hidden when the autostart entry launched us with `--hidden`; a manual
-            // launch always shows the window, with working controls. (Reopening from the
-            // tray re-arms the buttons via `rearm_window_controls`.)
-            let start_hidden = std::env::args().any(|a| a == "--hidden");
-            if start_hidden {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.hide();
-                }
+            // The window is created hidden (`visible: false` in tauri.conf.json) so the
+            // autostart entry — which launches us with `--hidden` — never flashes the UI
+            // at login: hiding an already-visible window during setup is unreliable on
+            // GNOME/Wayland and would let it appear briefly first. A manual launch shows
+            // the window here; showing it also re-arms the title-bar min/max/close
+            // buttons, which stay inert on GNOME/Wayland until the surface is reconfigured.
+            let start_hidden = launch_requests_hidden(std::env::args());
+            if !start_hidden && let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.set_focus();
+                rearm_window_controls();
             }
 
             // System tray — best-effort (some Linux desktops need an indicator extension).
             // Tray gives quick Show/Pause/Resume/Quit while running. We deliberately do NOT
             // hide-on-close, because a tray icon can be invisible on GNOME without an
             // extension, which would strand the window with no way to restore it.
-            let _ = build_tray(app);
+            //
+            // Build the tray AFTER the GTK main loop has started: creating it during setup
+            // (before the loop runs) can leave the menu-item labels blank on the very first
+            // launch until the app is restarted. A short deferral lets GTK finish
+            // initialising so the labels ("Quit DownMan", …) render the first time too.
+            {
+                let tray_handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(500));
+                    let build_handle = tray_handle.clone();
+                    let _ = tray_handle.run_on_main_thread(move || {
+                        if let Err(e) = build_tray(&build_handle) {
+                            eprintln!("DownMan tray: {e}");
+                        }
+                    });
+                });
+            }
             start_clipboard_watch();
             start_metered_watch();
             start_telemetry();
+            start_subscription_poller();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -5558,19 +8788,68 @@ pub fn run() {
             set_power_block,
             set_speed_limit_state,
             open_url,
+            list_download_profiles,
+            active_download_profile,
+            save_download_profile,
+            set_active_download_profile,
+            delete_download_profile,
+            media_policy_validate,
+            extractor_archive_status,
+            extractor_archive_export,
+            archive_export_m3u,
+            preflight_batch,
+            preflight_get,
+            preflight_select,
+            preflight_commit,
+            scheduler_get,
+            scheduler_set,
+            job_policy_get,
+            job_policy_set,
+            job_policy_clear,
+            subscription_list,
+            subscription_upsert,
+            subscription_delete,
+            subscription_run_now,
+            subscription_export_m3u,
+            review_inbox_page,
+            review_inbox_select,
+            review_inbox_dismiss,
+            review_inbox_download,
+            yt_search_start,
+            yt_search_page,
+            yt_search_select,
+            yt_search_cancel,
+            yt_search_download,
+            collection_inspect_start,
+            collection_inspect_page,
+            collection_select_items,
+            collection_enqueue_selected,
+            collection_cancel,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running DownMan");
+        .build(tauri::generate_context!())
+        .expect("error while building DownMan")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                stop_engine(app);
+            }
+        });
 }
 
-fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+fn build_tray(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     use tauri::menu::{CheckMenuItem, Menu, MenuItem};
     use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
     let show = MenuItem::with_id(app, "show", "Show DownMan", true, None::<&str>)?;
     let pa = MenuItem::with_id(app, "pauseall", "Pause all", true, None::<&str>)?;
     let ra = MenuItem::with_id(app, "resumeall", "Resume all", true, None::<&str>)?;
-    let limit = CheckMenuItem::with_id(app, "limit", "Speed limit", true, false, None::<&str>)?;
+    let limit = CheckMenuItem::with_id(
+        app,
+        "limit",
+        "Speed limit",
+        true,
+        LIMIT_ON.load(Ordering::Relaxed),
+        None::<&str>,
+    )?;
     let quit = MenuItem::with_id(app, "quit", "Quit DownMan", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &pa, &ra, &limit, &quit])?;
     TRAY_LIMIT.set(limit).ok();
@@ -5593,10 +8872,14 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 focus_main();
             }
             "pauseall" => {
-                tauri::async_runtime::spawn(async { let _ = pause_all().await; });
+                tauri::async_runtime::spawn(async {
+                    let _ = pause_all().await;
+                });
             }
             "resumeall" => {
-                tauri::async_runtime::spawn(async { let _ = resume_all().await; });
+                tauri::async_runtime::spawn(async {
+                    let _ = resume_all().await;
+                });
             }
             "limit" => {
                 // Toggle the global download cap between the configured limit and off.
@@ -5606,14 +8889,19 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     let _ = item.set_checked(on);
                 }
                 let val = if on {
-                    limit_val().lock().map(|v| v.clone()).unwrap_or_else(|_| "1M".into())
+                    limit_val()
+                        .lock()
+                        .map(|v| v.clone())
+                        .unwrap_or_else(|_| "1M".into())
                 } else {
                     "0".into()
                 };
                 if let Some(c) = ARIA2.get() {
                     let c = c.clone();
                     tauri::async_runtime::spawn(async move {
-                        let _ = c.change_global_option(json!({ "max-overall-download-limit": val })).await;
+                        let _ = c
+                            .change_global_option(json!({ "max-overall-download-limit": val }))
+                            .await;
                     });
                 }
             }
@@ -5639,15 +8927,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn category_auto_capture_tracks_additions_without_enabling_all_defaults() {
+        let previous = json!([
+            {"name":"Images","exts":["png"],"folder":"Images"},
+            {"name":"Other","exts":["json"],"folder":"Other"}
+        ]);
+        let current = json!([
+            {"name":"Images","exts":["png", "jpg"],"folder":"Images"},
+            {"name":"Other","exts":["json", ".wasm"],"folder":"Other"}
+        ]);
+        let added =
+            category_auto_capture_additions(&previous, &current, &["ZIP".into(), "WASM".into()]);
+        assert_eq!(added, vec!["JPG", "JSON"]);
+
+        let unchanged_defaults =
+            category_auto_capture_additions(&default_categories(), &default_categories(), &[]);
+        assert!(unchanged_defaults.is_empty());
+    }
+
+    #[test]
+    fn hidden_launch_detection_is_shared_by_initial_and_duplicate_launches() {
+        assert!(launch_requests_hidden(["/usr/bin/downman", "--hidden"]));
+        assert!(!launch_requests_hidden(["/usr/bin/downman"]));
+    }
+
+    #[test]
+    fn removed_queue_assignments_fall_back_to_main() {
+        let queues = json!([
+            {"id":"main","name":"Main"},
+            {"id":"video","name":"Video"}
+        ]);
+        let mut memberships = json!({
+            "https://one.test": "deleted",
+            "https://two.test": "video",
+            "https://three.test": null
+        });
+        assert!(normalize_queue_memberships(&queues, &mut memberships));
+        assert_eq!(memberships["https://one.test"], "main");
+        assert_eq!(memberships["https://two.test"], "video");
+        assert_eq!(memberships["https://three.test"], "main");
+    }
+
+    #[test]
+    fn desktop_exec_argument_is_quoted_and_escaped() {
+        let path = std::path::Path::new(r#"/tmp/Down Man/100%/$build\"`/downman"#);
+        assert_eq!(
+            desktop_exec_arg(path),
+            r#""/tmp/Down Man/100%%/\$build\\\"\`/downman""#
+        );
+    }
+
+    #[test]
     fn unwrap_media() {
         assert_eq!(
             unwrap_media_url("https://www.reddit.com/media?url=https%3A%2F%2Fi.redd.it%2Fabc.gif"),
             "https://i.redd.it/abc.gif"
         );
-        assert_eq!(unwrap_media_url("https://example.com/page"), "https://example.com/page");
+        assert_eq!(
+            unwrap_media_url("https://example.com/page"),
+            "https://example.com/page"
+        );
         // Extra query params after the wrapped URL are dropped with the &-split.
         assert_eq!(
-            unwrap_media_url("https://www.reddit.com/media?url=https%3A%2F%2Fi.redd.it%2Fx.png&foo=1"),
+            unwrap_media_url(
+                "https://www.reddit.com/media?url=https%3A%2F%2Fi.redd.it%2Fx.png&foo=1"
+            ),
             "https://i.redd.it/x.png"
         );
     }
@@ -5665,20 +9009,36 @@ mod tests {
     #[test]
     fn markdown_and_debian_packages_have_expected_defaults() {
         let rules = default_rules();
-        let extensions: HashSet<&str> = rules["autoExts"].as_array().unwrap()
-            .iter().filter_map(|value| value.as_str()).collect();
+        let extensions: HashSet<&str> = rules["autoExts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
         assert!(extensions.contains("MD"));
         assert!(extensions.contains("DEB"));
 
         let categories = default_categories();
-        let owner = |extension: &str| categories.as_array().unwrap().iter().find_map(|category| {
-            category["exts"].as_array().filter(|items| items.iter().any(|item| item.as_str() == Some(extension)))
-                .and_then(|_| category["name"].as_str())
-        });
+        let owner = |extension: &str| {
+            categories.as_array().unwrap().iter().find_map(|category| {
+                category["exts"]
+                    .as_array()
+                    .filter(|items| items.iter().any(|item| item.as_str() == Some(extension)))
+                    .and_then(|_| category["name"].as_str())
+            })
+        };
         assert_eq!(owner("md"), Some("Documents"));
         assert_eq!(owner("deb"), Some("Programs"));
-        let deb_owners = categories.as_array().unwrap().iter()
-            .filter(|category| category["exts"].as_array().map(|items| items.iter().any(|item| item.as_str() == Some("deb"))).unwrap_or(false))
+        let deb_owners = categories
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|category| {
+                category["exts"]
+                    .as_array()
+                    .map(|items| items.iter().any(|item| item.as_str() == Some("deb")))
+                    .unwrap_or(false)
+            })
             .count();
         assert_eq!(deb_owners, 1);
     }
@@ -5686,11 +9046,23 @@ mod tests {
     #[test]
     fn browser_import_is_restricted_to_downloads_descendants() {
         let downloads = std::path::Path::new("/home/user/Downloads");
-        assert!(browser_import_path_allowed(std::path::Path::new("/home/user/Downloads/CHANGELOG.md"), downloads));
-        assert!(browser_import_path_allowed(std::path::Path::new("/home/user/Downloads/sub/file.md"), downloads));
+        assert!(browser_import_path_allowed(
+            std::path::Path::new("/home/user/Downloads/CHANGELOG.md"),
+            downloads
+        ));
+        assert!(browser_import_path_allowed(
+            std::path::Path::new("/home/user/Downloads/sub/file.md"),
+            downloads
+        ));
         assert!(!browser_import_path_allowed(downloads, downloads));
-        assert!(!browser_import_path_allowed(std::path::Path::new("/home/user/Downloads-evil/file.md"), downloads));
-        assert!(!browser_import_path_allowed(std::path::Path::new("/etc/passwd"), downloads));
+        assert!(!browser_import_path_allowed(
+            std::path::Path::new("/home/user/Downloads-evil/file.md"),
+            downloads
+        ));
+        assert!(!browser_import_path_allowed(
+            std::path::Path::new("/etc/passwd"),
+            downloads
+        ));
     }
 
     #[test]
@@ -5714,16 +9086,31 @@ mod tests {
 
     #[test]
     fn filename_ext_completion() {
-        assert_eq!(filename_with_ext("https://dummyimage.com/200", Some("image/png")), "200.png");
-        assert_eq!(filename_with_ext("https://x.com/photo.jpg", Some("image/png")), "photo.jpg");
+        assert_eq!(
+            filename_with_ext("https://dummyimage.com/200", Some("image/png")),
+            "200.png"
+        );
+        assert_eq!(
+            filename_with_ext("https://x.com/photo.jpg", Some("image/png")),
+            "photo.jpg"
+        );
         assert_eq!(filename_with_ext("https://x.com/file", None), "file");
-        assert_eq!(filename_with_ext("https://x.com/file", Some("text/html")), "file");
+        assert_eq!(
+            filename_with_ext("https://x.com/file", Some("text/html")),
+            "file"
+        );
     }
 
     #[test]
     fn content_disposition_names() {
-        assert_eq!(cd_filename("attachment; filename=\"a.zip\""), Some("a.zip".into()));
-        assert_eq!(cd_filename("attachment; filename*=UTF-8''x%20y.pdf"), Some("x y.pdf".into()));
+        assert_eq!(
+            cd_filename("attachment; filename=\"a.zip\""),
+            Some("a.zip".into())
+        );
+        assert_eq!(
+            cd_filename("attachment; filename*=UTF-8''x%20y.pdf"),
+            Some("x y.pdf".into())
+        );
         // RFC 5987 name wins over the plain one.
         assert_eq!(
             cd_filename("attachment; filename=\"plain.bin\"; filename*=UTF-8''real.iso"),
@@ -5734,7 +9121,10 @@ mod tests {
 
     #[test]
     fn url_filenames() {
-        assert_eq!(url_filename("https://x.com/a/b/video.mp4?dl=1"), "video.mp4");
+        assert_eq!(
+            url_filename("https://x.com/a/b/video.mp4?dl=1"),
+            "video.mp4"
+        );
         assert_eq!(url_filename("https://x.com/a%20b.zip"), "a b.zip");
         assert_eq!(url_filename("https://x.com/"), "x.com");
     }
@@ -5742,7 +9132,9 @@ mod tests {
     #[test]
     fn ytdlp_hosts() {
         assert!(is_known_ytdlp_host("https://www.youtube.com/watch?v=1"));
-        assert!(is_known_ytdlp_host("https://www.youtube-nocookie.com/embed/1"));
+        assert!(is_known_ytdlp_host(
+            "https://www.youtube-nocookie.com/embed/1"
+        ));
         assert!(is_known_ytdlp_host("https://youtu.be/1"));
         assert!(is_known_ytdlp_host("https://old.reddit.com/r/videos/1"));
         assert!(!is_known_ytdlp_host("https://example.com/watch"));
@@ -5776,20 +9168,26 @@ mod tests {
             ]
         });
         let candidates = media_candidates(&value).unwrap();
-        assert_eq!(candidates, vec![MediaCandidate {
-            url: "https://two.test/master".into(),
-            kind: "manifest".into(),
-            content_type: None,
-        }]);
+        assert_eq!(
+            candidates,
+            vec![MediaCandidate {
+                url: "https://two.test/master".into(),
+                kind: "manifest".into(),
+                content_type: None,
+            }]
+        );
     }
 
     #[test]
     fn media_bundle_rejects_unknown_schema_and_non_http_sources() {
         assert!(media_candidates(&json!({ "schemaVersion": 1, "candidates": [] })).is_err());
-        assert!(media_candidates(&json!({
-            "schemaVersion": 2,
-            "candidates": [{ "url": "blob:https://example.test/id", "kind": "file" }]
-        })).is_err());
+        assert!(
+            media_candidates(&json!({
+                "schemaVersion": 2,
+                "candidates": [{ "url": "blob:https://example.test/id", "kind": "file" }]
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -5805,24 +9203,73 @@ mod tests {
     }
 
     #[test]
+    fn ytdlp_quality_token_uses_height_fallback_instead_of_raw_format_id() {
+        assert_eq!(
+            ytdlp_format("quality:480"),
+            vec![
+                "-f",
+                "bv*[height<=480]+ba/b[height<=480]/b",
+                "--merge-output-format",
+                "mp4"
+            ]
+        );
+        // Existing raw selectors remain supported for persisted/advanced jobs.
+        assert_eq!(ytdlp_format("135+bestaudio/135")[1], "135+bestaudio/135");
+        // Malformed internal tokens cannot become an unbounded height expression.
+        assert_eq!(ytdlp_format("quality:99999")[1], "quality:99999");
+    }
+
+    #[test]
     fn site_job_pause_resume_and_remove_controls_process_group() {
         let id = format!("site-test-{}", now_ms());
-        let mut child = Command::new("sleep").arg("30").process_group(0).spawn().unwrap();
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
         let pid = child.id();
         site_processes().lock().unwrap().insert(id.clone(), pid);
-        site_jobs().lock().unwrap().push(json!({ "gid": id, "status": "active" }));
+        site_jobs()
+            .lock()
+            .unwrap()
+            .push(json!({ "gid": id, "status": "active" }));
 
         tauri::async_runtime::block_on(pause(id.clone())).unwrap();
-        assert_eq!(site_jobs().lock().unwrap().iter().find(|job| job["gid"] == id).unwrap()["status"], json!("paused"));
-        let stopped = Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().unwrap();
+        assert_eq!(
+            site_jobs()
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|job| job["gid"] == id)
+                .unwrap()["status"],
+            json!("paused")
+        );
+        let stopped = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
         assert!(String::from_utf8_lossy(&stopped.stdout).contains('T'));
 
         tauri::async_runtime::block_on(resume(id.clone())).unwrap();
-        assert_eq!(site_jobs().lock().unwrap().iter().find(|job| job["gid"] == id).unwrap()["status"], json!("active"));
+        assert_eq!(
+            site_jobs()
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|job| job["gid"] == id)
+                .unwrap()["status"],
+            json!("active")
+        );
 
         tauri::async_runtime::block_on(remove(id.clone())).unwrap();
         let _ = child.wait();
-        assert!(!site_jobs().lock().unwrap().iter().any(|job| job["gid"] == id));
+        assert!(
+            !site_jobs()
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|job| job["gid"] == id)
+        );
         assert!(!site_processes().lock().unwrap().contains_key(&id));
     }
 
@@ -5880,7 +9327,8 @@ mod tests {
 
     #[test]
     fn retry_filename_repairs_query_fragment_output_names() {
-        let url = "https://cdn.test/files/vlc-3.0.12-win64.exe?token=x&Filename=vlc-3.0.12-win64.exe";
+        let url =
+            "https://cdn.test/files/vlc-3.0.12-win64.exe?token=x&Filename=vlc-3.0.12-win64.exe";
         let malformed = json!({ "files": [{ "path": "/tmp/&Filename=vlc-3.0.12-win64.exe" }] });
         let normal = json!({ "files": [{ "path": "/tmp/custom-vlc.exe" }] });
         assert_eq!(retry_filename(&malformed, url), "vlc-3.0.12-win64.exe");
@@ -5889,9 +9337,18 @@ mod tests {
 
     #[test]
     fn candidate_content_type_controls_route_without_host_rules() {
-        assert_eq!(route_from_media_evidence("file", Some("video/mp4")), Some(Route::Aria2));
-        assert_eq!(route_from_media_evidence("manifest", None), Some(Route::Ytdlp));
-        assert_eq!(route_from_media_evidence("file", Some("application/vnd.apple.mpegurl")), Some(Route::Ytdlp));
+        assert_eq!(
+            route_from_media_evidence("file", Some("video/mp4")),
+            Some(Route::Aria2)
+        );
+        assert_eq!(
+            route_from_media_evidence("manifest", None),
+            Some(Route::Ytdlp)
+        );
+        assert_eq!(
+            route_from_media_evidence("file", Some("application/vnd.apple.mpegurl")),
+            Some(Route::Ytdlp)
+        );
         assert_eq!(route_from_media_evidence("page", Some("text/html")), None);
     }
 
@@ -5905,8 +9362,12 @@ mod tests {
     #[test]
     fn lifetime_stats_count_each_gid_once() {
         let mut stats = LifetimeStatsState::default();
-        assert!(record_lifetime_entry(&mut stats, "gid-1", 512, "Archives", 86_400_000));
-        assert!(!record_lifetime_entry(&mut stats, "gid-1", 512, "Archives", 86_400_000));
+        assert!(record_lifetime_entry(
+            &mut stats, "gid-1", 512, "Archives", 86_400_000
+        ));
+        assert!(!record_lifetime_entry(
+            &mut stats, "gid-1", 512, "Archives", 86_400_000
+        ));
         assert_eq!(stats.completed_count, 1);
         assert_eq!(stats.completed_bytes, 512);
         assert_eq!(stats.by_category.get("Archives").map(|b| b.count), Some(1));
@@ -5920,8 +9381,16 @@ mod tests {
         stats.completed_bytes = 0;
         stats.by_category.clear();
         stats.by_day.clear();
-        assert!(!record_lifetime_entry(&mut stats, "old-gid", 1024, "Video", 86_400_000));
-        assert!(record_lifetime_entry(&mut stats, "new-gid", 2048, "Video", 172_800_000));
+        assert!(!record_lifetime_entry(
+            &mut stats, "old-gid", 1024, "Video", 86_400_000
+        ));
+        assert!(record_lifetime_entry(
+            &mut stats,
+            "new-gid",
+            2048,
+            "Video",
+            172_800_000
+        ));
         assert_eq!(stats.completed_count, 1);
         assert_eq!(stats.completed_bytes, 2048);
     }

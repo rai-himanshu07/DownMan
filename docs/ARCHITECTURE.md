@@ -1,7 +1,9 @@
 # Architecture
 
-DownMan is a three‑layer system: a **React UI**, a **Rust core** (Tauri), and the
-**aria2** download engine. Browser **extensions** feed downloads in through a local HTTP bridge.
+DownMan has a **React UI** inside a **Tauri/Rust core**, with **aria2** for direct downloads and
+**yt-dlp/ffmpeg** for extracted media. Browser **extensions** feed downloads through a local HTTP
+bridge. Versioned SQLite state keeps profiles and bounded media workflows independent of the
+window lifecycle.
 
 ## Component diagram
 
@@ -13,20 +15,26 @@ flowchart TB
 
     subgraph App["DownMan (Tauri 2)"]
         UI["React UI<br/>Vite · Tailwind · Zustand"]
-        CORE["Rust core (src-tauri)<br/>commands · engine mgr"]
+        CORE["Rust core (src-tauri)<br/>commands · policy · workers"]
         BRIDGE["HTTP bridge<br/>tiny_http :6802"]
+        DB[("SQLite state<br/>profiles · workflows · archive")]
     end
 
     ENGINE["aria2c (system dep)<br/>JSON-RPC :6810"]
-    FFMPEG["ffmpeg<br/>(HLS/DASH merge)"]
+    YTDLP["yt-dlp<br/>media extraction"]
+    FFMPEG["ffmpeg<br/>merge · transcode · clips"]
     FS["~/Downloads/DownMan"]
 
     UI -->|"invoke() IPC"| CORE
     EXT -->|"POST /add"| BRIDGE
     BRIDGE --> CORE
+    CORE <-->|"migrations + transactions"| DB
     CORE -->|"JSON-RPC + token"| ENGINE
+    CORE -->|"spawn bounded jobs"| YTDLP
     CORE -->|"spawn"| FFMPEG
+    YTDLP --> FFMPEG
     ENGINE --> FS
+    YTDLP --> FS
     FFMPEG --> FS
 ```
 
@@ -50,6 +58,11 @@ The RPC secret is generated per app launch and never leaves the process.
     yt‑dlp; HLS/DASH merged by ffmpeg). Media actions carry a ranked candidate bundle so a failed
     source can advance to the next candidate.
 
+Before either engine starts, Rust resolves the selected or active `DownloadProfile`, validates its
+semantic media policy, and stores a full snapshot with the job. Later profile edits therefore do
+not change queued work. Per-job schedule and network overrides are applied after the profile, so an
+explicit job setting wins without mutating the reusable profile.
+
 Ordinary browser-download interception is transaction-based: only newly-created in-progress items
 are eligible; state persists across MV3 worker suspension; completed/history replay events are
 ignored. The browser download is paused before handoff, canceled after DownMan accepts it, and
@@ -66,9 +79,54 @@ The UI polls once per second: the Rust `snapshot` command aggregates
 Zustand stores it; cards re‑render with progress, speed, and ETA.
 Each visible task carries an added timestamp; completed history also carries its completion time.
 
+### Collections, preflight, follows, and search
+
+Large media sources never become one unbounded frontend payload:
+
+1. Collection and search workers ask yt-dlp for bounded ranges and persist normalized rows in
+    SQLite.
+2. React requests fixed-size pages, filters and selection counts through Tauri commands.
+3. Enqueue workers resolve one profile snapshot, skip archived identities, and process selected
+    rows sequentially so cancellation and progress remain deterministic.
+4. The archive records `(extractor, media_id)` after confirmed completion, using canonical URL only
+    as a fallback identity. Repeated playlist imports and subscription polls can then skip completed
+    media safely.
+
+Followed channels and playlists poll in Rust, not React. Poll intervals and result counts are
+bounded; new matches go to the Review Inbox by default, while auto-download is an explicit per-source
+choice. Keyword search uses the same paged selection and archive checks.
+
+Bulk URL imports use a separate preflight session: normalize and classify first, show duplicates,
+conflicts, optional size/ETA estimates, then commit only the selected accepted rows.
+
+### Scheduling and lifecycle
+
+Rust evaluates global, queue, and per-job windows even when the WebView is hidden or unavailable.
+Precedence is per-job → queue → global. DownMan records which jobs the scheduler paused and resumes
+only those jobs when a window reopens, preserving pauses made by the user. Site jobs are controlled
+through their process groups; aria2 jobs use JSON-RPC.
+
+The subscription poller also runs in the backend. A persisted `running` claim prevents overlapping
+polls, and startup clears stale claims left by an interrupted process.
+
+### Persistence and migration
+
+`downman-state.sqlite3` uses bundled SQLite with foreign keys, WAL journaling, a busy timeout, and
+idempotent schema migrations. It owns profiles, collection/preflight/search sessions, media archive,
+subscriptions, review inbox, and scheduler settings. The first database creation copies existing
+`.downman-*` state files into `.downman-1.0.1-backup` without deleting or rewriting the originals.
+
+Existing history, rules, categories, queues, and download metadata remain readable in their legacy
+stores. Job metadata includes the resolved profile snapshot, schedule, and non-secret network
+override; transient passwords stay in process memory only.
+
+See [ADR-0014](adr/0014-sqlite-policy-state.md) for the persistence and snapshot boundary, and
+[ADR-0015](adr/0015-backend-bounded-automation.md) for worker bounds and schedule ownership.
+
 ### Completion & organization
 When a task reaches `complete`, the store calls `organize(gid)` once. Rust reads the file path via
 `aria2.tellStatus`, then moves it into a category subfolder (rename, with copy fallback across mounts).
+Completed extracted media is added to the media archive only after its final output path is known.
 
 ## Per-media downloads
 
@@ -124,16 +182,28 @@ keys are used only to deduplicate those observations. Some sites also offer an e
 ## Rust core surface (`src-tauri/src`)
 
 - `lib.rs` — Tauri builder, plugin setup, `start_engine()` (spawns aria2c, self‑heals the port),
-  `start_bridge()` (tiny_http), and commands.
+    `start_bridge()` (tiny_http), process lifecycle, command registration, and cross-module orchestration.
 - `aria2.rs` — typed JSON‑RPC client (`add_uri`, `pause`, `unpause`, `pause_all`, `unpause_all`,
   `remove`, `tell_active/waiting/stopped`, `tell_status`, `global_stat`, `change_global_option`).
+- `state_db.rs` — SQLite connection policy, schema migrations, and non-destructive legacy backup.
+- `profiles.rs` / `media_policy.rs` — reusable profile CRUD, validation, output/network defaults,
+    and yt-dlp/aria2 argument construction.
+- `collections.rs` / `preflight.rs` / `search.rs` — bounded extraction, paged review state,
+    selection, cancellation, and commit bookkeeping.
+- `archive.rs` — completed-media identity, yt-dlp archive export, and M3U generation.
+- `scheduler.rs` — global/queue/job window evaluation and network override normalization.
+- `subscriptions.rs` — followed-source claims, seen identities, Review Inbox, and polling state.
 
-**Commands exposed to the UI:** `add_download`, `pause`, `resume`, `pause_all`, `resume_all`,
-`remove`, `snapshot`, `organize`, `grab_hls`, `set_global_option`, `engine_info`.
+**Command groups exposed to the UI:** engine control and snapshots; profile/media-policy CRUD;
+collection inspection; preflight review; archive/M3U export; scheduler and per-job policy;
+subscriptions/Review Inbox; bounded media search; browser rules; settings and diagnostics.
 
 ## Security notes
 
 - RPC and bridge bind to loopback only; aria2 secret token is required on every RPC call.
 - Bridge is loopback‑bound and **origin‑gated**: requests carrying a web‑page `Origin`
   (`http(s)://…` or `null`) are refused with `403`, so a website can't drive it; extension and native callers pass.
-- No credentials are persisted; UI preferences live in `localStorage`.
+- aria2's RPC secret and per-job HTTP passwords are never persisted. Profiles and job policy may
+    persist user-supplied proxy/header configuration, so diagnostics must not print those values.
+- Presentation preferences remain in `localStorage`; backend-owned workflows and schedules use
+    SQLite so they continue without the WebView.

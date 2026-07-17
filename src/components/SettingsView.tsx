@@ -7,6 +7,7 @@ import { useStore } from "../store";
 import { I } from "./icons";
 import clsx from "clsx";
 import ImportModal from "./ImportModal";
+import ProfileSettings from "./ProfileSettings";
 import { PAPER_BG, SIGNAL_ACCENT, SIGNAL_BG } from "../lib/theme";
 
 type CatRow = { name: string; extsText: string; folder: string };
@@ -30,6 +31,7 @@ const THEMES = [
 
 const TABS: [string, string][] = [
   ["general", "General"],
+  ["profiles", "Profiles"],
   ["categories", "Categories"],
   ["queues", "Queues"],
   ["network", "Performance"],
@@ -41,8 +43,8 @@ const TABS: [string, string][] = [
 
 export default function SettingsView() {
   const [dir, setDir] = useState("");
-  const [conns, setConns] = useState("16");
-  const [maxDl, setMaxDl] = useState("5");
+  const [conns, setConns] = useState(localStorage.getItem("dm-conns") || "16");
+  const [maxDl, setMaxDl] = useState(localStorage.getItem("dm-max-downloads") || "5");
   const [speed, setSpeed] = useState(localStorage.getItem("dm-speed") || "0");
   const [accent, setAccent] = useState(localStorage.getItem("dm-accent") || ACCENTS[0].v);
   const [theme, setTheme] = useState(localStorage.getItem("dm-theme") || "Signal");
@@ -67,6 +69,7 @@ export default function SettingsView() {
   const [proxy, setProxy] = useState(localStorage.getItem("dm-proxy") || "");
   const [ua, setUa] = useState(localStorage.getItem("dm-ua") || "");
   const [header, setHeader] = useState(localStorage.getItem("dm-header") || "");
+  const [networkMsg, setNetworkMsg] = useState("");
 
   // Automation toggles
   const [confirmDl, setConfirmDl] = useState(localStorage.getItem("dm-confirm") !== "off");
@@ -89,6 +92,8 @@ export default function SettingsView() {
   const [schedOn, setSchedOn] = useState(!!sched.start && !!sched.stop);
   const [start, setStart] = useState(sched.start || "01:00");
   const [stop, setStop] = useState(sched.stop || "08:00");
+  const [schedDays, setSchedDays] = useState<number[]>([]);
+  const [schedMsg, setSchedMsg] = useState("");
 
   // Trackers
   const [trkMsg, setTrkMsg] = useState("");
@@ -145,6 +150,18 @@ export default function SettingsView() {
 
   useEffect(() => { api.getTrackers().then(setTrackers).catch(() => {}); }, []);
 
+  useEffect(() => {
+    api.schedulerGet().then((schedule) => {
+      setSchedOn(schedule.enabled);
+      const window = schedule.windows[0];
+      if (window) {
+        setStart(window.start);
+        setStop(window.stop);
+        setSchedDays(window.days || []);
+      }
+    }).catch(() => {});
+  }, []);
+
   function applyAccent(v: string) {
     setAccent(v);
     localStorage.setItem("dm-accent", v);
@@ -186,38 +203,77 @@ export default function SettingsView() {
     api.setTrackers(trackers).then(() => setTrkMsg("Your trackers applied")).catch(() => setTrkMsg("Failed"));
   }
 
-  function apply() {
-    localStorage.setItem("dm-speed", speed);
-    localStorage.setItem("dm-organize", organize ? "on" : "off");
-    localStorage.setItem("dm-proxy", proxy);
-    localStorage.setItem("dm-ua", ua);
-    localStorage.setItem("dm-header", header);
+  async function apply() {
+    const maxDownloads = Number(maxDl);
+    const connections = Number(conns);
+    const speedLimit = Number(speed);
+    if (!Number.isInteger(maxDownloads) || maxDownloads < 1 || maxDownloads > 100) {
+      setNetworkMsg("Max concurrent downloads must be a whole number from 1 to 100");
+      return;
+    }
+    if (!Number.isInteger(connections) || connections < 1 || connections > 16) {
+      setNetworkMsg("Connections per server must be a whole number from 1 to 16");
+      return;
+    }
+    if (!Number.isFinite(speedLimit) || speedLimit < 0) {
+      setNetworkMsg("Speed cap must be 0 or a positive number");
+      return;
+    }
     const opts: Record<string, string> = {
-      "max-concurrent-downloads": maxDl,
-      "max-connection-per-server": conns,
-      "max-overall-download-limit": speed === "0" ? "0" : `${speed}K`,
+      "max-concurrent-downloads": String(maxDownloads),
+      "max-connection-per-server": String(connections),
+      "max-overall-download-limit": speedLimit === 0 ? "0" : `${speedLimit}K`,
       "all-proxy": proxy,
     };
     if (ua.trim()) opts["user-agent"] = ua.trim();
     if (header.trim()) opts["header"] = header.trim();
-    api.setGlobal(opts).catch(() => {});
-    // Keep the tray "Speed limit" toggle in sync with the configured limit.
-    api.setSpeedLimitState(speed !== "0", speed !== "0" ? `${speed}K` : "").catch(() => {});
+    try {
+      await api.setGlobal(opts);
+      await api.setSpeedLimitState(speedLimit !== 0, speedLimit !== 0 ? `${speedLimit}K` : "");
+      localStorage.setItem("dm-max-downloads", String(maxDownloads));
+      localStorage.setItem("dm-conns", String(connections));
+      localStorage.setItem("dm-speed", String(speedLimit));
+      localStorage.setItem("dm-organize", organize ? "on" : "off");
+      localStorage.setItem("dm-proxy", proxy);
+      localStorage.setItem("dm-ua", ua);
+      localStorage.setItem("dm-header", header);
+      setNetworkMsg("Applied");
+    } catch {
+      setNetworkMsg("Could not apply performance and network settings");
+    }
   }
 
   function saveSchedule(on: boolean, a: string, b: string) {
-    if (on) localStorage.setItem("dm-sched", JSON.stringify({ start: a, stop: b }));
-    else localStorage.removeItem("dm-sched");
+    api.schedulerSet({
+      enabled: on,
+      timezone: "local",
+      windows: on ? [{ start: a, stop: b, days: schedDays }] : [],
+    }).then(() => setSchedMsg("Saved — Rust enforces this while the window is hidden"))
+      .catch((error) => setSchedMsg(String(error)));
   }
 
-  function saveRules() {
+  function toggleSchedDay(day: number) {
+    const next = schedDays.includes(day) ? schedDays.filter((value) => value !== day) : [...schedDays, day].sort();
+    setSchedDays(next);
+    api.schedulerSet({ enabled: schedOn, timezone: "local", windows: schedOn ? [{ start, stop, days: next }] : [] })
+      .then(() => setSchedMsg("Saved"))
+      .catch((error) => setSchedMsg(String(error)));
+  }
+
+  function normalizedRules(enabled = rulesOn) {
     const split = (s: string) => s.split(/[\s,]+/).map((x) => x.trim()).filter(Boolean);
-    api.setRules({
-      enabled: rulesOn,
-      autoExts: split(autoExts).map((s) => s.toUpperCase()),
-      blockSites: split(blockSites),
-      blockAddresses: split(blockAddr),
-    }).then(() => setRulesMsg("Saved \u2014 the extension applies it within a minute")).catch(() => setRulesMsg("Save failed"));
+    return {
+      enabled,
+      autoExts: [...new Set(split(autoExts).map((s) => s.replace(/^\./, "").toUpperCase()))],
+      blockSites: [...new Set(split(blockSites))],
+      blockAddresses: [...new Set(split(blockAddr))],
+    };
+  }
+
+  function saveRules(enabled = rulesOn) {
+    api.setRules(normalizedRules(enabled))
+      .then(() => setRulesMsg("Saved \u2014 the extension applies it within 15 seconds"))
+      .catch(() => setRulesMsg("Save failed"));
   }
 
   function resetRules() {
@@ -247,7 +303,13 @@ export default function SettingsView() {
       exts: c.extsText.split(/[\s,]+/).map((s) => s.trim().toLowerCase()).filter(Boolean),
       folder: c.folder.trim() || c.name.trim() || "Other",
     }));
-    api.setCategories(clean).then(() => { setCatMsg("Saved"); useStore.getState().loadCategories(); }).catch(() => setCatMsg("Save failed"));
+    api.setCategories(clean).then((res) => {
+      const added = res?.added || [];
+      setCatMsg(added.length ? `Saved \u2014 added ${added.join(", ")} to auto-capture` : "Saved");
+      useStore.getState().loadCategories();
+      // Reflect the mirrored types in the Browser interception field too.
+      if (added.length) api.getRules().then((r) => setAutoExts((r.autoExts || []).join(" "))).catch(() => {});
+    }).catch(() => setCatMsg("Save failed"));
   }
 
   function updateQ(i: number, patch: Partial<QRow>) {
@@ -299,15 +361,15 @@ export default function SettingsView() {
 
   return (
     <div className="settings-console w-full max-w-none">
-      <div className="flex overflow-x-auto mb-4 border-b border-white/10">
+      <div role="tablist" aria-label="Settings sections" className="flex flex-wrap mb-4 border-b border-white/10">
         {TABS.map(([id, label]) => (
-          <button key={id} onClick={() => setTab(id)}
-            className={clsx("flex-1 min-w-max px-3 py-2 text-[11px] font-mono uppercase whitespace-nowrap text-center border-b-2 -mb-px", tab === id ? "border-aurora-400 text-white" : "border-transparent text-slate-500 hover:text-slate-300")}>
+          <button key={id} id={`settings-tab-${id}`} role="tab" aria-selected={tab === id} aria-controls={`settings-panel-${id}`} onClick={() => setTab(id)}
+            className={clsx("min-w-max px-3 py-2 text-[11px] font-mono uppercase whitespace-nowrap text-center border-b-2 -mb-px", tab === id ? "border-aurora-400 text-white" : "border-transparent text-slate-500 hover:text-slate-300")}>
             {label}
           </button>
         ))}
       </div>
-      <div className="space-y-4">
+      <div id={`settings-panel-${tab}`} role="tabpanel" aria-labelledby={`settings-tab-${tab}`} className="space-y-4">
 
       {tab === "general" && (<>
       <div className="card p-5 space-y-3">
@@ -444,13 +506,24 @@ export default function SettingsView() {
       </div>
       </>)}
 
+      {tab === "profiles" && (
+        <ProfileSettings queues={qrows.map((queue) => ({
+          id: queue.id,
+          name: queue.name,
+          maxActive: Math.max(0, parseInt(queue.maxActive) || 0),
+          speed: Math.max(0, parseInt(queue.speed) || 0),
+          running: queue.running,
+          schedule: null,
+        }))} />
+      )}
+
       {tab === "categories" && (<>
       <div className="card p-5 space-y-3">
         <h3 className="font-semibold">Categories</h3>
-        <p className="text-sm text-slate-500">Files sort into the first category whose extensions match. The one with no extensions is the catch-all. Folder can be a name (under your download folder) or an absolute path.</p>
+        <p className="text-sm text-slate-500">Files sort into the first category whose extensions match. The one with no extensions is the catch-all. Folder can be a name (under your download folder) or an absolute path. Saving also adds any custom extensions you list here to browser auto-capture, so those files are grabbed by DownMan too.</p>
         <div className="space-y-2">
           {cats.map((c, i) => (
-            <div key={i} className="grid grid-cols-[1fr_1.5fr_1.5fr_auto] gap-2 items-center">
+            <div key={i} className="grid grid-cols-1 lg:grid-cols-[1fr_1.5fr_1.5fr_auto] gap-2 items-center">
               <input value={c.name} onChange={(e) => updateCat(i, { name: e.target.value })} placeholder="Name"
                 className="bg-ink-900/60 border border-white/5 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-aurora-500/50" />
               <input value={c.extsText} onChange={(e) => updateCat(i, { extsText: e.target.value })} placeholder="mp4 mkv …"
@@ -464,10 +537,10 @@ export default function SettingsView() {
             </div>
           ))}
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <button className="btn-ghost" onClick={addCat}>+ Add category</button>
           <button className="btn-primary" onClick={saveCats}>Save categories</button>
-          {catMsg && <span className="text-[11px] text-slate-500">{catMsg}</span>}
+          {catMsg && <span className="min-w-0 break-words text-[11px] text-slate-500">{catMsg}</span>}
         </div>
       </div>
       </>)}
@@ -529,7 +602,10 @@ export default function SettingsView() {
         <Field label="Proxy (http://host:port, blank = none)" v={proxy} set={setProxy} ph="http://127.0.0.1:8080" />
         <Field label="User-Agent" v={ua} set={setUa} ph="Mozilla/5.0 …" />
         <Field label="Custom header" v={header} set={setHeader} ph="Authorization: Bearer …" />
-        <button className="btn-primary" onClick={apply}>Apply performance & network</button>
+        <div className="flex flex-wrap items-center gap-3">
+          <button className="btn-primary" onClick={apply}>Apply performance & network</button>
+          {networkMsg && <span className="text-[11px] text-slate-500">{networkMsg}</span>}
+        </div>
       </div>
       </>)}
 
@@ -587,26 +663,32 @@ export default function SettingsView() {
             className="mt-1 w-full h-16 bg-ink-900/60 border border-white/5 rounded-lg px-3 py-2 text-sm font-mono placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-aurora-500/50 resize-none" />
         </div>
         <div className="flex items-center gap-3">
-          <button className="btn-primary" onClick={saveRules}>Save rules</button>
+          <button className="btn-primary" onClick={() => saveRules()}>Save rules</button>
           <button className="btn-ghost" onClick={resetRules}>Reset to defaults</button>
           {rulesMsg && <span className="text-[11px] text-slate-500">{rulesMsg}</span>}
         </div>
       </div>
 
       <div className="card p-5 space-y-3">
-        <h3 className="font-semibold">Scheduler</h3>
+        <h3 className="font-semibold">Backend scheduler</h3>
+        <p className="text-sm text-slate-500">Rust enforces active hours even when the window is closed or unavailable. Per-job schedules override queue windows, which override this global window.</p>
         <Toggle label="Only download during active hours" checked={schedOn}
           onChange={(c) => { setSchedOn(c); saveSchedule(c, start, stop); }} />
         {schedOn && (
-          <div className="flex items-center gap-3 text-sm text-slate-400">
-            <span>From</span>
-            <input type="time" value={start} onChange={(e) => { setStart(e.target.value); saveSchedule(true, e.target.value, stop); }}
-              className="bg-ink-900/60 border border-white/5 rounded-lg px-2 py-1 text-sm" />
-            <span>to</span>
-            <input type="time" value={stop} onChange={(e) => { setStop(e.target.value); saveSchedule(true, start, e.target.value); }}
-              className="bg-ink-900/60 border border-white/5 rounded-lg px-2 py-1 text-sm" />
-          </div>
+          <>
+            <div className="flex items-center gap-3 text-sm text-slate-400">
+              <span>From</span>
+              <input type="time" value={start} onChange={(e) => { setStart(e.target.value); saveSchedule(true, e.target.value, stop); }} className="control !w-auto" />
+              <span>to</span>
+              <input type="time" value={stop} onChange={(e) => { setStop(e.target.value); saveSchedule(true, start, e.target.value); }} className="control !w-auto" />
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((label, day) => <button key={label} onClick={() => toggleSchedDay(day)} className={schedDays.length === 0 || schedDays.includes(day) ? "btn-primary !px-2.5 !py-1 text-xs" : "btn-ghost !px-2.5 !py-1 text-xs"}>{label}</button>)}
+              <button className="btn-ghost !px-2.5 !py-1 text-xs" onClick={() => { setSchedDays([]); saveSchedule(true, start, stop); }}>Every day</button>
+            </div>
+          </>
         )}
+        {schedMsg && <div className="text-xs text-slate-500 break-words">{schedMsg}</div>}
       </div>
       </>)}
 
@@ -708,12 +790,16 @@ export default function SettingsView() {
         <h3 className="font-semibold">URL interception</h3>
         <p className="text-sm text-slate-500">The extension intercepts URLs matching these rules and routes them through DownMan instead of the browser&apos;s own download.</p>
         <Toggle label="Enable URL interception" checked={rulesOn}
-          onChange={(c) => { setRulesOn(c); api.setRules({ enabled: c, autoExts: autoExts.trim().split(/\s+/).filter(Boolean), blockSites: blockSites.trim().split("\n").filter(Boolean), blockAddresses: blockAddr.trim().split("\n").filter(Boolean) }).catch(() => {}); }} />
+          onChange={(c) => { setRulesOn(c); saveRules(c); }} />
         <div>
           <label className="text-sm text-slate-400">Auto-intercept file extensions (space-separated)</label>
           <input value={autoExts} onChange={(e) => setAutoExts(e.target.value)}
             placeholder="zip rar 7z iso pdf mp4 mkv"
             className="mt-1 w-full bg-ink-900/60 border border-white/5 rounded-lg px-3 py-1.5 text-sm font-mono placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-aurora-500/50" />
+        </div>
+        <div className="flex flex-wrap items-center gap-3">
+          <button className="btn-primary" onClick={() => saveRules()}>Save interception rules</button>
+          {rulesMsg && <span className="min-w-0 break-words text-[11px] text-slate-500">{rulesMsg}</span>}
         </div>
       </div>
       </>)}

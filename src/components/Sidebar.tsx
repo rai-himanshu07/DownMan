@@ -42,6 +42,16 @@ export default function Sidebar() {
         </button>
       ))}
 
+      <div className="px-3 pt-4 pb-1 text-[10px] font-mono uppercase text-slate-600">Discovery</div>
+      <button type="button" className={clsx("nav-item w-full text-left", view === "follows" && "active")} onClick={() => setView("follows")}>
+        <I.Globe className="w-[18px] h-[18px]" />
+        Follows
+      </button>
+      <button type="button" className={clsx("nav-item w-full text-left", view === "library" && "active")} onClick={() => setView("library")}>
+        <I.Folder className="w-[18px] h-[18px]" />
+        Library
+      </button>
+
       {categories.length > 0 && (
         <>
           <button

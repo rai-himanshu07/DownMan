@@ -302,6 +302,53 @@ test("a single-video post ignores media keys and prefers its page extractor", ()
   assert.equal([manifest, boundPage][plan.index].kind, "page");
 });
 
+test("a feed quote-tweet prefers the clicked video's own media-key manifest over a bound page", () => {
+  // The outer tweet quotes another tweet whose video is still a thumbnail (not a
+  // materialised <video>), so ownerMediaCount is 1 and nested is false. The bound
+  // status page would let yt-dlp resolve the quoted video, so in a feed the clicked
+  // player's own keyed manifest (its master playlist) must win.
+  const clickedVariant = candidate({
+    url: "https://video.twimg.test/amplify_video/2078043949848219648/pl/avc1/1920x1080/v.m3u8",
+    kind: "manifest",
+    contentType: "application/vnd.apple.mpegurl",
+    frameId: 3,
+  });
+  const clickedMaster = candidate({
+    url: "https://video.twimg.test/amplify_video/2078043949848219648/pl/master.m3u8?tag=29",
+    kind: "manifest",
+    contentType: "application/vnd.apple.mpegurl",
+    frameId: 3,
+  });
+  const quotedManifest = candidate({
+    url: "https://video.twimg.test/ext_tw_video/2078030350962270208/pu/pl/avc1/1276x718/q.m3u8",
+    kind: "manifest",
+    contentType: "application/vnd.apple.mpegurl",
+    frameId: 3,
+  });
+  const boundPage = candidate({
+    url: "https://x.test/BeingPolitical1/status/2078044024414290038/",
+    kind: "page",
+    contentType: "text/html",
+    pageBound: true,
+    pageStrength: 40,
+    pageIdentity: "https://x.test/BeingPolitical1/status/2078044024414290038/",
+    size: 0,
+  });
+  const intent = {
+    ...baseIntent,
+    contextKind: "collection",
+    ownerMediaCount: 1,
+    nested: false,
+    mediaKeys: ["2078043949848219648"],
+  };
+
+  const ranked = resolver.rankCandidates([boundPage, quotedManifest, clickedVariant, clickedMaster], intent, NOW);
+  const plan = resolver.planResolution(ranked, intent, resolver.confidenceFor(ranked));
+  assert.equal(plan.action, "submit");
+  assert.equal(plan.reason, "media-key-manifest");
+  assert.match(ranked[plan.index].url, /amplify_video\/2078043949848219648\/pl\/master\.m3u8/);
+});
+
 test("a media-key manifest survives a crowd of higher-scoring feed manifests", () => {
   const manifests = Array.from({ length: 8 }, (_, index) => candidate({
     url: `https://video.twimg.test/amplify_video/other${index}/pl/avc1/1080x1920/m${index}.m3u8`,
