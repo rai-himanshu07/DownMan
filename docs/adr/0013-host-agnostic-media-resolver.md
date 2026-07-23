@@ -30,6 +30,10 @@ Adopt a versioned, host-agnostic media resolver:
 2. The background records direct-media and HLS/DASH responses in a bounded candidate ledger. Each
    candidate retains its raw URL, a separate canonical deduplication key, frame/document context,
    content type, response size, timestamps, request type, and associated media IDs.
+   A small MAIN-world probe additionally observes `MediaSource` object URLs, media-like fetch/XHR
+   completions, and `SourceBuffer.appendBuffer` timing. It emits no media bodies. An MSE ownership
+   signal may bind only a URL already present in the background's network ledger to the stable
+   media-element ID, so page code cannot synthesize a downloadable candidate.
 3. File candidates expire after 10 minutes; volatile manifest/page candidates expire after 2
    minutes. The ledger is capped at 200 candidates per tab, cleared on navigation/tab close, and
    stored in `storage.session` when available so MV3 worker suspension does not erase it.
@@ -61,6 +65,8 @@ Adopt a versioned, host-agnostic media resolver:
 - Page-extractor URLs are canonicalized by content identity to remove navigation/tracking variants.
 - Cookies are not copied into the ledger or candidate bundle. The existing browser-cookie preference
   is forwarded only to yt-dlp through the local origin-gated bridge.
+- MSE ownership evidence is capped and expires. It contains URL, MIME, source ID, and timing only;
+   it is not a cache recorder and never retains appended bytes.
 - Blob URLs are evidence about the player but are never sent as downloadable candidates.
 - Completed browser-generated blob files may be adopted only from a canonical path inside the user's
    Downloads directory; arbitrary local paths are rejected by the bridge.

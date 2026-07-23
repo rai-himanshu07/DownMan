@@ -5,6 +5,48 @@ All notable changes to DownMan are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] — 2026-07-24
+
+### Added
+
+- Add one-time, user-approved browser-extension pairing with a persisted capability token,
+  rotation/revocation controls, protocol metadata, and authenticated bridge task actions.
+- Add pause/resume/retry/open/reveal controls to the extension popup.
+- Add bounded MAIN-world MediaSource ownership evidence that correlates network URLs with the
+  exact player consuming them, without capturing media bodies or introducing unobserved URLs.
+- Add bounded URL-pattern expansion to bulk preflight, including padded/stepped number ranges,
+  letter ranges, enumerations, escaping, and a hard 10,000-item limit.
+- Add guarded source-URL editing for paused single-file HTTP downloads. Partial data is reused
+  only when both sources prove the same strong ETag and size; otherwise restart requires explicit
+  confirmation and preserves task policy/queue metadata plus a bounded edit-history lineage.
+- Add a daily, notification-only app release check and a manual About-page check; DownMan never
+  downloads or installs an app update without the user.
+
+### Changed
+
+- Move app-owned state from the download folder to `~/.local/share/DownMan`, with an atomic,
+  integrity-checked, non-destructive migration that leaves the old state available as backup.
+- Cache global schedule policy in the backend, suspend frontend snapshots while hidden, share
+  monitor statistics, and reap completion-command children instead of repeatedly opening SQLite
+  or leaving helper processes behind.
+
+### Fixed
+
+- Keep login startup in the tray/background and automatically repair enabled 1.1 autostart entries
+  that omitted `--hidden`, while preserving entries the desktop session has explicitly disabled.
+
+### Security
+
+- Require the bridge capability token on operational routes while retaining loopback binding,
+  webpage-Origin rejection, bounded request bodies, and bounded bridge workers.
+- Keep MSE probe output as correlation evidence only: it can bind only URLs independently observed
+  by the extension's network ledger.
+
+### Packaging
+
+- The Firefox extension source changed and requires a new Mozilla signature for permanent
+  installation; stale signed packages are removed automatically during extension builds.
+
 ## [1.1.0] — 2026-07-17
 
 ### Added
@@ -243,6 +285,7 @@ extension share one version line; the extension's 0.1.0–0.1.1 builds were pre�
   web pages are rejected, so a website cannot drive the download manager. See
   [`SECURITY.md`](SECURITY.md).
 
+[1.2.0]: https://github.com/rai-himanshu07/DownMan/releases/tag/v1.2.0
 [1.1.0]: https://github.com/rai-himanshu07/DownMan/releases/tag/v1.1.0
 [1.0.1]: https://github.com/rai-himanshu07/DownMan/releases/tag/v1.0.1
 [1.0.0]: https://github.com/rai-himanshu07/DownMan/releases/tag/v1.0.0

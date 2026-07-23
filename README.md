@@ -70,8 +70,8 @@ That's it! The installer automatically pulls in the two helper tools DownMan nee
 - **Follows & search** — poll channels/playlists into a review inbox (or opt into bounded
   auto-download), and search/select media through paged yt-dlp results.
 - **Auto‑organization** — completed files sorted into `Video / Audio / Images / Documents / Archives / Other`.
-- **Browser bridge** — Chromium + Firefox MV3 extensions talk to the app over a local HTTP endpoint
-  and capture configured file types such as ZIP/EXE after redirects.
+- **Browser bridge** — Chromium + Firefox MV3 extensions pair once with the app, then use an
+  authenticated local HTTP endpoint to capture configured file types such as ZIP/EXE after redirects.
 - **Queue control & schedules** — pause/resume per item and selected items across aria2 and yt-dlp,
   plus backend-owned global/queue/job windows and per-job network overrides that work while hidden.
 - **Integrity & mirrors** — checksum verification (MD5 / SHA‑1 / SHA‑256 / SHA‑512), automatically
@@ -91,7 +91,8 @@ npm install          # frontend + Tauri CLI
 npm run app          # tauri dev — launches the window, starts aria2 + bridge
 ```
 
-The app writes downloads to `~/Downloads/DownMan/`.
+The app writes downloads to `~/Downloads/DownMan/` and keeps app-owned state under
+`~/.local/share/DownMan/`.
 
 ## Build a package
 
@@ -99,12 +100,12 @@ The app writes downloads to `~/Downloads/DownMan/`.
 npm run app:build -- --bundles deb appimage   # → src-tauri/target/release/bundle/{deb,appimage}/
 
 # .deb — pulls in aria2 + ffmpeg automatically:
-sudo apt install ./src-tauri/target/release/bundle/deb/downman_1.1.0_amd64.deb
+sudo apt install ./src-tauri/target/release/bundle/deb/downman_1.2.0_amd64.deb
 
 # AppImage — portable, but install its two runtime tools yourself first:
 sudo apt install aria2 ffmpeg
-chmod +x ./src-tauri/target/release/bundle/appimage/downman_1.1.0_amd64.AppImage
-./src-tauri/target/release/bundle/appimage/downman_1.1.0_amd64.AppImage
+chmod +x ./src-tauri/target/release/bundle/appimage/downman_1.2.0_amd64.AppImage
+./src-tauri/target/release/bundle/appimage/downman_1.2.0_amd64.AppImage
 ```
 
 > **AppImage note:** the AppImage bundles the app + the WebKit/GTK runtime, but **not** `aria2`/`ffmpeg`
@@ -128,6 +129,8 @@ Run `npm run build:ext`, then:
   requires an AMO-signed XPI.
 
 The extension defaults to the app endpoint `http://127.0.0.1:6802` (configurable in its options page).
+After loading or updating it, open *DownMan → Settings → Browser*, click **Allow extension pairing**,
+then click **Pair with DownMan** in the extension popup within 60 seconds.
 
 ---
 

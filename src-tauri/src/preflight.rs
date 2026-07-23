@@ -1,4 +1,6 @@
 use crate::state_db;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -14,6 +16,10 @@ const MAX_ITEMS: usize = 10_000;
 const MAX_PAGE_SIZE: u32 = 200;
 const MAX_ESTIMATE_WORKERS: usize = 8;
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
+static NUMBER_RANGE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^(\d+)-(\d+)(?::(\d+))?$").expect("valid number range"));
+static LETTER_RANGE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^([A-Za-z])-([A-Za-z])(?::(\d+))?$").expect("valid letter range"));
 
 #[derive(Clone, Default)]
 pub struct PreflightContext {
@@ -79,7 +85,8 @@ pub async fn create(
     );
     let mut seen = HashSet::new();
     let mut items = Vec::new();
-    for (offset, original) in raw_urls.into_iter().take(MAX_ITEMS).enumerate() {
+    let expanded_urls = expand_url_patterns(raw_urls)?;
+    for (offset, original) in expanded_urls.into_iter().enumerate() {
         let index = offset as u32 + 1;
         let mut item = match normalize_url(&original) {
             Ok(url) => {
@@ -150,6 +157,197 @@ pub async fn create(
     }
     store(state_dir, &id, &context, now, &items)?;
     page(state_dir, &id, 0, MAX_PAGE_SIZE, Some("all"))
+}
+
+pub fn expand_url_patterns(raw_urls: Vec<String>) -> Result<Vec<String>, String> {
+    let mut expanded = Vec::new();
+    for raw in raw_urls {
+        expand_one(&raw, &mut expanded)?;
+    }
+    Ok(expanded)
+}
+
+fn expand_one(value: &str, output: &mut Vec<String>) -> Result<(), String> {
+    if output.len() >= MAX_ITEMS {
+        return Err(format!(
+            "URL patterns expand beyond the {MAX_ITEMS}-item limit"
+        ));
+    }
+    if let Some((start, end, replacements)) = first_pattern(value)? {
+        for replacement in replacements {
+            let next = format!("{}{}{}", &value[..start], replacement, &value[end..]);
+            expand_one(&next, output)?;
+        }
+    } else {
+        output.push(unescape_pattern_literals(value));
+    }
+    Ok(())
+}
+
+fn first_pattern(value: &str) -> Result<Option<(usize, usize, Vec<String>)>, String> {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let open = bytes[index];
+        let close = match open {
+            b'[' => b']',
+            b'{' => b'}',
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        if escaped_at(bytes, index) {
+            index += 1;
+            continue;
+        }
+        let Some(relative_end) = bytes[index + 1..]
+            .iter()
+            .enumerate()
+            .find(|(offset, byte)| **byte == close && !escaped_at(bytes, index + 1 + *offset))
+            .map(|(offset, _)| offset)
+        else {
+            index += 1;
+            continue;
+        };
+        let close_index = index + 1 + relative_end;
+        let inner = &value[index + 1..close_index];
+        let replacements = if open == b'{' {
+            enum_replacements(inner)
+        } else {
+            range_replacements(inner)?
+        };
+        if let Some(replacements) = replacements {
+            return Ok(Some((index, close_index + 1, replacements)));
+        }
+        index = close_index + 1;
+    }
+    Ok(None)
+}
+
+fn enum_replacements(inner: &str) -> Option<Vec<String>> {
+    let values = inner
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(unescape_pattern_literals)
+        .collect::<Vec<_>>();
+    (values.len() >= 2).then_some(values)
+}
+
+fn range_replacements(inner: &str) -> Result<Option<Vec<String>>, String> {
+    if let Some(captures) = NUMBER_RANGE_RE.captures(inner) {
+        let start_text = &captures[1];
+        let stop_text = &captures[2];
+        let start = start_text
+            .parse::<u64>()
+            .map_err(|_| "numeric URL range is too large".to_string())?;
+        let stop = stop_text
+            .parse::<u64>()
+            .map_err(|_| "numeric URL range is too large".to_string())?;
+        let step = captures
+            .get(3)
+            .map(|value| value.as_str().parse::<u64>())
+            .transpose()
+            .map_err(|_| "URL range step is too large".to_string())?
+            .unwrap_or(1);
+        if step == 0 {
+            return Err("URL range step must be greater than zero".into());
+        }
+        let count = start.abs_diff(stop) / step + 1;
+        if count as usize > MAX_ITEMS {
+            return Err(format!(
+                "URL range expands beyond the {MAX_ITEMS}-item limit"
+            ));
+        }
+        let padded = (start_text.starts_with('0') && start_text.len() > 1)
+            || (stop_text.starts_with('0') && stop_text.len() > 1);
+        let width = start_text.len().max(stop_text.len());
+        let mut values = Vec::with_capacity(count as usize);
+        let mut current = start;
+        loop {
+            values.push(if padded {
+                format!("{current:0width$}")
+            } else {
+                current.to_string()
+            });
+            if current == stop {
+                break;
+            }
+            let next = if start < stop {
+                current.saturating_add(step).min(stop)
+            } else {
+                current.saturating_sub(step).max(stop)
+            };
+            if next == current {
+                break;
+            }
+            current = next;
+        }
+        return Ok(Some(values));
+    }
+    if let Some(captures) = LETTER_RANGE_RE.captures(inner) {
+        let start = captures[1].as_bytes()[0];
+        let stop = captures[2].as_bytes()[0];
+        if start.is_ascii_lowercase() != stop.is_ascii_lowercase() {
+            return Err("letter URL ranges must use one consistent case".into());
+        }
+        let step = captures
+            .get(3)
+            .map(|value| value.as_str().parse::<u8>())
+            .transpose()
+            .map_err(|_| "URL range step is too large".to_string())?
+            .unwrap_or(1);
+        if step == 0 {
+            return Err("URL range step must be greater than zero".into());
+        }
+        let count = start.abs_diff(stop) as usize / step as usize + 1;
+        let mut values = Vec::with_capacity(count);
+        let mut current = start;
+        loop {
+            values.push(char::from(current).to_string());
+            if current == stop {
+                break;
+            }
+            let next = if start < stop {
+                current.saturating_add(step).min(stop)
+            } else {
+                current.saturating_sub(step).max(stop)
+            };
+            if next == current {
+                break;
+            }
+            current = next;
+        }
+        return Ok(Some(values));
+    }
+    Ok(None)
+}
+
+fn escaped_at(bytes: &[u8], index: usize) -> bool {
+    let mut slashes = 0;
+    let mut cursor = index;
+    while cursor > 0 && bytes[cursor - 1] == b'\\' {
+        slashes += 1;
+        cursor -= 1;
+    }
+    slashes % 2 == 1
+}
+
+fn unescape_pattern_literals(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\'
+            && let Some(next) = chars.peek()
+            && matches!(next, '[' | ']' | '{' | '}' | ',' | '\\')
+        {
+            output.push(chars.next().unwrap_or_default());
+        } else {
+            output.push(ch);
+        }
+    }
+    output
 }
 
 pub fn page(
@@ -666,6 +864,33 @@ mod tests {
         );
         assert_eq!(classify("https://youtube.com/watch?v=abc"), "media");
         assert_eq!(classify("https://example.test/file.zip"), "direct");
+    }
+
+    #[test]
+    fn url_patterns_expand_padding_steps_letters_enums_and_escapes() {
+        let expanded = expand_url_patterns(vec![
+            "https://example.test/file-[001-005:2].{zip,iso}".into(),
+            "https://example.test/chapter-[c-a].pdf".into(),
+            r"https://example.test/literal-\[1-2\].txt".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            expanded,
+            vec![
+                "https://example.test/file-001.zip",
+                "https://example.test/file-001.iso",
+                "https://example.test/file-003.zip",
+                "https://example.test/file-003.iso",
+                "https://example.test/file-005.zip",
+                "https://example.test/file-005.iso",
+                "https://example.test/chapter-c.pdf",
+                "https://example.test/chapter-b.pdf",
+                "https://example.test/chapter-a.pdf",
+                "https://example.test/literal-[1-2].txt",
+            ]
+        );
+        assert!(expand_url_patterns(vec!["https://example.test/[1-20000]".into()]).is_err());
+        assert!(expand_url_patterns(vec!["https://example.test/[1-5:0]".into()]).is_err());
     }
 
     #[test]

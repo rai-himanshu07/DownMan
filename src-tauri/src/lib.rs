@@ -17,12 +17,13 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::Manager;
 
 static ARIA2: OnceCell<Aria2> = OnceCell::new();
@@ -58,7 +59,10 @@ static REMOTE_STARTED: AtomicBool = AtomicBool::new(false);
 /// Auto-refresh yt-dlp on our own schedule (default on) + last check (unix secs).
 static YTDLP_AUTO: AtomicBool = AtomicBool::new(true);
 static YTDLP_LAST_CHECK: AtomicU64 = AtomicU64::new(0);
+static APP_LAST_CHECK: AtomicU64 = AtomicU64::new(0);
 static LAST_BRIDGE_PING: AtomicU64 = AtomicU64::new(0);
+static BRIDGE_PAIRING_UNTIL: AtomicU64 = AtomicU64::new(0);
+static BRIDGE_TOKEN: OnceCell<Mutex<String>> = OnceCell::new();
 static REMOTE_TOKEN: OnceCell<String> = OnceCell::new();
 /// Custom download folder override (None = default).
 static DLDIR: OnceCell<Mutex<Option<String>>> = OnceCell::new();
@@ -99,6 +103,10 @@ static RETRIES: OnceCell<Mutex<HashMap<String, u32>>> = OnceCell::new();
 static COLLECTION_ACTIVE_JOBS: OnceCell<Mutex<HashMap<String, String>>> = OnceCell::new();
 /// Jobs paused by scheduler policy; only these are auto-resumed when allowed again.
 static SCHEDULER_PAUSED: OnceCell<Mutex<HashSet<String>>> = OnceCell::new();
+/// Global schedule cache. SQLite is persistence, not a two-second polling source.
+static GLOBAL_SCHEDULE_CACHE: OnceCell<Mutex<scheduler::GlobalSchedule>> = OnceCell::new();
+/// The completion watcher and telemetry loop run together; share their aria2 stat sample.
+static MONITOR_GLOBAL_STAT: OnceCell<Mutex<Option<(Instant, Value)>>> = OnceCell::new();
 /// Authentication secrets are intentionally memory-only and disappear on restart.
 static JOB_PASSWORDS: OnceCell<Mutex<HashMap<String, String>>> = OnceCell::new();
 
@@ -126,6 +134,112 @@ fn scheduler_paused() -> &'static Mutex<HashSet<String>> {
     SCHEDULER_PAUSED.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+fn global_schedule_cache() -> &'static Mutex<scheduler::GlobalSchedule> {
+    GLOBAL_SCHEDULE_CACHE.get_or_init(|| Mutex::new(scheduler::GlobalSchedule::default()))
+}
+
+fn initialize_global_schedule() -> Result<(), String> {
+    let schedule = scheduler::load_global(&state_dir())?;
+    let mut cached = global_schedule_cache()
+        .lock()
+        .map_err(|_| "global schedule cache is unavailable".to_string())?;
+    *cached = schedule;
+    Ok(())
+}
+
+fn monitor_global_stat(client: &Aria2) -> Option<Value> {
+    let cache = MONITOR_GLOBAL_STAT.get_or_init(|| Mutex::new(None));
+    let mut cached = cache.lock().ok()?;
+    if let Some((sampled_at, value)) = cached.as_ref()
+        && sampled_at.elapsed() < Duration::from_millis(1500)
+    {
+        return Some(value.clone());
+    }
+    let value = tauri::async_runtime::block_on(client.global_stat()).ok()?;
+    *cached = Some((Instant::now(), value.clone()));
+    Some(value)
+}
+
+fn bridge_token_file() -> std::path::PathBuf {
+    state_dir().join(".downman-bridge-token")
+}
+
+fn generate_bridge_token() -> String {
+    let mut rng = rand::rng();
+    (0..48)
+        .map(|_| {
+            b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+                [rng.random_range(0..62)] as char
+        })
+        .collect()
+}
+
+fn write_private_token(path: &std::path::Path, token: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("could not create bridge token folder: {error}"))?;
+    }
+    let temporary = path.with_extension(format!("token-{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&temporary);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .map_err(|error| format!("could not create bridge token: {error}"))?;
+    file.write_all(token.as_bytes())
+        .and_then(|_| file.write_all(b"\n"))
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("could not save bridge token: {error}"))?;
+    std::fs::rename(&temporary, path)
+        .map_err(|error| format!("could not finalize bridge token: {error}"))
+}
+
+fn load_or_create_bridge_token(path: &std::path::Path) -> Result<String, String> {
+    if let Ok(token) = std::fs::read_to_string(path) {
+        let token = token.trim();
+        if token.len() >= 32 && token.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return Ok(token.to_string());
+        }
+    }
+    let token = generate_bridge_token();
+    write_private_token(path, &token)?;
+    Ok(token)
+}
+
+fn initialize_bridge_token() -> Result<(), String> {
+    let token = load_or_create_bridge_token(&bridge_token_file())?;
+    let cache = BRIDGE_TOKEN.get_or_init(|| Mutex::new(String::new()));
+    let mut cached = cache
+        .lock()
+        .map_err(|_| "bridge token cache is unavailable".to_string())?;
+    *cached = token;
+    Ok(())
+}
+
+fn bridge_token() -> String {
+    BRIDGE_TOKEN
+        .get_or_init(|| Mutex::new(String::new()))
+        .lock()
+        .map(|token| token.clone())
+        .unwrap_or_default()
+}
+
+fn token_matches(candidate: &str, expected: &str) -> bool {
+    if candidate.len() != expected.len() {
+        return false;
+    }
+    candidate
+        .bytes()
+        .zip(expected.bytes())
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
+fn pairing_is_open(now: u64, until: u64) -> bool {
+    until > 0 && now <= until
+}
+
 fn job_passwords() -> &'static Mutex<HashMap<String, String>> {
     JOB_PASSWORDS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -151,8 +265,119 @@ struct LifetimeStatsState {
     seen: HashSet<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ResourceIdentity {
+    size: Option<u64>,
+    strong_etag: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceEditPreview {
+    old_url: String,
+    new_url: String,
+    completed_bytes: u64,
+    can_reuse: bool,
+    requires_restart: bool,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppUpdateStatus {
+    current: String,
+    latest: String,
+    available: bool,
+    url: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceEditRecord {
+    old_url: String,
+    new_url: String,
+    edited_at: u64,
+    reused_partial: bool,
+}
+
 fn lifetime_stats_state() -> &'static Mutex<LifetimeStatsState> {
     LIFETIME_STATS.get_or_init(|| Mutex::new(LifetimeStatsState::default()))
+}
+
+fn strong_etag(value: Option<&reqwest::header::HeaderValue>) -> Option<String> {
+    let value = value?.to_str().ok()?.trim();
+    (!value.is_empty() && !value.starts_with("W/")).then(|| value.to_string())
+}
+
+fn content_range_total(value: Option<&reqwest::header::HeaderValue>) -> Option<u64> {
+    value?
+        .to_str()
+        .ok()?
+        .rsplit_once('/')?
+        .1
+        .parse::<u64>()
+        .ok()
+}
+
+fn resource_identity(response: &reqwest::Response) -> ResourceIdentity {
+    let headers = response.headers();
+    ResourceIdentity {
+        size: content_range_total(headers.get(reqwest::header::CONTENT_RANGE)).or_else(|| {
+            headers
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+        }),
+        strong_etag: strong_etag(headers.get(reqwest::header::ETAG)),
+    }
+}
+
+fn identities_allow_resume(old: &ResourceIdentity, new: &ResourceIdentity) -> bool {
+    matches!(
+        (&old.strong_etag, old.size, &new.strong_etag, new.size),
+        (Some(old_etag), Some(old_size), Some(new_etag), Some(new_size))
+            if old_etag == new_etag && old_size == new_size && old_size > 0
+    )
+}
+
+async fn probe_resource_identity(url: &str) -> Result<ResourceIdentity, String> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|error| format!("could not create source probe: {error}"))?;
+    if let Ok(response) = client
+        .head(url)
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
+        .send()
+        .await
+        && response.status().is_success()
+    {
+        let identity = resource_identity(&response);
+        if identity.size.is_some() && identity.strong_etag.is_some() {
+            return Ok(identity);
+        }
+    }
+    let response = client
+        .get(url)
+        .header(reqwest::header::RANGE, "bytes=0-0")
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
+        .send()
+        .await
+        .map_err(|error| format!("could not probe source: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("source returned HTTP {}", response.status()));
+    }
+    Ok(resource_identity(&response))
+}
+
+fn normalized_edit_url(value: &str) -> Result<String, String> {
+    let mut url = reqwest::Url::parse(value.trim()).map_err(|_| "enter a valid HTTP URL")?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("source editing supports HTTP and HTTPS URLs only".into());
+    }
+    url.set_fragment(None);
+    Ok(url.to_string())
 }
 
 fn lifetime_stats_file() -> std::path::PathBuf {
@@ -830,7 +1055,10 @@ async fn gate_queues() {
     };
     let active = c.tell_active().await.unwrap_or(json!([]));
     let waiting = c.tell_waiting().await.unwrap_or(json!([]));
-    let global_schedule = scheduler::load_global(&state_dir()).unwrap_or_default();
+    let global_schedule = global_schedule_cache()
+        .lock()
+        .map(|schedule| schedule.clone())
+        .unwrap_or_default();
     let moment = scheduler::current_moment();
     let metadata = dl_meta()
         .lock()
@@ -1358,6 +1586,8 @@ struct DlMeta {
     network_override: scheduler::NetworkOverride,
     #[serde(default)]
     scheduler_paused: bool,
+    #[serde(default)]
+    source_edits: Vec<SourceEditRecord>,
 }
 
 static DL_META: OnceCell<Mutex<HashMap<String, DlMeta>>> = OnceCell::new();
@@ -1454,6 +1684,22 @@ fn transfer_job_metadata(old_gid: &str, new_gid: &str) {
     }
 }
 
+fn record_source_edit(gid: &str, old_url: &str, new_url: &str, reused_partial: bool) {
+    if let Ok(mut metadata) = dl_meta().lock() {
+        let edits = &mut metadata.entry(gid.to_string()).or_default().source_edits;
+        edits.push(SourceEditRecord {
+            old_url: old_url.to_string(),
+            new_url: new_url.to_string(),
+            edited_at: now_ms() as u64,
+            reused_partial,
+        });
+        if edits.len() > 20 {
+            edits.drain(..edits.len() - 20);
+        }
+    }
+    save_dl_meta();
+}
+
 fn mark_download_added(gid: &str) {
     if gid.is_empty() {
         return;
@@ -1522,6 +1768,23 @@ fn assign_profile_queue(url: &str, profile: &DownloadProfile) {
     }
 }
 
+fn transfer_queue_url(old_url: &str, new_url: &str) {
+    if old_url == new_url || old_url.is_empty() || new_url.is_empty() {
+        return;
+    }
+    let mut changed = false;
+    if let Ok(mut memberships) = qmember().lock()
+        && let Value::Object(map) = &mut *memberships
+        && let Some(queue) = map.remove(old_url)
+    {
+        map.insert(new_url.to_string(), queue);
+        changed = true;
+    }
+    if changed {
+        save_qmember();
+    }
+}
+
 #[tauri::command]
 fn set_dl_meta(
     gid: String,
@@ -1559,12 +1822,20 @@ fn get_dl_meta(gid: String) -> DlMeta {
 
 #[tauri::command]
 fn scheduler_get() -> Result<scheduler::GlobalSchedule, String> {
-    scheduler::load_global(&state_dir())
+    global_schedule_cache()
+        .lock()
+        .map(|schedule| schedule.clone())
+        .map_err(|_| "global schedule cache is unavailable".to_string())
 }
 
 #[tauri::command]
 fn scheduler_set(schedule: scheduler::GlobalSchedule) -> Result<scheduler::GlobalSchedule, String> {
-    scheduler::save_global(&state_dir(), schedule)
+    let saved = scheduler::save_global(&state_dir(), schedule)?;
+    let mut cached = global_schedule_cache()
+        .lock()
+        .map_err(|_| "global schedule cache is unavailable".to_string())?;
+    *cached = saved.clone();
+    Ok(saved)
 }
 
 #[tauri::command]
@@ -1881,7 +2152,9 @@ fn run_on_complete(gid: &str, path: &str, name: &str) {
             let full = cmd
                 .replace("{path}", &shell_quote(path))
                 .replace("{name}", &shell_quote(name));
-            let _ = Command::new("sh").arg("-c").arg(full).spawn();
+            let mut command = Command::new("sh");
+            command.arg("-c").arg(full);
+            spawn_reaped(command);
         }
         _ => {}
     }
@@ -2915,6 +3188,100 @@ async fn latest_ytdlp_tag() -> Result<String, String> {
         .ok_or_else(|| "could not resolve latest yt-dlp tag".into())
 }
 
+fn app_update_file() -> std::path::PathBuf {
+    state_dir().join(".downman-app-update.json")
+}
+
+fn load_app_update_state() {
+    if let Ok(contents) = std::fs::read_to_string(app_update_file())
+        && let Ok(value) = serde_json::from_str::<Value>(&contents)
+        && let Some(last_check) = value.get("last_check").and_then(Value::as_u64)
+    {
+        APP_LAST_CHECK.store(last_check, Ordering::Relaxed);
+    }
+}
+
+fn save_app_update_state(latest: &str) {
+    let value = json!({
+        "last_check": APP_LAST_CHECK.load(Ordering::Relaxed),
+        "latest": latest,
+    });
+    let _ = std::fs::write(app_update_file(), value.to_string());
+}
+
+fn version_triplet(value: &str) -> Option<[u64; 3]> {
+    let core = value.trim().trim_start_matches('v').split('-').next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    Some([major, minor, patch])
+}
+
+fn version_is_newer(candidate: &str, current: &str) -> bool {
+    matches!(
+        (version_triplet(candidate), version_triplet(current)),
+        (Some(candidate), Some(current)) if candidate > current
+    )
+}
+
+async fn fetch_app_update() -> Result<AppUpdateStatus, String> {
+    let current = env!("CARGO_PKG_VERSION").to_string();
+    let client = reqwest::Client::builder()
+        .user_agent(format!("DownMan/{current}"))
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response = client
+        .head("https://github.com/rai-himanshu07/DownMan/releases/latest")
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let url = response.url().to_string();
+    let latest = response
+        .url()
+        .path()
+        .rsplit('/')
+        .next()
+        .filter(|tag| version_triplet(tag).is_some())
+        .ok_or_else(|| "could not resolve the latest DownMan release".to_string())?
+        .trim_start_matches('v')
+        .to_string();
+    Ok(AppUpdateStatus {
+        available: version_is_newer(&latest, &current),
+        current,
+        latest,
+        url,
+    })
+}
+
+#[tauri::command]
+async fn app_update_check() -> Result<AppUpdateStatus, String> {
+    let status = fetch_app_update().await?;
+    APP_LAST_CHECK.store((now_ms() / 1000) as u64, Ordering::Relaxed);
+    save_app_update_state(&status.latest);
+    Ok(status)
+}
+
+fn start_app_update_check() {
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(10));
+        let now = (now_ms() / 1000) as u64;
+        if now.saturating_sub(APP_LAST_CHECK.load(Ordering::Relaxed)) < 24 * 3600 {
+            return;
+        }
+        if let Ok(status) = tauri::async_runtime::block_on(app_update_check())
+            && status.available
+        {
+            notify(
+                "DownMan update available",
+                &format!("Version {} is ready on GitHub Releases.", status.latest),
+            );
+        }
+    });
+}
+
 /// Keep yt-dlp fresh on our own schedule, independent of the distro package:
 /// a cheap tag check throttled to once a day that only downloads when a newer
 /// release exists. On first run with nothing usable, fetches one immediately.
@@ -3902,6 +4269,17 @@ fn stop_process_group(mut child: Child) {
     let _ = child.wait();
 }
 
+fn spawn_reaped(mut command: Command) {
+    match command.spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(error) => eprintln!("DownMan helper process: {error}"),
+    }
+}
+
 fn stop_engine(app: &tauri::AppHandle) {
     terminate_owned_process_groups();
     if let Some(client) = ARIA2.get() {
@@ -3939,10 +4317,21 @@ fn default_dl_dir() -> std::path::PathBuf {
     base.join("DownMan")
 }
 
-/// Stable location for DownMan's own state (history, rules, session, …). Always the
-/// default folder, so changing the download folder never strands existing state.
-fn state_dir() -> std::path::PathBuf {
+fn legacy_state_dir() -> std::path::PathBuf {
     default_dl_dir()
+}
+
+/// Stable XDG location for DownMan-owned state. User downloads stay separate.
+#[cfg(not(test))]
+fn state_dir() -> std::path::PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/share"))
+        .join("DownMan")
+}
+
+#[cfg(test)]
+fn state_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("downman-lib-tests-{}", std::process::id()))
 }
 
 #[tauri::command]
@@ -4961,6 +5350,8 @@ fn start_engine() -> Result<Child, String> {
 
 const MAX_BRIDGE_BODY_BYTES: u64 = 1024 * 1024;
 const MAX_BRIDGE_WORKERS: usize = 32;
+const BRIDGE_PROTOCOL_VERSION: u32 = 2;
+const BRIDGE_PAIRING_WINDOW_MS: u64 = 60_000;
 static BRIDGE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 struct BridgeWorkerGuard;
@@ -4988,6 +5379,62 @@ fn read_bridge_body(reader: &mut dyn std::io::Read) -> std::io::Result<Option<St
     }
 }
 
+fn bridge_request_token(req: &tiny_http::Request) -> &str {
+    req.headers()
+        .iter()
+        .find(|header| header.field.equiv("X-DownMan-Token"))
+        .map(|header| header.value.as_str())
+        .unwrap_or("")
+}
+
+fn bridge_request_authorized(req: &tiny_http::Request) -> bool {
+    let expected = bridge_token();
+    !expected.is_empty() && token_matches(bridge_request_token(req), &expected)
+}
+
+async fn bridge_task_path(gid: &str) -> Result<String, String> {
+    if let Some(path) = history_path(gid) {
+        return Ok(path);
+    }
+    if let Ok(jobs) = site_jobs().lock()
+        && let Some(path) = jobs
+            .iter()
+            .find(|job| job.get("gid").and_then(Value::as_str) == Some(gid))
+            .and_then(|job| job.get("files"))
+            .and_then(|files| files.get(0))
+            .and_then(|file| file.get("path"))
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+    {
+        return Ok(path.to_string());
+    }
+    client()?
+        .tell_status(gid)
+        .await
+        .map_err(|error| error.to_string())?
+        .get("files")
+        .and_then(|files| files.get(0))
+        .and_then(|file| file.get("path"))
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .map(String::from)
+        .ok_or_else(|| "download path is unavailable".to_string())
+}
+
+async fn run_bridge_action(action: &str, gid: String) -> Result<(), String> {
+    if gid.trim().is_empty() {
+        return Err("download id is required".into());
+    }
+    match action {
+        "pause" => pause(gid).await,
+        "resume" => resume(gid).await,
+        "retry" => retry_download(gid, None).await.map(|_| ()),
+        "open" => open_path(bridge_task_path(&gid).await?),
+        "reveal" => reveal_path(bridge_task_path(&gid).await?),
+        _ => Err("unsupported bridge action".into()),
+    }
+}
+
 fn handle_bridge_request(mut req: tiny_http::Request) {
     // Local-security gate: a web page must not be able to drive the bridge.
     // Browser fetches carry an Origin header — allow extension origins and
@@ -5008,13 +5455,13 @@ fn handle_bridge_request(mut req: tiny_http::Request) {
         );
         return;
     }
-    // Stamp ping time on every incoming request so the Settings card can show "last seen".
-    LAST_BRIDGE_PING.store(now_ms() as u64, Ordering::Relaxed);
     let cors =
         tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap();
-    let ctype =
-        tiny_http::Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type"[..])
-            .unwrap();
+    let ctype = tiny_http::Header::from_bytes(
+        &b"Access-Control-Allow-Headers"[..],
+        &b"Content-Type, X-DownMan-Token"[..],
+    )
+    .unwrap();
     if req.method() == &tiny_http::Method::Options {
         let _ = req.respond(
             tiny_http::Response::empty(204)
@@ -5024,6 +5471,55 @@ fn handle_bridge_request(mut req: tiny_http::Request) {
         return;
     }
     let path = req.url().to_string();
+    if path == "/pair" && req.method() == &tiny_http::Method::Post {
+        let now = now_ms() as u64;
+        let until = BRIDGE_PAIRING_UNTIL.swap(0, Ordering::AcqRel);
+        if !pairing_is_open(now, until) {
+            let _ = req.respond(
+                tiny_http::Response::from_string(
+                    json!({
+                        "ok": false,
+                        "error": "open pairing from DownMan Settings first",
+                        "protocolVersion": BRIDGE_PROTOCOL_VERSION
+                    })
+                    .to_string(),
+                )
+                .with_status_code(403)
+                .with_header(cors),
+            );
+            return;
+        }
+        LAST_BRIDGE_PING.store(now, Ordering::Relaxed);
+        let _ = req.respond(
+            tiny_http::Response::from_string(
+                json!({
+                    "ok": true,
+                    "token": bridge_token(),
+                    "protocolVersion": BRIDGE_PROTOCOL_VERSION
+                })
+                .to_string(),
+            )
+            .with_header(cors),
+        );
+        return;
+    }
+    if !bridge_request_authorized(&req) {
+        let _ = req.respond(
+            tiny_http::Response::from_string(
+                json!({
+                    "ok": false,
+                    "error": "browser extension is not paired",
+                    "code": "unauthorized",
+                    "protocolVersion": BRIDGE_PROTOCOL_VERSION
+                })
+                .to_string(),
+            )
+            .with_status_code(401)
+            .with_header(cors),
+        );
+        return;
+    }
+    LAST_BRIDGE_PING.store(now_ms() as u64, Ordering::Relaxed);
     // GET /rules -> interception rules the browser extension applies.
     if path == "/rules" && req.method() == &tiny_http::Method::Get {
         let out = rules()
@@ -5051,8 +5547,10 @@ fn handle_bridge_request(mut req: tiny_http::Request) {
         );
         return;
     }
-    let known_post = matches!(path.as_str(), "/rules" | "/grab" | "/formats" | "/add")
-        && req.method() == &tiny_http::Method::Post;
+    let known_post = matches!(
+        path.as_str(),
+        "/rules" | "/grab" | "/formats" | "/action" | "/add"
+    ) && req.method() == &tiny_http::Method::Post;
     if !known_post {
         let _ = req.respond(
             tiny_http::Response::from_string("{\"ok\":false,\"error\":\"not found\"}")
@@ -5093,6 +5591,27 @@ fn handle_bridge_request(mut req: tiny_http::Request) {
     let v: Value = serde_json::from_str(&body).unwrap_or(json!({}));
     let json_ct =
         tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+
+    if path == "/action" && req.method() == &tiny_http::Method::Post {
+        let action = v.get("action").and_then(Value::as_str).unwrap_or("");
+        let gid = v
+            .get("gid")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let result = tauri::async_runtime::block_on(run_bridge_action(action, gid));
+        let (status, response) = match result {
+            Ok(()) => (200, json!({ "ok": true })),
+            Err(error) => (400, json!({ "ok": false, "error": error })),
+        };
+        let _ = req.respond(
+            tiny_http::Response::from_string(response.to_string())
+                .with_status_code(status)
+                .with_header(cors)
+                .with_header(json_ct),
+        );
+        return;
+    }
 
     // POST /rules { enabled } -> keep the extension's quick toggle and the
     // in-app Browser interception setting on one persisted source of truth.
@@ -5544,6 +6063,224 @@ async fn resume(gid: String) -> Result<(), String> {
         return Ok(());
     }
     client()?.unpause(&gid).await.map_err(|e| e.to_string())
+}
+
+fn source_edit_fields(task: &Value) -> Result<(String, u32, String, String, u64), String> {
+    let status = task.get("status").and_then(Value::as_str).unwrap_or("");
+    if !matches!(status, "paused" | "waiting") {
+        return Err("pause the download before editing its source".into());
+    }
+    if task.get("bittorrent").is_some() || task.get("infoHash").is_some() {
+        return Err("torrent sources cannot be edited".into());
+    }
+    let file = task
+        .get("files")
+        .and_then(Value::as_array)
+        .and_then(|files| (files.len() == 1).then(|| &files[0]))
+        .ok_or_else(|| "source editing supports one-file downloads only".to_string())?;
+    let file_index = file
+        .get("index")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1);
+    let old_url = file
+        .get("uris")
+        .and_then(Value::as_array)
+        .and_then(|uris| uris.first())
+        .and_then(|uri| uri.get("uri"))
+        .and_then(Value::as_str)
+        .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+        .map(String::from)
+        .ok_or_else(|| "download does not have an editable HTTP source".to_string())?;
+    let path = file
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| std::path::Path::new(path).is_absolute())
+        .map(String::from)
+        .ok_or_else(|| "download output path is unavailable".to_string())?;
+    let completed = task
+        .get("completedLength")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    Ok((status.to_string(), file_index, old_url, path, completed))
+}
+
+async fn source_edit_preview_inner(gid: &str, new_url: &str) -> Result<SourceEditPreview, String> {
+    if gid.starts_with("site-") {
+        return Err("site-media sources cannot be edited".into());
+    }
+    let new_url = normalized_edit_url(new_url)?;
+    let task = client()?
+        .tell_status(gid)
+        .await
+        .map_err(|error| error.to_string())?;
+    let (_, _, old_url, _, completed_bytes) = source_edit_fields(&task)?;
+    if old_url == new_url {
+        return Ok(SourceEditPreview {
+            old_url,
+            new_url,
+            completed_bytes,
+            can_reuse: true,
+            requires_restart: false,
+            reason: "Source is unchanged.".into(),
+        });
+    }
+    if completed_bytes == 0 {
+        return Ok(SourceEditPreview {
+            old_url,
+            new_url,
+            completed_bytes,
+            can_reuse: true,
+            requires_restart: false,
+            reason: "No downloaded bytes need to be reused.".into(),
+        });
+    }
+    let (old_identity, new_identity) = tokio::join!(
+        probe_resource_identity(&old_url),
+        probe_resource_identity(&new_url)
+    );
+    let can_reuse = matches!(
+        (&old_identity, &new_identity),
+        (Ok(old), Ok(new)) if identities_allow_resume(old, new)
+    );
+    let reason = if can_reuse {
+        "Both sources report the same strong ETag and size; partial bytes can be kept.".to_string()
+    } else {
+        match (old_identity, new_identity) {
+            (Err(error), _) => format!("The current source could not prove identity ({error})."),
+            (_, Err(error)) => {
+                format!("The replacement source could not prove identity ({error}).")
+            }
+            _ => "Strong ETag and size do not match; continuing could corrupt the file.".into(),
+        }
+    };
+    Ok(SourceEditPreview {
+        old_url,
+        new_url,
+        completed_bytes,
+        can_reuse,
+        requires_restart: !can_reuse,
+        reason,
+    })
+}
+
+#[tauri::command]
+async fn source_edit_preview(gid: String, new_url: String) -> Result<SourceEditPreview, String> {
+    source_edit_preview_inner(&gid, &new_url).await
+}
+
+#[tauri::command]
+async fn source_edit_apply(
+    gid: String,
+    new_url: String,
+    restart_from_zero: bool,
+) -> Result<Value, String> {
+    let preview = source_edit_preview_inner(&gid, &new_url).await?;
+    if preview.old_url == preview.new_url {
+        return Ok(json!({ "gid": gid, "reused": true, "changed": false }));
+    }
+    if preview.requires_restart && !restart_from_zero {
+        return Err("source identity differs; confirm restart from zero".into());
+    }
+
+    let c = client()?;
+    let mut task = c
+        .tell_status(&gid)
+        .await
+        .map_err(|error| error.to_string())?;
+    let (status, file_index, old_url, path, _) = source_edit_fields(&task)?;
+    if old_url != preview.old_url {
+        return Err("download source changed while the edit was open".into());
+    }
+    if status == "waiting" {
+        c.pause(&gid).await.map_err(|error| error.to_string())?;
+        task = c
+            .tell_status(&gid)
+            .await
+            .map_err(|error| error.to_string())?;
+        source_edit_fields(&task)?;
+    }
+
+    if preview.can_reuse {
+        c.change_uri(
+            &gid,
+            file_index,
+            vec![preview.old_url.clone()],
+            vec![preview.new_url.clone()],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        transfer_queue_url(&preview.old_url, &preview.new_url);
+        record_source_edit(&gid, &preview.old_url, &preview.new_url, true);
+        return Ok(json!({ "gid": gid, "reused": true, "changed": true }));
+    }
+
+    let mut options = c
+        .get_option(&gid)
+        .await
+        .map_err(|error| error.to_string())?
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    let output = std::path::Path::new(&path);
+    let dir = output
+        .parent()
+        .ok_or("download output folder is unavailable")?;
+    let name = output
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or("download output name is unavailable")?;
+    options.insert("dir".into(), json!(dir.display().to_string()));
+    options.insert("out".into(), json!(name));
+    options.insert("pause".into(), json!("true"));
+    options.insert("allow-overwrite".into(), json!("true"));
+    options.insert("auto-file-renaming".into(), json!("false"));
+    let preserve_no_organize = no_organize()
+        .lock()
+        .map(|items| items.contains(&gid))
+        .unwrap_or(false);
+
+    c.remove(&gid).await.map_err(|error| error.to_string())?;
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.aria2"));
+    let new_gid = match c
+        .add_uri(
+            vec![preview.new_url.clone()],
+            Value::Object(options.clone()),
+        )
+        .await
+    {
+        Ok(new_gid) => new_gid,
+        Err(error) => {
+            let rollback = c
+                .add_uri(vec![preview.old_url.clone()], Value::Object(options))
+                .await;
+            if let Ok(rollback_gid) = rollback {
+                mark_download_added(&rollback_gid);
+                transfer_job_metadata(&gid, &rollback_gid);
+                if preserve_no_organize && let Ok(mut items) = no_organize().lock() {
+                    items.remove(&gid);
+                    items.insert(rollback_gid);
+                }
+                return Err(format!(
+                    "replacement failed; original source was requeued from zero: {error}"
+                ));
+            }
+            return Err(format!(
+                "replacement and original-source recovery failed: {error}"
+            ));
+        }
+    };
+    mark_download_added(&new_gid);
+    transfer_job_metadata(&gid, &new_gid);
+    transfer_queue_url(&preview.old_url, &preview.new_url);
+    record_source_edit(&new_gid, &preview.old_url, &preview.new_url, false);
+    if preserve_no_organize && let Ok(mut items) = no_organize().lock() {
+        items.remove(&gid);
+        items.insert(new_gid.clone());
+    }
+    Ok(json!({ "gid": new_gid, "reused": false, "changed": true }))
 }
 
 #[tauri::command]
@@ -6873,21 +7610,80 @@ fn desktop_exec_arg(path: &std::path::Path) -> String {
     format!("\"{escaped}\"")
 }
 
+fn autostart_file() -> Result<std::path::PathBuf, String> {
+    dirs::config_dir()
+        .map(|dir| dir.join("autostart").join("downman.desktop"))
+        .ok_or_else(|| "no config dir".to_string())
+}
+
+fn autostart_executable() -> Result<std::path::PathBuf, String> {
+    std::env::var_os("APPIMAGE")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_file())
+        .map(Ok)
+        .unwrap_or_else(|| std::env::current_exe().map_err(|error| error.to_string()))
+}
+
+fn autostart_entry(executable: &std::path::Path) -> String {
+    format!(
+        "[Desktop Entry]\nType=Application\nName=DownMan\nComment=Download manager\nExec={} --hidden\nIcon=downman\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+        desktop_exec_arg(executable)
+    )
+}
+
+fn autostart_entry_is_enabled(content: &str) -> bool {
+    !content.lines().any(|line| {
+        let Some((key, value)) = line.split_once('=') else {
+            return false;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        (key.eq_ignore_ascii_case("Hidden") && value.eq_ignore_ascii_case("true"))
+            || (key.eq_ignore_ascii_case("X-GNOME-Autostart-enabled")
+                && value.eq_ignore_ascii_case("false"))
+    })
+}
+
+fn write_autostart_entry(file: &std::path::Path, content: &str) -> Result<(), String> {
+    let dir = file.parent().ok_or("invalid autostart path")?;
+    std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+    let temporary = file.with_extension(format!("desktop-{}.tmp", std::process::id()));
+    std::fs::write(&temporary, content).map_err(|error| error.to_string())?;
+    std::fs::rename(&temporary, file).map_err(|error| error.to_string())
+}
+
+fn repair_autostart_entry_at(
+    file: &std::path::Path,
+    executable: &std::path::Path,
+) -> Result<bool, String> {
+    let current = std::fs::read_to_string(file).map_err(|error| error.to_string())?;
+    if !autostart_entry_is_enabled(&current) {
+        return Ok(false);
+    }
+    let desired = autostart_entry(executable);
+    if current == desired {
+        return Ok(false);
+    }
+    write_autostart_entry(file, &desired)?;
+    Ok(true)
+}
+
+fn repair_autostart_entry() -> Result<bool, String> {
+    if cfg!(debug_assertions) {
+        return Ok(false);
+    }
+    let file = autostart_file()?;
+    if !file.exists() {
+        return Ok(false);
+    }
+    repair_autostart_entry_at(&file, &autostart_executable()?)
+}
+
 #[tauri::command]
 fn set_autostart(enable: bool) -> Result<(), String> {
-    let dir = dirs::config_dir().ok_or("no config dir")?.join("autostart");
-    let file = dir.join("downman.desktop");
+    let file = autostart_file()?;
     if enable {
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let exe = std::env::var_os("APPIMAGE")
-            .map(std::path::PathBuf::from)
-            .filter(|path| path.is_file())
-            .unwrap_or(std::env::current_exe().map_err(|e| e.to_string())?);
-        let content = format!(
-            "[Desktop Entry]\nType=Application\nName=DownMan\nComment=Download manager\nExec={} --hidden\nIcon=downman\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
-            desktop_exec_arg(&exe)
-        );
-        std::fs::write(&file, content).map_err(|e| e.to_string())?;
+        write_autostart_entry(&file, &autostart_entry(&autostart_executable()?))?;
     } else {
         let _ = std::fs::remove_file(&file);
     }
@@ -6896,9 +7692,10 @@ fn set_autostart(enable: bool) -> Result<(), String> {
 
 #[tauri::command]
 fn autostart_enabled() -> bool {
-    dirs::config_dir()
-        .map(|c| c.join("autostart").join("downman.desktop").exists())
-        .unwrap_or(false)
+    autostart_file()
+        .ok()
+        .and_then(|file| std::fs::read_to_string(file).ok())
+        .is_some_and(|content| autostart_entry_is_enabled(&content))
 }
 
 // ---- BitTorrent tracker auto-update (P5) ----
@@ -7206,7 +8003,7 @@ fn start_telemetry() {
         loop {
             std::thread::sleep(Duration::from_secs(2));
             let Some(c) = ARIA2.get() else { continue };
-            let Ok(stat) = tauri::async_runtime::block_on(c.global_stat()) else {
+            let Some(stat) = monitor_global_stat(c) else {
                 continue;
             };
             let num = |k: &str| {
@@ -7374,7 +8171,7 @@ fn start_watcher() {
 
             // aria2 finished downloads.
             if let Some(c) = ARIA2.get() {
-                if let Ok(stat) = tauri::async_runtime::block_on(c.global_stat()) {
+                if let Some(stat) = monitor_global_stat(c) {
                     let a = stat
                         .get("numActive")
                         .and_then(|v| v.as_str())
@@ -8364,13 +9161,47 @@ fn remote_info() -> Value {
 /// Info about the browser-extension bridge — port, running status, last ping timestamp.
 #[tauri::command]
 fn bridge_info() -> Value {
+    let now = now_ms() as u64;
+    let pairing_until = BRIDGE_PAIRING_UNTIL.load(Ordering::Relaxed);
     json!({
         "port": 6802,
         "url": "http://127.0.0.1:6802",
         "running": true,
+        "authRequired": true,
+        "protocolVersion": BRIDGE_PROTOCOL_VERSION,
+        "pairingUntilMs": if pairing_is_open(now, pairing_until) { pairing_until } else { 0 },
         "extensionFolder": "extensions",
         "lastPingMs": LAST_BRIDGE_PING.load(Ordering::Relaxed),
     })
+}
+
+#[tauri::command]
+fn bridge_pairing_begin() -> Value {
+    let until = now_ms() as u64 + BRIDGE_PAIRING_WINDOW_MS;
+    BRIDGE_PAIRING_UNTIL.store(until, Ordering::Release);
+    json!({
+        "pairingUntilMs": until,
+        "protocolVersion": BRIDGE_PROTOCOL_VERSION
+    })
+}
+
+#[tauri::command]
+fn bridge_pairing_cancel() {
+    BRIDGE_PAIRING_UNTIL.store(0, Ordering::Release);
+}
+
+#[tauri::command]
+fn bridge_token_rotate() -> Result<Value, String> {
+    let token = generate_bridge_token();
+    write_private_token(&bridge_token_file(), &token)?;
+    let mut cached = BRIDGE_TOKEN
+        .get_or_init(|| Mutex::new(String::new()))
+        .lock()
+        .map_err(|_| "bridge token cache is unavailable".to_string())?;
+    *cached = token;
+    BRIDGE_PAIRING_UNTIL.store(0, Ordering::Release);
+    LAST_BRIDGE_PING.store(0, Ordering::Relaxed);
+    Ok(json!({ "rotated": true }))
 }
 
 /// Resolve the bundled extension folder path and the pre-built .zip/.xpi archives.
@@ -8586,6 +9417,24 @@ where
     args.into_iter().any(|arg| arg.as_ref() == "--hidden")
 }
 
+fn initial_launch_requests_hidden<I, S>(
+    args: I,
+    desktop_autostart_id: Option<&std::ffi::OsStr>,
+    launched_desktop_file: Option<&std::ffi::OsStr>,
+    configured_autostart_file: Option<&std::path::Path>,
+) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    launch_requests_hidden(args)
+        || desktop_autostart_id.is_some()
+        || matches!(
+            (launched_desktop_file, configured_autostart_file),
+            (Some(launched), Some(configured)) if std::path::Path::new(launched) == configured
+        )
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -8612,13 +9461,23 @@ pub fn run() {
         })
         .setup(|app| {
             APP.set(app.handle().clone()).ok();
+            if let Err(error) = repair_autostart_entry() {
+                eprintln!("DownMan autostart repair: {error}");
+            }
+            state_db::migrate_state_root(&legacy_state_dir(), &state_dir())
+                .map_err(|error| format!("DownMan state migration: {error}"))?;
             profiles::initialize(&state_dir())
                 .map_err(|error| format!("DownMan profile database: {error}"))?;
+            initialize_global_schedule()
+                .map_err(|error| format!("DownMan scheduler database: {error}"))?;
+            initialize_bridge_token()
+                .map_err(|error| format!("DownMan browser bridge: {error}"))?;
             load_dl_dir();
             load_history();
             load_rules();
             load_categories();
             load_lifetime_stats();
+            load_app_update_state();
             load_queues();
             load_qmember();
             load_grabbed();
@@ -8673,7 +9532,15 @@ pub fn run() {
             // GNOME/Wayland and would let it appear briefly first. A manual launch shows
             // the window here; showing it also re-arms the title-bar min/max/close
             // buttons, which stay inert on GNOME/Wayland until the surface is reconfigured.
-            let start_hidden = launch_requests_hidden(std::env::args());
+            let desktop_autostart_id = std::env::var_os("DESKTOP_AUTOSTART_ID");
+            let launched_desktop_file = std::env::var_os("GIO_LAUNCHED_DESKTOP_FILE");
+            let configured_autostart_file = autostart_file().ok();
+            let start_hidden = initial_launch_requests_hidden(
+                std::env::args(),
+                desktop_autostart_id.as_deref(),
+                launched_desktop_file.as_deref(),
+                configured_autostart_file.as_deref(),
+            );
             if !start_hidden && let Some(w) = app.get_webview_window("main") {
                 let _ = w.show();
                 let _ = w.set_focus();
@@ -8705,12 +9572,15 @@ pub fn run() {
             start_metered_watch();
             start_telemetry();
             start_subscription_poller();
+            start_app_update_check();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             add_download,
             pause,
             resume,
+            source_edit_preview,
+            source_edit_apply,
             pause_all,
             resume_all,
             remove,
@@ -8776,6 +9646,9 @@ pub fn run() {
             set_dl_meta,
             get_dl_meta,
             bridge_info,
+            bridge_pairing_begin,
+            bridge_pairing_cancel,
+            bridge_token_rotate,
             import_urls,
             extension_paths,
             update_ytdlp,
@@ -8783,6 +9656,7 @@ pub fn run() {
             js_runtime_status,
             ytdlp_auto_update,
             set_ytdlp_auto_update,
+            app_update_check,
             set_clipboard_watch,
             set_metered_pause,
             set_power_block,
@@ -8949,6 +9823,156 @@ mod tests {
     fn hidden_launch_detection_is_shared_by_initial_and_duplicate_launches() {
         assert!(launch_requests_hidden(["/usr/bin/downman", "--hidden"]));
         assert!(!launch_requests_hidden(["/usr/bin/downman"]));
+        assert!(initial_launch_requests_hidden(
+            ["/usr/bin/downman"],
+            Some(std::ffi::OsStr::new("gnome-session-id")),
+            None,
+            None
+        ));
+        let autostart = std::path::Path::new("/home/user/.config/autostart/downman.desktop");
+        assert!(initial_launch_requests_hidden(
+            ["/usr/bin/downman"],
+            None,
+            Some(autostart.as_os_str()),
+            Some(autostart)
+        ));
+        assert!(!initial_launch_requests_hidden(
+            ["/usr/bin/downman"],
+            None,
+            Some(std::ffi::OsStr::new(
+                "/usr/share/applications/downman.desktop"
+            )),
+            Some(autostart)
+        ));
+        assert!(!initial_launch_requests_hidden(
+            ["/usr/bin/downman"],
+            None,
+            None,
+            Some(autostart)
+        ));
+    }
+
+    #[test]
+    fn autostart_entry_always_requests_a_hidden_launch() {
+        let entry = autostart_entry(std::path::Path::new("/opt/Down Man/downman"));
+        assert!(entry.contains("Exec=\"/opt/Down Man/downman\" --hidden\n"));
+        assert!(entry.contains("X-GNOME-Autostart-enabled=true\n"));
+    }
+
+    #[test]
+    fn stale_enabled_autostart_entry_is_repaired_without_reenabling_disabled_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "downman-autostart-repair-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let file = root.join("autostart/downman.desktop");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file,
+            "[Desktop Entry]\nExec=/usr/bin/downman\nX-GNOME-Autostart-enabled=true\n",
+        )
+        .unwrap();
+
+        assert!(
+            repair_autostart_entry_at(&file, std::path::Path::new("/usr/bin/downman")).unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            autostart_entry(std::path::Path::new("/usr/bin/downman"))
+        );
+        assert!(
+            !repair_autostart_entry_at(&file, std::path::Path::new("/usr/bin/downman")).unwrap()
+        );
+
+        let disabled = "[Desktop Entry]\nExec=/usr/bin/downman\nHidden=true\n";
+        std::fs::write(&file, disabled).unwrap();
+        assert!(
+            !repair_autostart_entry_at(&file, std::path::Path::new("/usr/bin/downman")).unwrap()
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), disabled);
+
+        let disabled = "[Desktop Entry]\nExec=/usr/bin/downman\nX-GNOME-Autostart-enabled=false\n";
+        std::fs::write(&file, disabled).unwrap();
+        assert!(
+            !repair_autostart_entry_at(&file, std::path::Path::new("/usr/bin/downman")).unwrap()
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), disabled);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bridge_tokens_persist_privately_and_compare_without_shortcuts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "downman-bridge-token-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let path = root.join("token");
+        let first = load_or_create_bridge_token(&path).unwrap();
+        let second = load_or_create_bridge_token(&path).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 48);
+        assert!(token_matches(&first, &second));
+        assert!(!token_matches(&first, &format!("{}x", &second[..47])));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(pairing_is_open(100, 101));
+        assert!(!pairing_is_open(102, 101));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_resume_requires_matching_strong_etag_and_size() {
+        let original = ResourceIdentity {
+            size: Some(1024),
+            strong_etag: Some("\"same\"".into()),
+        };
+        assert!(identities_allow_resume(&original, &original));
+        assert!(!identities_allow_resume(
+            &original,
+            &ResourceIdentity {
+                size: Some(2048),
+                strong_etag: Some("\"same\"".into()),
+            }
+        ));
+        assert!(!identities_allow_resume(
+            &original,
+            &ResourceIdentity {
+                size: Some(1024),
+                strong_etag: Some("\"different\"".into()),
+            }
+        ));
+        assert!(!identities_allow_resume(
+            &original,
+            &ResourceIdentity {
+                size: Some(1024),
+                strong_etag: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn source_edit_accepts_only_http_urls_and_removes_fragments() {
+        assert_eq!(
+            normalized_edit_url(" https://example.test/file.zip#fragment ").unwrap(),
+            "https://example.test/file.zip"
+        );
+        assert!(normalized_edit_url("file:///tmp/file.zip").is_err());
+        assert!(normalized_edit_url("magnet:?xt=urn:btih:abc").is_err());
+    }
+
+    #[test]
+    fn app_versions_compare_numeric_release_triplets() {
+        assert!(version_is_newer("v1.2.0", "1.1.9"));
+        assert!(version_is_newer("2.0", "1.99.99"));
+        assert!(!version_is_newer("1.2.0", "1.2.0"));
+        assert!(!version_is_newer("1.1.9", "1.2.0"));
+        assert_eq!(version_triplet("v1.2.3-beta.1"), Some([1, 2, 3]));
     }
 
     #[test]

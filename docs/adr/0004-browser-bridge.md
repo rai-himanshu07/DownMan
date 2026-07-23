@@ -37,3 +37,15 @@ Expose a tiny **localhost HTTP endpoint** from the Rust core and have the extens
 The bridge now **rejects requests carrying a web‑page `Origin`** (`http(s)://…` or `null`) with `403`,
 while still allowing extension origins and header‑less native callers. This closes the “a website could
 POST to the loopback socket” gap noted above, without needing native‑messaging pairing.
+
+## Update (2026-07-22)
+
+Operational routes now also require a persisted 48-character capability token in
+`X-DownMan-Token`. A browser installation obtains it only through `POST /pair` during a one-shot,
+60-second window explicitly opened from the app's Browser settings. The user can cancel pairing or
+rotate the token to revoke every paired extension. The token is stored under the application data
+root with mode `0600`; it is never exposed through diagnostics or the ordinary bridge-status API.
+
+The HTTP transport remains deliberate: the extension only polls while its popup is open, while the
+Rust backend continues to own schedules, completion handling, and follows. Authenticated routes now
+cover add, format lookup, rules, task snapshots, Site Grabber requests, and bounded task actions.

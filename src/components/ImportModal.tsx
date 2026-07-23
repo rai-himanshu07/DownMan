@@ -101,16 +101,16 @@ export default function ImportModal({ onClose }: { onClose: () => void }) {
     <div className="fixed inset-0 z-[80] grid place-items-center bg-black/60 backdrop-blur-sm animate-fade-up" onClick={onClose}>
       <div className="card w-[900px] max-w-[96vw] max-h-[88vh] flex flex-col p-5" onClick={(e) => e.stopPropagation()}>
         <h3 className="font-semibold mb-1">Import URL list</h3>
-        <p className="text-xs text-slate-500 mb-3">Clean, classify, deduplicate, and review every URL before anything starts.</p>
+        <p className="text-xs text-slate-500 mb-3">Clean, expand patterns, classify, deduplicate, and review every URL before anything starts.</p>
         {!review ? <>
           <textarea autoFocus value={text} onChange={(event) => setText(event.target.value)}
-            placeholder={"https://example.com/file1.zip\nhttps://example.com/file2.iso\nmagnet:?xt=urn:btih:..."}
+            placeholder={"https://example.com/file-[001-050].zip\nhttps://example.com/video.{mp4,webm}\nmagnet:?xt=urn:btih:..."}
             className="w-full h-40 bg-ink-900/60 border border-white/5 rounded-md p-3 text-sm font-mono placeholder:text-slate-600 focus:outline-none resize-none" />
           <div className="grid grid-cols-1 sm:grid-cols-[1fr_auto] gap-3 items-end mt-3">
             {profiles.length > 0 && <label className="block"><span className="block text-xs text-slate-500 mb-1">Download profile</span><select value={profileId} onChange={(event) => setProfileId(event.target.value)} className="control">{profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}</select></label>}
             <label className="flex items-center gap-2 text-sm text-slate-400 pb-2"><input type="checkbox" checked={estimateSizes} onChange={(event) => setEstimateSizes(event.target.checked)} />Estimate server sizes and ETA</label>
           </div>
-          <div className="text-xs text-slate-500 mt-2">{lines.length} non-empty {lines.length === 1 ? "line" : "lines"}</div>
+          <div className="text-xs text-slate-500 mt-2">{lines.length} non-empty {lines.length === 1 ? "line" : "lines"} · patterns: [1-100], [001-050], [1-10:2], [a-z], {'{mp4,mkv}'}</div>
         </> : <>
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-3 text-xs font-mono">
             <Metric label="Total" value={review.summary.totalCount} />

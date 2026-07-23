@@ -76,6 +76,10 @@ impl Aria2 {
         self.call("aria2.tellStatus", json!([gid])).await
     }
 
+    pub async fn get_option(&self, gid: &str) -> Result<Value> {
+        self.call("aria2.getOption", json!([gid])).await
+    }
+
     pub async fn remove(&self, gid: &str) -> Result<()> {
         // try active remove then stopped removal cleanup
         let _ = self.call("aria2.forceRemove", json!([gid])).await;
@@ -126,6 +130,18 @@ impl Aria2 {
             .call("aria2.changePosition", json!([gid, pos, how]))
             .await?;
         Ok(r.as_i64().unwrap_or(0))
+    }
+
+    /// Replace sources for one file in a paused/waiting download.
+    pub async fn change_uri(
+        &self,
+        gid: &str,
+        file_index: u32,
+        remove: Vec<String>,
+        add: Vec<String>,
+    ) -> Result<Value> {
+        self.call("aria2.changeUri", json!([gid, file_index, remove, add, 0]))
+            .await
     }
 
     /// Add a torrent from base64-encoded .torrent contents.

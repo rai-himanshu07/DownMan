@@ -62,3 +62,17 @@ editing a profile later cannot silently change its format, output, network, clip
 - Negative: two persistence families remain until a later migration is justified.
 - Risk: profile headers and proxy settings may contain sensitive values, so logs and diagnostics
   must continue to omit policy contents.
+
+## Update (2026-07-22)
+
+The original implementation accidentally resolved the state root to `~/Downloads/DownMan` despite
+this ADR choosing the platform application-data directory. State now lives at
+`~/.local/share/DownMan`. Before database initialization, DownMan copies an allowlist of durable
+legacy files and a checkpointed SQLite database through temporary files, runs `PRAGMA quick_check`,
+and atomically publishes the result. It never copies transient WAL/SHM files or runtime markers and
+does not delete or overwrite the legacy source. The state root uses mode `0700`; migrated state
+files, the SQLite database, the migration marker, and the bridge token use mode `0600`.
+
+The global schedule is also cached in backend memory after startup and updated after successful
+persistence. Queue enforcement no longer opens a WAL connection every two seconds merely to reread
+unchanged policy.

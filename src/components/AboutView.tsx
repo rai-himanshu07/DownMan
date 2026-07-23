@@ -17,6 +17,9 @@ export default function AboutView() {
   const [jsRt, setJsRt] = useState<string>("…");
   const [updating, setUpdating] = useState(false);
   const [autoUp, setAutoUp] = useState(true);
+  const [checkingApp, setCheckingApp] = useState(false);
+  const [appUpdate, setAppUpdate] = useState<{ current: string; latest: string; available: boolean; url: string } | null>(null);
+  const [appUpdateMessage, setAppUpdateMessage] = useState("");
 
   useEffect(() => {
     Promise.all([api.info(), api.bridgeInfo()]).then(([info, bridge]) => {
@@ -54,11 +57,25 @@ export default function AboutView() {
     }
   }
 
+  async function checkAppUpdate() {
+    setCheckingApp(true);
+    setAppUpdateMessage("");
+    try {
+      const status = await api.appUpdateCheck();
+      setAppUpdate(status);
+      setAppUpdateMessage(status.available ? `Version ${status.latest} is available.` : "DownMan is up to date.");
+    } catch (error) {
+      setAppUpdateMessage(`Could not check for updates: ${String(error)}`);
+    } finally {
+      setCheckingApp(false);
+    }
+  }
+
   async function copyDiagnostics() {
     if (!diag) return;
     setCopying(true);
     const text = [
-      `DownMan v1.1.0`,
+      `DownMan v1.2.0`,
       `License: MIT (see LICENSE)`,
       `Engine: aria2`,
       `Download folder: ${diag.dir}`,
@@ -90,7 +107,17 @@ export default function AboutView() {
         <img src="/downman.png" alt="DownMan" className="w-14 h-14 rounded-2xl" />
         <div>
           <div className="text-xl font-bold">DownMan</div>
-          <div className="text-sm text-slate-500">v1.1.0 · aria2 engine · Linux</div>
+          <div className="text-sm text-slate-500">v1.2.0 · aria2 engine · Linux</div>
+        </div>
+      </div>
+
+      <div className="card p-5 space-y-3">
+        <h3 className="font-semibold">App updates</h3>
+        <p className="text-sm text-slate-500">DownMan checks GitHub Releases at most once a day and only notifies you. Installation stays under your control.</p>
+        {appUpdateMessage && <div className={`text-xs ${appUpdate?.available ? "text-aurora-300" : "text-slate-500"}`}>{appUpdateMessage}</div>}
+        <div className="flex gap-2">
+          <button className="btn-ghost text-xs" disabled={checkingApp} onClick={checkAppUpdate}>{checkingApp ? "Checking…" : "Check for updates"}</button>
+          {appUpdate?.available && <button className="btn-primary text-xs" onClick={() => api.openUrl(appUpdate.url).catch(() => {})}>Open release</button>}
         </div>
       </div>
 
@@ -98,7 +125,7 @@ export default function AboutView() {
         <h3 className="font-semibold">Diagnostics</h3>
         {diag ? (
           <div className="space-y-1.5 text-sm text-slate-400 font-mono text-xs">
-            <DiagRow label="Version" value="1.1.0 · Linux" />
+            <DiagRow label="Version" value="1.2.0 · Linux" />
             <DiagRow label="License" value="MIT" />
             <DiagRow label="Download folder" value={diag.dir} />
             <DiagRow label="Bridge" value={`${diag.bridgeRunning ? "running" : "offline"} — ${diag.bridgeUrl}`} />

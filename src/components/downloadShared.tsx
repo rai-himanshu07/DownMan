@@ -1,6 +1,6 @@
 import { type ReactElement, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { Aria2Task, JobSchedule, NetworkOverride, api } from "../lib/api";
+import { Aria2Task, JobSchedule, NetworkOverride, SourceEditPreview, api } from "../lib/api";
 import { fmtBytes } from "../lib/format";
 import { toast } from "../lib/toast";
 import { queueOf, taskUrl, useStore } from "../store";
@@ -74,7 +74,7 @@ function cellStyle(f: number): React.CSSProperties {
 export function RowMenu({ t, name, category, total, detailsOpen, onToggleDetails }: {
   t: Aria2Task; name: string; category: string; total: number; detailsOpen: boolean; onToggleDetails: () => void;
 }) {
-  const { completed, canControl, path, hasPath, srcUrl } = taskFlags(t);
+  const { isSite, completed, canControl, isTorrent, path, hasPath, srcUrl } = taskFlags(t);
   const active = t.status === "active";
   const paused = t.status === "paused" || t.status === "waiting";
   const [menuOpen, setMenuOpen] = useState(false);
@@ -83,6 +83,7 @@ export function RowMenu({ t, name, category, total, detailsOpen, onToggleDetails
   const pauseTask = useStore((s) => s.pauseTask);
   const resumeTask = useStore((s) => s.resumeTask);
   const retryTask = useStore((s) => s.retryTask);
+  const poll = useStore((s) => s.poll);
   const [confirmDel, setConfirmDel] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [renameVal, setRenameVal] = useState("");
@@ -90,6 +91,11 @@ export function RowMenu({ t, name, category, total, detailsOpen, onToggleDetails
   const [verifying, setVerifying] = useState(false);
   const [verifyVal, setVerifyVal] = useState("");
   const [verifyMsg, setVerifyMsg] = useState("");
+  const [editingSource, setEditingSource] = useState(false);
+  const [sourceValue, setSourceValue] = useState("");
+  const [sourcePreview, setSourcePreview] = useState<SourceEditPreview | null>(null);
+  const [sourceBusy, setSourceBusy] = useState(false);
+  const [sourceMessage, setSourceMessage] = useState("");
   const kebabRef = useRef<HTMLButtonElement>(null);
   const [menuPos, setMenuPos] = useState<{ top: number; left: number }>({ top: 0, left: 0 });
 
@@ -144,6 +150,43 @@ export function RowMenu({ t, name, category, total, detailsOpen, onToggleDetails
       setVerifyMsg("Couldn't verify — unrecognized hash type or unreadable file.");
     }
   }
+  const canEditSource = !!srcUrl && !isSite && !isTorrent && (t.status === "paused" || t.status === "waiting");
+  function openSourceEditor() {
+    setSourceValue(srcUrl);
+    setSourcePreview(null);
+    setSourceMessage("");
+    setEditingSource(true);
+    setMenuOpen(false);
+  }
+  async function previewSource() {
+    setSourceBusy(true);
+    setSourceMessage("Checking source identity…");
+    try {
+      const preview = await api.sourceEditPreview(t.gid, sourceValue);
+      setSourcePreview(preview);
+      setSourceValue(preview.newUrl);
+      setSourceMessage(preview.reason);
+    } catch (error) {
+      setSourcePreview(null);
+      setSourceMessage(String(error));
+    } finally {
+      setSourceBusy(false);
+    }
+  }
+  async function applySource(restartFromZero: boolean) {
+    setSourceBusy(true);
+    try {
+      const result = await api.sourceEditApply(t.gid, sourceValue, restartFromZero);
+      toast.success(result.reused ? "Download source updated; partial data was kept." : "Download source updated and restarted from zero.");
+      setEditingSource(false);
+      setShowProps(false);
+      await poll();
+    } catch (error) {
+      setSourceMessage(String(error));
+    } finally {
+      setSourceBusy(false);
+    }
+  }
 
   return (
     <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
@@ -164,6 +207,7 @@ export function RowMenu({ t, name, category, total, detailsOpen, onToggleDetails
             {completed && hasPath && <MenuItem onClick={() => act(() => api.openPath(path))}>Open file</MenuItem>}
             {hasPath && <MenuItem onClick={() => act(() => api.revealPath(path))}>Open folder</MenuItem>}
             {srcUrl && <MenuItem onClick={() => act(() => navigator.clipboard.writeText(srcUrl))}>Copy link</MenuItem>}
+            {canEditSource && <MenuItem onClick={openSourceEditor}>Edit source…</MenuItem>}
             {srcUrl && completed && <MenuItem onClick={() => act(() => api.redownload(srcUrl, path))}>Redownload</MenuItem>}
             {srcUrl && t.status === "error" && <MenuItem onClick={() => act(() => retryTask(t.gid))}>Retry</MenuItem>}
             {completed && hasPath && <MenuItem onClick={() => { setRenameVal(name); setRenaming(true); setMenuOpen(false); }}>Rename…</MenuItem>}
@@ -220,6 +264,7 @@ export function RowMenu({ t, name, category, total, detailsOpen, onToggleDetails
             )}
             {hasPath && <PropRow label="Saved to" value={path} copy />}
             {srcUrl && <PropRow label="Source URL" value={srcUrl} copy />}
+            {canEditSource && <div className="pt-2"><button className="btn-ghost !py-1.5 text-xs" onClick={openSourceEditor}>Edit source URL…</button></div>}
             {t.files?.length > 1 && <PropRow label="Files" value={`${t.files.length} files`} />}
             {t.connections && +t.connections > 0 && <PropRow label="Connections" value={t.connections} />}
             {t.numPieces && +t.numPieces > 0 && <PropRow label="Pieces" value={`${t.numPieces} × ${fmtBytes(+(t.pieceLength || 0))}`} />}
@@ -245,6 +290,26 @@ export function RowMenu({ t, name, category, total, detailsOpen, onToggleDetails
             <div className="flex justify-end gap-2 mt-4">
               <button className="btn-ghost" onClick={() => setVerifying(false)}>Close</button>
               <button className="btn-primary" onClick={doVerify}>Verify</button>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {editingSource && createPortal(
+        <div className="fixed inset-0 z-[80] grid place-items-center bg-black/60 backdrop-blur-sm" onClick={() => !sourceBusy && setEditingSource(false)}>
+          <div className="card w-[620px] max-w-[94vw] p-5" onClick={(event) => event.stopPropagation()}>
+            <h3 className="font-semibold mb-1">Edit download source</h3>
+            <p className="text-xs text-slate-500 mb-3">DownMan keeps partial data only when both servers prove the same strong ETag and file size.</p>
+            <input autoFocus value={sourceValue} onChange={(event) => { setSourceValue(event.target.value); setSourcePreview(null); setSourceMessage(""); }}
+              className="w-full bg-ink-900/60 border border-white/5 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-aurora-500/50" />
+            {sourcePreview && sourcePreview.completedBytes > 0 && <div className="mt-2 text-xs text-slate-500">Partial data: {fmtBytes(sourcePreview.completedBytes)}</div>}
+            {sourceMessage && <div className={`mt-2 text-xs break-words ${sourcePreview?.requiresRestart ? "text-amber-300" : sourcePreview?.canReuse ? "text-lime-400" : "text-slate-400"}`}>{sourceMessage}</div>}
+            <div className="flex justify-end gap-2 mt-4 flex-wrap">
+              <button className="btn-ghost" disabled={sourceBusy} onClick={() => setEditingSource(false)}>Cancel</button>
+              {!sourcePreview && <button className="btn-primary" disabled={sourceBusy || !sourceValue.trim()} onClick={previewSource}>{sourceBusy ? "Checking…" : "Check source"}</button>}
+              {sourcePreview?.canReuse && <button className="btn-primary" disabled={sourceBusy || sourcePreview.oldUrl === sourcePreview.newUrl} onClick={() => applySource(false)}>{sourceBusy ? "Applying…" : sourcePreview.oldUrl === sourcePreview.newUrl ? "No change" : "Apply and keep progress"}</button>}
+              {sourcePreview?.requiresRestart && <button className="btn-danger" disabled={sourceBusy} onClick={() => applySource(true)}>{sourceBusy ? "Restarting…" : "Discard partial data and restart"}</button>}
             </div>
           </div>
         </div>,

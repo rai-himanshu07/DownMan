@@ -29,14 +29,18 @@ a release and credit you in the advisory unless you prefer to remain anonymous.
 DownMan runs entirely on the local machine and opens only **loopback‑bound** surfaces:
 
 - **Browser bridge** — `http://127.0.0.1:6802`, used by the companion extension to hand off
-  downloads. It is **origin‑gated**: requests carrying a web‑page `Origin`
-  (`http(s)://…` or `null`) are rejected, so a website cannot silently drive it.
+  downloads. It is **origin-gated and capability-authenticated**: requests carrying a web-page
+  `Origin` (`http(s)://…` or `null`) are rejected, and operational routes require a token obtained
+  through a one-shot pairing window explicitly opened by the user. Resetting paired extensions
+  rotates that token immediately.
 - **aria2 JSON‑RPC** — `127.0.0.1:6810`, protected by a random per‑session secret token.
 - **Remote web UI** — **off by default**; when enabled it is token‑protected and intended
   for trusted LAN use only.
 
 The app also launches **aria2**, **yt‑dlp**, and **FFmpeg** as subprocesses and keeps
 **yt‑dlp** current by downloading official releases (checksum‑verified).
+App-owned workflow state is kept under `~/.local/share/DownMan` with a private state directory;
+the SQLite database and bridge token are readable only by the current user.
 
 ### In scope
 

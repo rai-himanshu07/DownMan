@@ -72,6 +72,15 @@ export interface Rules {
   blockAddresses: string[];
 }
 
+export interface SourceEditPreview {
+  oldUrl: string;
+  newUrl: string;
+  completedBytes: number;
+  canReuse: boolean;
+  requiresRestart: boolean;
+  reason: string;
+}
+
 export interface CategoryDef {
   name: string;
   exts: string[];
@@ -393,6 +402,8 @@ export const api = {
     invoke<string>("add_download", { uris, options }),
   pause: (gid: string) => invoke("pause", { gid }),
   resume: (gid: string) => invoke("resume", { gid }),
+  sourceEditPreview: (gid: string, newUrl: string) => invoke<SourceEditPreview>("source_edit_preview", { gid, newUrl }),
+  sourceEditApply: (gid: string, newUrl: string, restartFromZero: boolean) => invoke<{ gid: string; reused: boolean; changed: boolean }>("source_edit_apply", { gid, newUrl, restartFromZero }),
   pauseAll: () => invoke("pause_all"),
   resumeAll: () => invoke("resume_all"),
   remove: (gid: string) => invoke("remove", { gid }),
@@ -453,13 +464,17 @@ export const api = {
   setDlMeta: (gid: string, opts: { checksum?: string; oncomplete_action?: string; oncomplete_cmd?: string }) =>
     invoke("set_dl_meta", { gid, checksum: opts.checksum, onCompleteAction: opts.oncomplete_action, onCompleteCmd: opts.oncomplete_cmd }),
   getDlMeta: (gid: string) => invoke<{ checksum: string; verify: string; oncomplete_action: string; oncomplete_cmd: string }>("get_dl_meta", { gid }),
-  bridgeInfo: () => invoke<{ port: number; url: string; running: boolean; extensionFolder: string; lastPingMs: number }>("bridge_info"),
+  bridgeInfo: () => invoke<{ port: number; url: string; running: boolean; authRequired: boolean; protocolVersion: number; pairingUntilMs: number; extensionFolder: string; lastPingMs: number }>("bridge_info"),
+  bridgePairingBegin: () => invoke<{ pairingUntilMs: number; protocolVersion: number }>("bridge_pairing_begin"),
+  bridgePairingCancel: () => invoke("bridge_pairing_cancel"),
+  bridgeTokenRotate: () => invoke<{ rotated: boolean }>("bridge_token_rotate"),
   extensionPaths: () => invoke<{ dir: string; dirExists: boolean; crx: string; crxExists: boolean; xpi: string; xpiExists: boolean; xpiSigned: boolean }>("extension_paths"),
   ytdlpVersion: () => invoke<string>("ytdlp_version"),
   updateYtdlp: () => invoke<string>("update_ytdlp"),
   jsRuntimeStatus: () => invoke<string>("js_runtime_status"),
   ytdlpAutoUpdate: () => invoke<boolean>("ytdlp_auto_update"),
   setYtdlpAutoUpdate: (enable: boolean) => invoke("set_ytdlp_auto_update", { enable }),
+  appUpdateCheck: () => invoke<{ current: string; latest: string; available: boolean; url: string }>("app_update_check"),
   setClipboardWatch: (enable: boolean) => invoke("set_clipboard_watch", { enable }),
   setMeteredPause: (enable: boolean) => invoke("set_metered_pause", { enable }),
   setPowerBlock: (enable: boolean) => invoke("set_power_block", { enable }),

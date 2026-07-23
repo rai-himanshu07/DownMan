@@ -69,9 +69,24 @@ export default function App() {
   const [toast, setToast] = useState<{ msg: string; onYes?: () => void } | null>(null);
 
   useEffect(() => {
+    let interval: number | undefined;
+    const syncPolling = () => {
+      if (interval !== undefined) {
+        window.clearInterval(interval);
+        interval = undefined;
+      }
+      if (document.visibilityState === "visible") {
+        poll();
+        interval = window.setInterval(poll, 1000);
+      }
+    };
     poll();
-    const id = setInterval(poll, 1000);
-    return () => clearInterval(id);
+    syncPolling();
+    document.addEventListener("visibilitychange", syncPolling);
+    return () => {
+      document.removeEventListener("visibilitychange", syncPolling);
+      if (interval !== undefined) window.clearInterval(interval);
+    };
   }, [poll]);
 
   // Use a native right-click menu everywhere instead of the WebKit web menu.

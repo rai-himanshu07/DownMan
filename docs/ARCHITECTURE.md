@@ -43,7 +43,7 @@ flowchart TB
 | Component        | Bind                | Auth                       | Purpose                                   |
 | ---------------- | ------------------- | -------------------------- | ----------------------------------------- |
 | aria2 JSON‑RPC   | `127.0.0.1:6810`    | random 32‑char secret token | download control (add/pause/status/stat)  |
-| Extension bridge | `127.0.0.1:6802`    | loopback‑only; web‑page Origins refused | accept `POST /add` from the browser |
+| Extension bridge | `127.0.0.1:6802`    | capability token + web-page Origin refusal | extension add/rules/list/actions |
 | Vite dev server  | `localhost:1420`    | —                          | UI during `tauri dev` only                |
 
 `aria2c` is launched with `--rpc-listen-all=false`, so RPC is reachable only from localhost.
@@ -53,7 +53,8 @@ The RPC secret is generated per app launch and never leaves the process.
 
 ### Adding a download
 1. **From UI** → `AddModal` → `invoke("add_download", { uris, options })` → Rust → `aria2.addUri`.
-2. **From browser** → extension `POST http://127.0.0.1:6802/add` → bridge → `decide_route`
+2. **From browser** → the paired extension sends `X-DownMan-Token` with
+    `POST http://127.0.0.1:6802/add` → bridge → `decide_route`
     picks the engine from URL, content-type, and DOM evidence (direct file → aria2; page/stream →
     yt‑dlp; HLS/DASH merged by ffmpeg). Media actions carry a ranked candidate bundle so a failed
     source can advance to the next candidate.
@@ -111,10 +112,11 @@ polls, and startup clears stale claims left by an interrupted process.
 
 ### Persistence and migration
 
-`downman-state.sqlite3` uses bundled SQLite with foreign keys, WAL journaling, a busy timeout, and
+`~/.local/share/DownMan/downman-state.sqlite3` uses bundled SQLite with foreign keys, WAL journaling, a busy timeout, and
 idempotent schema migrations. It owns profiles, collection/preflight/search sessions, media archive,
 subscriptions, review inbox, and scheduler settings. The first database creation copies existing
-`.downman-*` state files into `.downman-1.0.1-backup` without deleting or rewriting the originals.
+state from the legacy `~/Downloads/DownMan` root through an atomic, integrity-checked migration.
+The legacy files remain untouched as a rollback copy.
 
 Existing history, rules, categories, queues, and download metadata remain readable in their legacy
 stores. Job metadata includes the resolved profile snapshot, schedule, and non-secret network
@@ -165,7 +167,9 @@ sequenceDiagram
 
 The key UX rule is **one action on the media the user chose**. There is no separate stream pill,
 badge, or global stream list. Passive network detection is correlated with a stable per-player ID,
-frame, playback time, content type, response size, and visible geometry. Candidates expire, are
+frame, playback time, content type, response size, visible geometry, and (for MSE players) which
+`MediaSource` consumed an observed URL. The MAIN-world probe reports URL/MIME/timing evidence only;
+it never copies media bytes and cannot introduce URLs absent from the network ledger. Candidates expire, are
 bounded per tab, and are stored in browser session storage so MV3 worker suspension does not erase
 them. Partial byte-range media responses are excluded from download candidates; nearby semantic page
 links are generic extractor evidence only when bound by direct ancestry or the nearest timestamp.
@@ -201,8 +205,9 @@ subscriptions/Review Inbox; bounded media search; browser rules; settings and di
 ## Security notes
 
 - RPC and bridge bind to loopback only; aria2 secret token is required on every RPC call.
-- Bridge is loopback‑bound and **origin‑gated**: requests carrying a web‑page `Origin`
-  (`http(s)://…` or `null`) are refused with `403`, so a website can't drive it; extension and native callers pass.
+- Bridge is loopback-bound, **origin-gated**, and capability-authenticated. Requests carrying a
+    web-page `Origin` (`http(s)://…` or `null`) are refused with `403`; operational routes also require
+    the paired extension's 48-character token. Pairing is a one-shot, 60-second user-approved window.
 - aria2's RPC secret and per-job HTTP passwords are never persisted. Profiles and job policy may
     persist user-supplied proxy/header configuration, so diagnostics must not print those values.
 - Presentation preferences remain in `localStorage`; backend-owned workflows and schedules use

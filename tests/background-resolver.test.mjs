@@ -24,6 +24,7 @@ function browserWorker(session = {}, options = {}) {
   const paused = [];
   const resumed = [];
   const actions = [];
+  const requests = [];
   const uiOptions = [];
   let runtimeLastError = null;
   let lastErrorReads = 0;
@@ -114,7 +115,8 @@ function browserWorker(session = {}, options = {}) {
     URL,
     DownManMediaResolver: resolver,
     clearTimeout,
-    fetch: async (url, init) => {
+    fetch: async (url, init = {}) => {
+      requests.push({ url: String(url), headers: { ...(init.headers || {}) } });
       if (String(url).endsWith("/rules")) {
         if (options.offline) throw new Error("app offline");
         const fallback = { enabled: true, autoExts: ["ZIP", "EXE", "MD"], blockSites: [], blockAddresses: [] };
@@ -146,7 +148,7 @@ function browserWorker(session = {}, options = {}) {
     });
   }
 
-  return { actions, cancelled, erased, lastErrorReads: () => lastErrorReads, listeners, message, paused, posted, resumed, session, uiOptions };
+  return { actions, cancelled, erased, lastErrorReads: () => lastErrorReads, listeners, message, paused, posted, requests, resumed, session, uiOptions };
 }
 
 async function waitFor(check, message) {
@@ -229,6 +231,70 @@ test("worker correlates the clicked player instead of choosing newer same-frame 
   assert.equal(worker.posted[0].candidates[0].url, "https://cdn.test/one?token=raw-one");
   assert.ok(worker.posted[0].candidates[0].reasons.includes("same-media-session"));
   assert.ok(!worker.posted[0].candidates[1].reasons.includes("same-media-session"));
+});
+
+test("paired worker sends its capability token on bridge requests", async () => {
+  const worker = browserWorker({}, { local: { bridgeToken: "paired-token" } });
+  const sender = { tab: { id: 31 }, frameId: 0 };
+  const directUrl = "https://cdn.test/exact-video.mp4";
+
+  const result = await worker.message({
+    dm: "media-intent",
+    intent: {
+      ...intent("paired-media", Date.now()),
+      currentSrc: directUrl,
+      sourceKind: "http",
+      contextKind: "document",
+      trigger: "button",
+    },
+  }, sender);
+
+  assert.equal(result.ok, true);
+  const addRequest = worker.requests.find((request) => request.url.endsWith("/add"));
+  assert.ok(addRequest);
+  assert.equal(addRequest.headers["X-DownMan-Token"], "paired-token");
+});
+
+test("MSE ownership binds only an observed candidate to the clicked player", async () => {
+  const worker = browserWorker();
+  const sender = { tab: { id: 29 }, frameId: 0 };
+  const clickedUrl = "https://video.cdn.test/clicked/master.m3u8?token=raw-one";
+  const neighbourUrl = "https://video.cdn.test/neighbour/master.m3u8?token=raw-two";
+  const unobservedUrl = "https://video.cdn.test/not-in-webrequest/master.m3u8";
+
+  await worker.message({ dm: "media-observed", intent: intent("media-one", Date.now()) }, sender);
+  await worker.message({ dm: "media-observed", intent: intent("media-two", Date.now()) }, sender);
+  for (const url of [clickedUrl, neighbourUrl]) {
+    worker.listeners.headersReceived[0]({
+      ...mediaResponse(url, 29, 0),
+      responseHeaders: [{ name: "content-type", value: "application/x-mpegURL" }],
+    });
+  }
+
+  const result = await worker.message({
+    dm: "media-intent",
+    intent: {
+      ...intent("media-one", Date.now()),
+      frameUrl: "https://social.test/home",
+      topUrl: "https://social.test/home",
+      feedContext: true,
+      contextKind: "collection",
+      trigger: "button",
+      mseEvidence: [
+        { url: clickedUrl, contentType: "video/mp4; codecs=avc1", observedAt: Date.now() },
+        { url: unobservedUrl, contentType: "video/mp4", observedAt: Date.now() },
+      ],
+    },
+  }, sender);
+
+  assert.equal(result.ok, true);
+  assert.equal(worker.posted.length, 1);
+  const payload = worker.posted[0];
+  const selected = payload.candidates[payload.selectedIndex];
+  assert.equal(selected.url, clickedUrl);
+  assert.equal(selected.mseOwned, true);
+  assert.ok(selected.mediaIds.includes("media-one"));
+  assert.ok(!payload.candidates.some((candidate) => candidate.url === unobservedUrl));
 });
 
 test("concurrent players keep unbound streams from auto-downloading", async () => {

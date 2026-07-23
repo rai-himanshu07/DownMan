@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "DownMan Connector",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvdwOMpUdiyHAbhpZDvza41qCtTnRS0ETosyYjuwDusiLfP8E5PeFRl7VTCCyTlUBdl6qYDeJ8YY19p/S/5fkMZzIXdJQAvQ1P0tzelZRU/a0Z6Y2QWTd9ONlqbGo55HKg7cQRd1zfFiyRz/h67Q3VKgD4b92iQhvLsho42fd6sW/YQ2I4gU3EO/eWNxSs7W2Uj2nYby5UgZv/004QyXda7dy4R6OmZ1U4m6Z3+QKjX+swN2Xkdt7pNwSlPmFWy5I5iOvN+nSLFH06sU9o2hDY7S6BSVgApQz84NykiA8+VpiM2IzyF8kUfN6W+3aFX5AQG3L9qB9ykQ8rCyz+7cMOQIDAQAB",
   "description": "Send downloads to DownMan with one-click per-media controls.",
   "permissions": ["downloads", "downloads.shelf", "downloads.ui", "contextMenus", "storage", "webRequest", "tabs", "notifications"],
@@ -14,6 +14,7 @@
   },
   "options_ui": { "page": "options.html", "open_in_tab": true },
   "content_scripts": [
+    { "matches": ["<all_urls>"], "js": ["mse-probe.js"], "run_at": "document_start", "all_frames": true, "world": "MAIN" },
     { "matches": ["<all_urls>"], "js": ["media-resolver.js", "content.js"], "run_at": "document_idle", "all_frames": true }
   ],
   "icons": { "16": "icon16.png", "32": "icon32.png", "48": "icon48.png", "128": "icon128.png" },

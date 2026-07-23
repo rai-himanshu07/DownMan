@@ -15,7 +15,7 @@ if [[ ! -f "$EXT_DIR/manifest.json" ]]; then
   exit 1
 fi
 
-FILES=(background.js media-resolver.js content.js options.html options.js popup.html popup.js
+FILES=(background.js media-resolver.js mse-probe.js content.js options.html options.js popup.html popup.js
        icon16.png icon32.png icon48.png icon128.png)
 
 cd "$EXT_DIR"

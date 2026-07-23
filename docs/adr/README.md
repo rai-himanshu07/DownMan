@@ -34,5 +34,5 @@ See [`0000-template.md`](0000-template.md). Status is one of:
 ## Conventions referenced by ADRs
 
 - aria2 JSON‑RPC: `127.0.0.1:6810`, per‑launch secret token, `--rpc-listen-all=false`.
-- Extension bridge: `127.0.0.1:6802`, `POST /add { uris, options }`.
+- Extension bridge: `127.0.0.1:6802`, one-time capability pairing, authenticated `POST /add`.
 - Download root: `~/Downloads/DownMan/`.

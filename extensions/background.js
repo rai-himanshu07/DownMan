@@ -9,7 +9,7 @@ const MediaResolver = globalThis.DownManMediaResolver;
 
 const DEFAULT_ENDPOINT = "http://127.0.0.1:6802";
 const WORKER_STARTED_AT = Date.now();
-const DM_BUILD = "1.1.0";
+const DM_BUILD = "1.2.0";
 // Verbose resolver diagnostics for the service-worker console. Off for releases.
 const DM_DEBUG = false;
 const NEW_DOWNLOAD_GRACE_MS = 60 * 1000;
@@ -206,6 +206,11 @@ async function endpoint() {
   return server || DEFAULT_ENDPOINT;
 }
 
+async function bridgeHeaders(headers = {}) {
+  const { bridgeToken } = await chrome.storage.local.get("bridgeToken");
+  return bridgeToken ? { ...headers, "X-DownMan-Token": bridgeToken } : { ...headers };
+}
+
 // Backend aria2 RPC calls are bounded at 10s; keep a buffer so the browser never
 // resumes at the exact instant DownMan may have accepted the same download.
 const BRIDGE_REQUEST_TIMEOUT_MS = 15000;
@@ -215,7 +220,11 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = BRIDGE_REQUEST_TI
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    return await fetch(url, {
+      ...options,
+      headers: await bridgeHeaders(options.headers),
+      signal: controller.signal,
+    });
   } finally {
     clearTimeout(timer);
   }
@@ -451,6 +460,20 @@ async function mediaBundle(tabId, frameId, rawIntent) {
   mergeCandidate(combined, pageCandidate(intent, frameId));
   if (intent.topUrl && intent.topUrl !== intent.frameUrl) {
     mergeCandidate(combined, pageCandidate(intent, frameId, { url: intent.topUrl, strength: 4 }));
+  }
+  // MAIN-world MSE evidence cannot introduce a download URL. It may only bind an
+  // already-observed webRequest candidate to the exact media element that consumed it.
+  const mseUrls = new Map(
+    (Array.isArray(intent.mseEvidence) ? intent.mseEvidence : [])
+      .filter((item) => item && /^https?:/i.test(item.url || ""))
+      .map((item) => [canonicalKey(item.url), item]),
+  );
+  for (const candidate of combined.values()) {
+    const evidence = mseUrls.get(candidate.canonicalKey);
+    if (!evidence || !intent.mediaId) continue;
+    candidate.mediaIds = [...new Set([...(candidate.mediaIds || []), intent.mediaId])].slice(-4);
+    candidate.mseOwned = true;
+    if (!candidate.contentType && evidence.contentType) candidate.contentType = evidence.contentType;
   }
   const candidates = MediaResolver.rankCandidates([...combined.values()], intent, now);
   let confidence = MediaResolver.confidenceFor(candidates);

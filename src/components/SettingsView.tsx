@@ -83,7 +83,8 @@ export default function SettingsView() {
   const [cookiesBrowser, setCookiesBrowser] = useState(localStorage.getItem("dm-cookies-browser") || "none");
   const [remote, setRemote] = useState(false);
   const [remoteUrl, setRemoteUrl] = useState("");
-  const [bridgeStatus, setBridgeStatus] = useState<{ running: boolean; lastPingMs: number; url: string } | null>(null);
+  const [bridgeStatus, setBridgeStatus] = useState<{ running: boolean; lastPingMs: number; url: string; protocolVersion: number; pairingUntilMs: number } | null>(null);
+  const [bridgeMessage, setBridgeMessage] = useState("");
   const [extPaths, setExtPaths] = useState<{ dir: string; dirExists: boolean; crx: string; crxExists: boolean; xpi: string; xpiExists: boolean; xpiSigned: boolean } | null>(null);
   const [showImport, setShowImport] = useState(false);
 
@@ -120,7 +121,7 @@ export default function SettingsView() {
     document.documentElement.style.setProperty("--dm-accent", accent);
     api.setAvScan(localStorage.getItem("dm-av") === "on").catch(() => {});
     api.remoteInfo().then((r) => { setRemote(r.enabled); setRemoteUrl(r.url); }).catch(() => {});
-    api.bridgeInfo().then((b) => setBridgeStatus({ running: b.running, lastPingMs: b.lastPingMs, url: b.url })).catch(() => {});
+    api.bridgeInfo().then((b) => setBridgeStatus({ running: b.running, lastPingMs: b.lastPingMs, url: b.url, protocolVersion: b.protocolVersion, pairingUntilMs: b.pairingUntilMs })).catch(() => {});
     api.extensionPaths().then(setExtPaths).catch(() => {});
   }, [accent]);
 
@@ -706,8 +707,36 @@ export default function SettingsView() {
             {bridgeStatus.lastPingMs > 0
               ? `Extension last seen ${Math.round((Date.now() - bridgeStatus.lastPingMs) / 1000)}s ago`
               : "Extension hasn't connected yet this session."}
+            <span className="ml-2 font-mono text-slate-600">protocol v{bridgeStatus.protocolVersion}</span>
           </div>
         )}
+        <div className="rounded-lg border border-white/5 bg-ink-900/40 p-4 space-y-2">
+          <div className="flex items-center gap-2 flex-wrap">
+            <button className="btn-primary !py-1.5 text-xs" onClick={async () => {
+              try {
+                const result = await api.bridgePairingBegin();
+                setBridgeStatus((status) => status ? { ...status, pairingUntilMs: result.pairingUntilMs } : status);
+                setBridgeMessage("Pairing is open for 60 seconds. Open the extension and click Pair with DownMan.");
+              } catch (error) { setBridgeMessage(String(error)); }
+            }}>Allow extension pairing</button>
+            {bridgeStatus && bridgeStatus.pairingUntilMs > Date.now() && (
+              <button className="btn-ghost !py-1.5 text-xs" onClick={async () => {
+                await api.bridgePairingCancel().catch(() => {});
+                setBridgeStatus((status) => status ? { ...status, pairingUntilMs: 0 } : status);
+                setBridgeMessage("Pairing cancelled.");
+              }}>Cancel</button>
+            )}
+            <button className="btn-ghost !py-1.5 text-xs ml-auto" onClick={async () => {
+              try {
+                await api.bridgeTokenRotate();
+                setBridgeStatus((status) => status ? { ...status, lastPingMs: 0, pairingUntilMs: 0 } : status);
+                setBridgeMessage("Paired extensions were disconnected. Open pairing again to reconnect them.");
+              } catch (error) { setBridgeMessage(String(error)); }
+            }}>Reset paired extensions</button>
+          </div>
+          <p className="text-xs text-slate-500">Pairing authorizes this browser installation without exposing DownMan to web pages.</p>
+          {bridgeMessage && <p className="text-xs text-aurora-300 break-words">{bridgeMessage}</p>}
+        </div>
         <div className="rounded-lg border border-white/5 bg-ink-900/40 p-4 space-y-4">
           <p className="text-sm font-medium text-slate-300">Install the browser extension</p>
 
@@ -778,8 +807,12 @@ export default function SettingsView() {
         </div>
         <div className="flex gap-2">
           <button className="btn-ghost text-xs" onClick={async () => {
-            try { const r = await fetch("http://127.0.0.1:6802/list"); if (r.ok) setBridgeStatus((b) => b ? { ...b, lastPingMs: Date.now() } : b); } catch { /* offline */ }
-          }}>Test connection</button>
+            try {
+              const status = await api.bridgeInfo();
+              setBridgeStatus({ running: status.running, lastPingMs: status.lastPingMs, url: status.url, protocolVersion: status.protocolVersion, pairingUntilMs: status.pairingUntilMs });
+              setBridgeMessage(status.lastPingMs > 0 ? "Bridge is running and a paired extension has connected." : "Bridge is running; no paired extension has connected this session.");
+            } catch (error) { setBridgeMessage(String(error)); }
+          }}>Refresh status</button>
           <button className="btn-ghost text-xs" onClick={() => setShowImport(true)}>
             <I.Plus className="w-3.5 h-3.5" /> Import URL list
           </button>

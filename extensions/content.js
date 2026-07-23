@@ -10,7 +10,35 @@ const MediaResolver = globalThis.DownManMediaResolver;
 const DM_DEBUG = false;
 const mediaIds = new WeakMap();
 const mediaObservedAt = new WeakMap();
+const MSE_SIGNAL = "__downmanMseSignalV1";
+const MSE_CONTROL = "__downmanMseControlV1";
+const MSE_EVIDENCE_TTL_MS = 2 * 60 * 1000;
+const mseSourceByObjectUrl = new Map();
+const mseEvidenceBySource = new Map();
 let mediaSequence = 0;
+
+window.addEventListener("message", (event) => {
+  if (event.source !== window || !event.data || event.data[MSE_SIGNAL] !== true) return;
+  const signal = event.data;
+  if (signal.kind === "object-url" && typeof signal.sourceId === "string" && typeof signal.objectUrl === "string") {
+    mseSourceByObjectUrl.set(signal.objectUrl, signal.sourceId);
+    return;
+  }
+  if (signal.kind !== "owned-url" || typeof signal.sourceId !== "string" || !/^https?:/i.test(signal.url || "")) return;
+  const now = Date.now();
+  const evidence = mseEvidenceBySource.get(signal.sourceId) || new Map();
+  evidence.set(signal.url, {
+    url: signal.url,
+    contentType: typeof signal.contentType === "string" ? signal.contentType : "",
+    observedAt: Number.isFinite(signal.observedAt) ? signal.observedAt : now,
+  });
+  for (const [url, item] of evidence) {
+    if (now - item.observedAt > MSE_EVIDENCE_TTL_MS) evidence.delete(url);
+  }
+  while (evidence.size > 8) evidence.delete(evidence.keys().next().value);
+  mseEvidenceBySource.set(signal.sourceId, evidence);
+}, false);
+window.postMessage({ [MSE_CONTROL]: true, kind: "ready" }, "*");
 
 function el(tag, css, html) {
   const e = document.createElement(tag);
@@ -219,6 +247,18 @@ function mediaKeysFor(media) {
   return [...keys];
 }
 
+function mseEvidenceFor(media) {
+  const src = media?.currentSrc || media?.src || "";
+  const sourceId = mseSourceByObjectUrl.get(src);
+  if (!sourceId) return [];
+  const now = Date.now();
+  const evidence = mseEvidenceBySource.get(sourceId);
+  if (!evidence) return [];
+  return [...evidence.values()]
+    .filter((item) => now - item.observedAt <= MSE_EVIDENCE_TTL_MS)
+    .slice(-8);
+}
+
 function mediaIntent(media, trigger) {
   const rect = media.getBoundingClientRect();
   const owner = media.closest?.("article, [role='article']");
@@ -241,6 +281,7 @@ function mediaIntent(media, trigger) {
     feedContext: !!owner,
     nested: !!nestedPostUnit(media, owner),
     mediaKeys: mediaKeysFor(media),
+    mseEvidence: mseEvidenceFor(media),
     contextKind: documentIdentity.specific ? "detail" : owner ? "collection" : "document",
     ownerMediaCount: owner?.querySelectorAll?.("video, audio").length || 1,
     element: media.tagName.toLowerCase(),
@@ -479,7 +520,7 @@ function onClick() {
     return;
   }
   if (DM_DEBUG) console.log("[DownMan] media-intent", JSON.stringify({
-    build: "1.1.0",
+    build: "1.2.0",
     context: intent.contextKind,
     element: intent.element,
     currentSrc: intent.currentSrc,

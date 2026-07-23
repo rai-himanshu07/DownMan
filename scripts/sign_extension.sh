@@ -31,7 +31,7 @@ rm -rf "$ART_DIR"
 
 # Stage a Firefox package with an event-page (background.scripts) manifest — the
 # source manifest is Chrome-native (service_worker), which Firefox won't accept.
-FILES=(background.js media-resolver.js content.js options.html options.js popup.html popup.js
+FILES=(background.js media-resolver.js mse-probe.js content.js options.html options.js popup.html popup.js
        icon16.png icon32.png icon48.png icon128.png)
 FF="$(mktemp -d)"
 trap 'rm -rf "$FF"' EXIT

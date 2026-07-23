@@ -1,12 +1,31 @@
 use once_cell::sync::Lazy;
 use rusqlite::Connection;
 use std::collections::HashSet;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
 pub const CORE_SCHEMA_VERSION: i64 = 7;
 pub const LEGACY_BACKUP_DIR: &str = ".downman-1.0.1-backup";
+const STATE_ROOT_MIGRATION_MARKER: &str = ".state-root-v1";
+const LEGACY_STATE_FILES: &[&str] = &[
+    ".downman-bridge-token",
+    ".downman-categories.json",
+    ".downman-dir.txt",
+    ".downman-dlmeta.json",
+    ".downman-grabbed.json",
+    ".downman-histlimit",
+    ".downman-history.json",
+    ".downman-lifetime-stats.json",
+    ".downman-oncomplete.json",
+    ".downman-queue-map.json",
+    ".downman-queues.json",
+    ".downman-rules.json",
+    ".downman-session",
+    ".downman-trackers.txt",
+    ".downman-ytdlp.json",
+];
 static INITIALIZED_DATABASES: Lazy<Mutex<HashSet<PathBuf>>> =
     Lazy::new(|| Mutex::new(HashSet::new()));
 
@@ -14,15 +33,128 @@ pub fn database_path(state_dir: &Path) -> PathBuf {
     state_dir.join("downman-state.sqlite3")
 }
 
+pub fn migrate_state_root(legacy_dir: &Path, state_dir: &Path) -> Result<(), String> {
+    if legacy_dir == state_dir {
+        return Ok(());
+    }
+    std::fs::create_dir_all(state_dir)
+        .map_err(|error| format!("could not create DownMan state directory: {error}"))?;
+    set_mode(state_dir, 0o700)?;
+    let marker = state_dir.join(STATE_ROOT_MIGRATION_MARKER);
+    if marker.exists() {
+        return Ok(());
+    }
+
+    for name in LEGACY_STATE_FILES {
+        copy_file_if_missing(&legacy_dir.join(name), &state_dir.join(name))?;
+    }
+    migrate_database_if_missing(legacy_dir, state_dir)?;
+    write_atomic(&marker, b"1\n")
+}
+
+fn copy_file_if_missing(source: &Path, destination: &Path) -> Result<(), String> {
+    if destination.exists() || !source.is_file() {
+        return Ok(());
+    }
+    let temporary = destination.with_extension(format!("migrate-{}.tmp", std::process::id()));
+    if temporary.exists() {
+        std::fs::remove_file(&temporary)
+            .map_err(|error| format!("could not clear incomplete state migration: {error}"))?;
+    }
+    std::fs::copy(source, &temporary)
+        .map_err(|error| format!("could not migrate {}: {error}", source.display()))?;
+    sync_file(&temporary)?;
+    std::fs::rename(&temporary, destination)
+        .map_err(|error| format!("could not finalize {} migration: {error}", source.display()))?;
+    set_mode(destination, 0o600)
+}
+
+fn migrate_database_if_missing(legacy_dir: &Path, state_dir: &Path) -> Result<(), String> {
+    let source = database_path(legacy_dir);
+    let destination = database_path(state_dir);
+    if destination.exists() || !source.is_file() {
+        return Ok(());
+    }
+
+    let connection = Connection::open(&source)
+        .map_err(|error| format!("could not open legacy state database: {error}"))?;
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(|error| format!("could not configure legacy database timeout: {error}"))?;
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(|error| format!("could not checkpoint legacy state database: {error}"))?;
+    ensure_integrity(&connection, "legacy")?;
+    drop(connection);
+
+    let temporary = destination.with_extension(format!("migrate-{}.tmp", std::process::id()));
+    if temporary.exists() {
+        std::fs::remove_file(&temporary)
+            .map_err(|error| format!("could not clear incomplete database migration: {error}"))?;
+    }
+    std::fs::copy(&source, &temporary)
+        .map_err(|error| format!("could not migrate state database: {error}"))?;
+    sync_file(&temporary)?;
+    let migrated = Connection::open(&temporary)
+        .map_err(|error| format!("could not validate migrated state database: {error}"))?;
+    ensure_integrity(&migrated, "migrated")?;
+    drop(migrated);
+    std::fs::rename(&temporary, &destination)
+        .map_err(|error| format!("could not finalize state database migration: {error}"))?;
+    set_mode(&destination, 0o600)
+}
+
+fn ensure_integrity(connection: &Connection, label: &str) -> Result<(), String> {
+    let result: String = connection
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .map_err(|error| format!("could not check {label} state database: {error}"))?;
+    if result == "ok" {
+        Ok(())
+    } else {
+        Err(format!(
+            "{label} state database failed integrity check: {result}"
+        ))
+    }
+}
+
+fn sync_file(path: &Path) -> Result<(), String> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("could not sync {}: {error}", path.display()))
+}
+
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
+    let temporary = path.with_extension(format!("write-{}.tmp", std::process::id()));
+    std::fs::write(&temporary, contents)
+        .map_err(|error| format!("could not write state migration marker: {error}"))?;
+    sync_file(&temporary)?;
+    std::fs::rename(&temporary, path)
+        .map_err(|error| format!("could not finalize state migration marker: {error}"))?;
+    set_mode(path, 0o600)
+}
+
+fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
+    let mut permissions = std::fs::metadata(path)
+        .map_err(|error| format!("could not inspect {} permissions: {error}", path.display()))?
+        .permissions();
+    permissions.set_mode(mode);
+    std::fs::set_permissions(path, permissions)
+        .map_err(|error| format!("could not secure {}: {error}", path.display()))
+}
+
 pub fn open(state_dir: &Path) -> Result<Connection, String> {
     std::fs::create_dir_all(state_dir)
         .map_err(|error| format!("could not create DownMan state directory: {error}"))?;
+    set_mode(state_dir, 0o700)?;
     let path = database_path(state_dir);
     if !path.exists() {
         backup_legacy_state(state_dir)?;
     }
     let mut connection = Connection::open(&path)
         .map_err(|error| format!("could not open DownMan state database: {error}"))?;
+    set_mode(&path, 0o600)?;
     connection
         .busy_timeout(Duration::from_secs(5))
         .map_err(|error| format!("could not configure state database timeout: {error}"))?;
@@ -586,5 +718,86 @@ mod tests {
             b"[{\"gid\":\"legacy\"}]"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn state_root_migration_is_non_destructive_and_idempotent() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let legacy = std::env::temp_dir().join(format!(
+            "downman-legacy-state-{}-{nonce}",
+            std::process::id()
+        ));
+        let target =
+            std::env::temp_dir().join(format!("downman-xdg-state-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join(".downman-history.json"), b"legacy history").unwrap();
+        std::fs::write(legacy.join(".downman-started"), b"runtime marker").unwrap();
+        let source = open(&legacy).unwrap();
+        source
+            .execute(
+                "INSERT INTO app_settings(key, value, updated_at) VALUES('migrated', 'yes', 1)",
+                [],
+            )
+            .unwrap();
+        drop(source);
+
+        migrate_state_root(&legacy, &target).unwrap();
+        assert_eq!(
+            std::fs::read(target.join(".downman-history.json")).unwrap(),
+            b"legacy history"
+        );
+        assert!(!target.join(".downman-started").exists());
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(target.join(".downman-history.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(target.join(STATE_ROOT_MIGRATION_MARKER))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let migrated = open(&target).unwrap();
+        assert_eq!(
+            std::fs::metadata(database_path(&target))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let value: String = migrated
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='migrated'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "yes");
+        drop(migrated);
+
+        std::fs::write(target.join(".downman-history.json"), b"new state").unwrap();
+        std::fs::write(legacy.join(".downman-history.json"), b"changed legacy").unwrap();
+        migrate_state_root(&legacy, &target).unwrap();
+        assert_eq!(
+            std::fs::read(target.join(".downman-history.json")).unwrap(),
+            b"new state"
+        );
+
+        std::fs::remove_dir_all(legacy).unwrap();
+        std::fs::remove_dir_all(target).unwrap();
     }
 }

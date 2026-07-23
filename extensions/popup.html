@@ -8,15 +8,19 @@
       .dot { width: 8px; height: 8px; border-radius: 50%; background: #6ee63a; }
       .body { padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
       button { background: #0a74f0; color: #fff; border: 0; border-radius: 8px; padding: 8px; cursor: pointer; font-weight: 600; }
+      button:disabled { opacity: .55; cursor: default; }
       ul { margin: 0; padding: 0; list-style: none; max-height: 160px; overflow: auto; }
       li { padding: 6px 8px; border-radius: 6px; cursor: pointer; font-size: 12px; word-break: break-all; }
       li:hover { background: rgba(255,255,255,.06); }
+      .actions { display: flex; gap: 4px; margin-top: 5px; }
+      .actions button { width: 25px; height: 23px; padding: 0; border-radius: 5px; background: rgba(255,255,255,.09); font-size: 12px; }
       .label { font-size: 11px; color: #64748b; margin: 4px 0 2px; }
     </style>
   </head>
   <body>
     <header><span class="dot" id="dot"></span><b>DownMan</b><span id="st" style="margin-left:auto;color:#64748b">…</span></header>
     <div class="body">
+      <button id="pair" style="display:none">Pair with DownMan</button>
       <button id="grabsite" style="background:rgba(255,255,255,.08)">Grab files from this page…</button>
       <label class="label" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:2px"><input type="checkbox" id="intercept" /> Auto-capture configured file types</label>
       <div class="label" id="dlabel" style="display:none">Downloads</div>
