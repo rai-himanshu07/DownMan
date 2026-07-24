@@ -17,7 +17,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
@@ -1565,6 +1565,20 @@ fn dl_on_complete() -> &'static Mutex<HashMap<String, (String, String)>> {
 // "verify": "ok"|"fail"|"pending"|"", "oncomplete_action": "...", "oncomplete_cmd": "..." } }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+struct DirectMediaRetryContext {
+    #[serde(default)]
+    format: String,
+    #[serde(default)]
+    referer: Option<String>,
+    #[serde(default)]
+    cookies_browser: Option<String>,
+    #[serde(default)]
+    subs: bool,
+    #[serde(default)]
+    sponsorblock: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
 struct DlMeta {
     #[serde(default)]
     checksum: String,
@@ -1588,6 +1602,8 @@ struct DlMeta {
     scheduler_paused: bool,
     #[serde(default)]
     source_edits: Vec<SourceEditRecord>,
+    #[serde(default)]
+    direct_media_retry: Option<DirectMediaRetryContext>,
 }
 
 static DL_META: OnceCell<Mutex<HashMap<String, DlMeta>>> = OnceCell::new();
@@ -1727,6 +1743,61 @@ fn attach_profile_snapshot(gid: &str, profile: &DownloadProfile) {
         entry.profile_snapshot = Some(profile.clone());
     }
     save_dl_meta();
+}
+
+fn attach_direct_media_retry(gid: &str, options: &MediaDownloadOptions) {
+    if gid.is_empty() {
+        return;
+    }
+    if let Ok(mut metadata) = dl_meta().lock() {
+        metadata
+            .entry(gid.to_string())
+            .or_default()
+            .direct_media_retry = Some(DirectMediaRetryContext {
+            format: options.format.clone(),
+            referer: options.referer.clone(),
+            cookies_browser: options.cookies.clone(),
+            subs: options.subs,
+            sponsorblock: options.sponsorblock,
+        });
+    }
+    save_dl_meta();
+}
+
+fn direct_media_retry_options(gid: &str, task: &Value) -> Option<MediaDownloadOptions> {
+    let (context, profile) = dl_meta().lock().ok().and_then(|metadata| {
+        let entry = metadata.get(gid)?;
+        Some((
+            entry.direct_media_retry.clone()?,
+            entry.profile_snapshot.clone()?,
+        ))
+    })?;
+    let out_dir = task
+        .get("dir")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(String::from);
+    let out_name = task
+        .get("files")
+        .and_then(|files| files.get(0))
+        .and_then(|file| file.get("path"))
+        .and_then(Value::as_str)
+        .and_then(|path| std::path::Path::new(path).file_name())
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(String::from);
+    Some(MediaDownloadOptions {
+        format: context.format,
+        referer: context.referer,
+        cookies: context.cookies_browser,
+        subs: context.subs,
+        sponsorblock: context.sponsorblock,
+        out_dir,
+        out_name,
+        elem: None,
+        paused: false,
+        profile,
+    })
 }
 
 fn resolve_download_profile(id: Option<&str>) -> Result<DownloadProfile, String> {
@@ -3539,6 +3610,172 @@ fn is_direct_file_url(url: &str) -> bool {
     .any(|e| path.ends_with(e))
 }
 
+fn should_shortcut_site_to_direct(url: &str, force_ytdlp: bool) -> bool {
+    !force_ytdlp && is_direct_file_url(url)
+}
+
+fn retryable_media_transport_error(message: &str) -> bool {
+    let message = message.to_lowercase();
+    message.contains("curl: (35)")
+        || message.contains("ssl/tls handshake failure")
+        || message.contains("error in the pull function")
+        || message.contains("connection reset by peer")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MediaPayloadIssue {
+    HlsManifest,
+    DashManifest,
+    Html,
+    Json,
+}
+
+impl MediaPayloadIssue {
+    fn description(self) -> &'static str {
+        match self {
+            Self::HlsManifest => "HLS playlist",
+            Self::DashManifest => "DASH manifest",
+            Self::Html => "HTML page",
+            Self::Json => "JSON metadata",
+        }
+    }
+
+    fn ffmpeg_input_format(self) -> Option<&'static str> {
+        match self {
+            Self::HlsManifest => Some("hls"),
+            Self::DashManifest => Some("dash"),
+            Self::Html | Self::Json => None,
+        }
+    }
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct FfmpegProgressRecord {
+    total_size: u64,
+    out_time_us: u64,
+    processing_speed: String,
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct YtdlpProgressState {
+    phase_base: u64,
+    last_downloaded: u64,
+}
+
+#[derive(Debug, PartialEq)]
+struct YtdlpProgressUpdate {
+    completed: u64,
+    total: Option<u64>,
+    total_is_estimate: bool,
+}
+
+fn progress_number(value: &str) -> Option<u64> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|number| number.is_finite() && *number > 0.0)
+        .map(|number| number as u64)
+}
+
+fn accumulate_ytdlp_progress(
+    state: &mut YtdlpProgressState,
+    downloaded: u64,
+    exact_total: Option<u64>,
+    estimated_total: Option<u64>,
+) -> YtdlpProgressUpdate {
+    if downloaded + 1 < state.last_downloaded {
+        state.phase_base = state.phase_base.saturating_add(state.last_downloaded);
+    }
+    state.last_downloaded = downloaded;
+    let completed = state.phase_base.saturating_add(downloaded);
+    let total = exact_total
+        .or(estimated_total)
+        .map(|value| state.phase_base.saturating_add(value).max(completed));
+    YtdlpProgressUpdate {
+        completed,
+        total,
+        total_is_estimate: exact_total.is_none() && estimated_total.is_some(),
+    }
+}
+
+/// Consume one `ffmpeg -progress` key/value line. `Some(true)` marks the end of
+/// a sample and tells the caller to publish the accumulated values to the UI.
+fn consume_ffmpeg_progress_line(record: &mut FfmpegProgressRecord, line: &str) -> Option<bool> {
+    let (key, value) = line.trim().split_once('=')?;
+    match key {
+        "total_size" => record.total_size = value.parse().unwrap_or(record.total_size),
+        "out_time_us" => record.out_time_us = value.parse().unwrap_or(record.out_time_us),
+        "speed" => {
+            record.processing_speed = match value.trim() {
+                "" | "N/A" => String::new(),
+                speed => speed.to_string(),
+            }
+        }
+        "progress" => return Some(true),
+        "frame" | "fps" | "stream_0_0_q" | "bitrate" | "out_time_ms" | "out_time"
+        | "dup_frames" | "drop_frames" => {}
+        _ => return None,
+    }
+    Some(false)
+}
+
+fn media_payload_issue_from_prefix(prefix: &[u8]) -> Option<MediaPayloadIssue> {
+    let text = String::from_utf8_lossy(prefix);
+    let trimmed = text.trim_start_matches('\u{feff}').trim_start();
+    let lowercase = trimmed.to_lowercase();
+    if trimmed.starts_with("#EXTM3U") {
+        Some(MediaPayloadIssue::HlsManifest)
+    } else if lowercase.starts_with("<mpd")
+        || (lowercase.starts_with("<?xml") && lowercase.contains("<mpd"))
+    {
+        Some(MediaPayloadIssue::DashManifest)
+    } else if lowercase.starts_with("<!doctype html") || lowercase.starts_with("<html") {
+        Some(MediaPayloadIssue::Html)
+    } else if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        Some(MediaPayloadIssue::Json)
+    } else {
+        None
+    }
+}
+
+fn downloaded_media_payload_issue(path: &std::path::Path) -> Option<MediaPayloadIssue> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if !matches!(
+        extension.as_str(),
+        "mp4"
+            | "m4v"
+            | "webm"
+            | "mkv"
+            | "mov"
+            | "avi"
+            | "flv"
+            | "3gp"
+            | "mpeg"
+            | "mpg"
+            | "ts"
+            | "m4a"
+            | "mp3"
+            | "aac"
+            | "flac"
+            | "ogg"
+            | "opus"
+            | "wav"
+    ) {
+        return None;
+    }
+    let mut prefix = Vec::with_capacity(8192);
+    std::fs::File::open(path)
+        .ok()?
+        .take(8192)
+        .read_to_end(&mut prefix)
+        .ok()?;
+    media_payload_issue_from_prefix(&prefix)
+}
+
 /// Turn a user-chosen name into a yt-dlp output stem (no path separators or
 /// %-templates; a trailing media extension is stripped since yt-dlp appends the
 /// real one based on the chosen format).
@@ -3674,6 +3911,7 @@ fn start_direct_media(
         .unwrap_or_else(|_| Err("aria2 add failed".into()))?;
     mark_download_added(&gid);
     attach_profile_snapshot(&gid, &options.profile);
+    attach_direct_media_retry(&gid, options);
     assign_profile_queue(&candidate.url, &options.profile);
     if let Ok(mut no_move) = no_organize().lock() {
         no_move.insert(gid.clone());
@@ -3693,6 +3931,9 @@ fn start_media_candidates(
                 candidate.url.clone(),
                 options.clone(),
                 candidates[index + 1..].to_vec(),
+                true,
+                false,
+                None,
             );
         }
         match start_direct_media(candidate, &options, &routing) {
@@ -3706,13 +3947,16 @@ fn start_media_candidates(
 }
 
 fn start_site_download(url: String, options: MediaDownloadOptions) -> Result<String, String> {
-    start_site_download_with_fallbacks(url, options, Vec::new())
+    start_site_download_with_fallbacks(url, options, Vec::new(), false, false, None)
 }
 
 fn start_site_download_with_fallbacks(
     url: String,
     mut options: MediaDownloadOptions,
     fallback_candidates: Vec<MediaCandidate>,
+    force_ytdlp: bool,
+    transport_retry_attempted: bool,
+    forced_manifest: Option<MediaPayloadIssue>,
 ) -> Result<String, String> {
     let url = unwrap_media_url(&url);
     // Site jobs are always started immediately; `paused` only applies to direct
@@ -3733,7 +3977,7 @@ fn start_site_download_with_fallbacks(
     // A direct file behind a viewer wrapper (e.g. a /media?url=…gif wrapper) isn't a
     // page yt-dlp can extract — hand it straight to aria2 (in a worker thread so we
     // never nest block_on inside an async caller).
-    if is_direct_file_url(&url) {
+    if should_shortcut_site_to_direct(&url, force_ytdlp) {
         let candidate = MediaCandidate {
             url,
             kind: "file".into(),
@@ -3798,6 +4042,9 @@ fn start_site_download_with_fallbacks(
         "totalLength": "0", "completedLength": "0", "downloadSpeed": "0",
         "connections": "1", "dir": out.display().to_string(),
         "files": [{ "path": url.clone(), "uris": [{ "uri": url.clone() }] }], "dmKind": "site",
+        "dmTitle": out_name.clone().unwrap_or_default(),
+        "dmElapsedSeconds": 0.0, "dmDurationSeconds": 0.0, "dmProcessingSpeed": "",
+        "dmTotalEstimated": false,
         "dmFormat": format.clone(), "dmReferer": referer.clone(), "dmCookies": cookies_browser.clone(),
         "dmSubs": subs, "dmSponsorblock": sponsorblock,
         "dmOutDir": out_dir.clone(), "dmOutName": out_name.clone(),
@@ -3821,6 +4068,8 @@ fn start_site_download_with_fallbacks(
         .arg("--progress-template")
         .arg("download:DM\u{a7}%(progress.downloaded_bytes)s\u{a7}%(progress.total_bytes)s\u{a7}%(progress.total_bytes_estimate)s\u{a7}%(progress.speed)s\u{a7}%(info.title)s")
         .arg("--no-simulate")
+        .arg("--print")
+        .arg("before_dl:DMINFO\u{a7}%(duration)s\u{a7}%(filesize)s\u{a7}%(filesize_approx)s\u{a7}%(title)s")
         .arg("--print")
         .arg("after_move:DMFILE\u{a7}%(filepath)s");
     if out_name
@@ -3886,6 +4135,14 @@ fn start_site_download_with_fallbacks(
     if profile.retries > 0 {
         cmd.arg("--retries").arg(profile.retries.to_string());
     }
+    if let Some(input_format) = forced_manifest.and_then(MediaPayloadIssue::ffmpeg_input_format) {
+        cmd.arg("--downloader")
+            .arg("ffmpeg")
+            .arg("--downloader-args")
+            .arg(format!("ffmpeg_i:-f {input_format}"))
+            .arg("--downloader-args")
+            .arg("ffmpeg_o:-progress pipe:2 -nostats");
+    }
     let referer_fb = referer.clone();
     if let Some(r) = referer.filter(|r| !r.is_empty()) {
         cmd.arg("--referer").arg(r);
@@ -3935,9 +4192,40 @@ fn start_site_download_with_fallbacks(
     // Capture yt-dlp's stderr so a failed download reports *why* instead of vanishing.
     let errbuf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let errbuf_w = errbuf.clone();
-    std::thread::spawn(move || {
+    let progress_id = id.clone();
+    let stderr_reader = std::thread::spawn(move || {
         if let Some(err) = stderr {
+            let mut progress = FfmpegProgressRecord::default();
+            let mut previous_size = 0u64;
+            let mut previous_sample = Instant::now();
             for line in BufReader::new(err).lines().map_while(Result::ok) {
+                if let Some(publish) = consume_ffmpeg_progress_line(&mut progress, &line) {
+                    if publish {
+                        let sampled_at = Instant::now();
+                        let sample_seconds =
+                            sampled_at.duration_since(previous_sample).as_secs_f64();
+                        let bytes_per_second = if sample_seconds > 0.0 {
+                            progress
+                                .total_size
+                                .saturating_sub(previous_size)
+                                .checked_div((sample_seconds.max(0.001) * 1000.0) as u64)
+                                .unwrap_or(0)
+                                .saturating_mul(1000)
+                        } else {
+                            0
+                        };
+                        previous_size = progress.total_size;
+                        previous_sample = sampled_at;
+                        update_site_job(&progress_id, |job| {
+                            job["completedLength"] = json!(progress.total_size.to_string());
+                            job["downloadSpeed"] = json!(bytes_per_second.to_string());
+                            job["dmElapsedSeconds"] =
+                                json!(progress.out_time_us as f64 / 1_000_000.0);
+                            job["dmProcessingSpeed"] = json!(progress.processing_speed);
+                        });
+                    }
+                    continue;
+                }
                 if let Ok(mut b) = errbuf_w.lock() {
                     b.push(line);
                     if b.len() > 60 {
@@ -3950,19 +4238,47 @@ fn start_site_download_with_fallbacks(
     });
 
     std::thread::spawn(move || {
+        let mut invalid_output = None;
         if let Some(out) = stdout {
-            let mut phase_base: u64 = 0;
-            let mut last_dl: u64 = 0;
-            let mut last_total: u64 = 0;
+            let mut progress_state = YtdlpProgressState::default();
             for line in BufReader::new(out).lines().map_while(Result::ok) {
+                if let Some(rest) = line.strip_prefix("DMINFO\u{a7}") {
+                    let fields: Vec<&str> = rest.split('\u{a7}').collect();
+                    if fields.len() >= 4 {
+                        let duration = fields[0].parse::<f64>().unwrap_or(0.0);
+                        let exact_size = progress_number(fields[1]);
+                        let estimated_size = progress_number(fields[2]);
+                        let title = fields[3..].join("\u{a7}");
+                        update_site_job(&id2, |job| {
+                            if !title.is_empty() && title != "NA" {
+                                job["dmTitle"] = json!(title);
+                            }
+                            if duration > 0.0 {
+                                job["dmDurationSeconds"] = json!(duration);
+                            }
+                            if let Some(size) = exact_size.or(estimated_size) {
+                                job["totalLength"] = json!(size.to_string());
+                                job["dmTotalEstimated"] =
+                                    json!(exact_size.is_none() && estimated_size.is_some());
+                            }
+                        });
+                    }
+                    continue;
+                }
                 // Final merged file path (printed after move) -> use its real size.
                 if let Some(path) = line.strip_prefix("DMFILE\u{a7}") {
+                    if let Some(issue) = downloaded_media_payload_issue(std::path::Path::new(path))
+                    {
+                        invalid_output = Some((path.to_string(), issue));
+                        continue;
+                    }
                     if let Ok(meta) = std::fs::metadata(path) {
                         let size = meta.len();
                         let full = path.to_string();
                         update_site_job(&id2, |j| {
                             j["totalLength"] = json!(size.to_string());
                             j["completedLength"] = json!(size.to_string());
+                            j["dmTotalEstimated"] = json!(false);
                             j["files"] =
                                 json!([{ "path": full, "uris": [{ "uri": url_log.clone() }] }]);
                         });
@@ -3972,33 +4288,26 @@ fn start_site_download_with_fallbacks(
                 if let Some(rest) = line.strip_prefix("DM\u{a7}") {
                     let p: Vec<&str> = rest.split('\u{a7}').collect();
                     if p.len() >= 5 {
-                        let downloaded = p[0].parse::<f64>().unwrap_or(0.0) as u64;
-                        let total = p[1]
-                            .parse::<f64>()
-                            .ok()
-                            .filter(|v| *v > 0.0)
-                            .or_else(|| p[2].parse::<f64>().ok())
-                            .unwrap_or(0.0) as u64;
+                        let downloaded = progress_number(p[0]).unwrap_or(0);
+                        let exact_total = progress_number(p[1]);
+                        let estimated_total = progress_number(p[2]);
                         let speed = p[3].parse::<f64>().unwrap_or(0.0) as u64;
                         let title = p[4..].join("\u{a7}");
-                        // A new stream (e.g. audio after video) restarts the byte counter.
-                        if downloaded + 1 < last_dl {
-                            phase_base += last_total.max(last_dl);
-                        }
-                        last_dl = downloaded;
-                        last_total = total;
-                        let cum_done = phase_base + downloaded;
-                        let cum_total = phase_base + total;
+                        let progress = accumulate_ytdlp_progress(
+                            &mut progress_state,
+                            downloaded,
+                            exact_total,
+                            estimated_total,
+                        );
                         update_site_job(&id2, |j| {
-                            j["completedLength"] = json!(cum_done.to_string());
-                            let prev = j["totalLength"]
-                                .as_str()
-                                .and_then(|s| s.parse::<u64>().ok())
-                                .unwrap_or(0);
-                            j["totalLength"] = json!(cum_total.max(prev).to_string());
+                            j["completedLength"] = json!(progress.completed.to_string());
+                            if let Some(total) = progress.total {
+                                j["totalLength"] = json!(total.to_string());
+                                j["dmTotalEstimated"] = json!(progress.total_is_estimate);
+                            }
                             j["downloadSpeed"] = json!(speed.to_string());
                             if !title.is_empty() && title != "NA" {
-                                j["files"] = json!([{ "path": title }]);
+                                j["dmTitle"] = json!(title);
                             }
                         });
                     }
@@ -4006,7 +4315,8 @@ fn start_site_download_with_fallbacks(
                 }
             }
         }
-        let success = child.wait().map(|s| s.success()).unwrap_or(false);
+        let process_success = child.wait().map(|s| s.success()).unwrap_or(false);
+        let _ = stderr_reader.join();
         if let Some(path) = output_reservation.as_deref() {
             unreserve(path);
         }
@@ -4020,8 +4330,53 @@ fn start_site_download_with_fallbacks(
         if cancelled {
             return;
         }
-        let errlines = errbuf.lock().map(|b| b.clone()).unwrap_or_default();
+        let mut errlines = errbuf.lock().map(|b| b.clone()).unwrap_or_default();
+        if let Some((path, issue)) = invalid_output.as_ref() {
+            let _ = std::fs::remove_file(path);
+            errlines.push(format!(
+                "ERROR: Downloaded response was an {}, not a media file",
+                issue.description()
+            ));
+        }
+        let success = process_success && invalid_output.is_none();
         if !success {
+            if forced_manifest.is_none()
+                && let Some((_, issue)) = invalid_output.as_ref()
+                && issue.ffmpeg_input_format().is_some()
+                && let Ok(retry_id) = start_site_download_with_fallbacks(
+                    url_log.clone(),
+                    fallback_options.clone(),
+                    fallback_candidates.clone(),
+                    true,
+                    transport_retry_attempted,
+                    Some(*issue),
+                )
+            {
+                transfer_job_metadata(&id2, &retry_id);
+                if let Ok(mut jobs) = site_jobs().lock() {
+                    jobs.retain(|job| job.get("gid").and_then(Value::as_str) != Some(id2.as_str()));
+                }
+                return;
+            }
+            if !transport_retry_attempted
+                && errlines
+                    .iter()
+                    .any(|line| retryable_media_transport_error(line))
+                && let Ok(retry_id) = start_site_download_with_fallbacks(
+                    url_log.clone(),
+                    fallback_options.clone(),
+                    fallback_candidates.clone(),
+                    force_ytdlp,
+                    true,
+                    forced_manifest,
+                )
+            {
+                transfer_job_metadata(&id2, &retry_id);
+                if let Ok(mut jobs) = site_jobs().lock() {
+                    jobs.retain(|job| job.get("gid").and_then(Value::as_str) != Some(id2.as_str()));
+                }
+                return;
+            }
             // yt-dlp rejected the page's resolved media as an "Unsupported URL". If that
             // URL is really a direct file — a known media extension, or (extensionless CDN
             // links) the server reports a media/binary content-type — hand it to aria2,
@@ -6490,6 +6845,25 @@ async fn retry_download(gid: String, cookies: Option<String>) -> Result<String, 
     if !url.starts_with("http") {
         return Err("no retryable source url".into());
     }
+    let error_message = task
+        .get("errorMessage")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if retryable_media_transport_error(error_message)
+        && let Some(options) = direct_media_retry_options(&gid, &task)
+    {
+        let new_gid = start_site_download_with_fallbacks(
+            url.clone(),
+            options,
+            Vec::new(),
+            true,
+            false,
+            None,
+        )?;
+        transfer_job_metadata(&gid, &new_gid);
+        c.remove(&gid).await.map_err(|error| error.to_string())?;
+        return Ok(new_gid);
+    }
     for group in [c.tell_active().await, c.tell_waiting().await] {
         if let Ok(tasks) = group
             && let Some(existing_gid) = tasks
@@ -7731,6 +8105,13 @@ async fn update_trackers() -> Result<usize, String> {
 
 /// Resolve a human-friendly file name from an aria2 task value.
 fn task_name(t: &Value) -> String {
+    if let Some(title) = t
+        .get("dmTitle")
+        .and_then(Value::as_str)
+        .filter(|title| !title.is_empty())
+    {
+        return title.to_string();
+    }
     if let Some(n) = t
         .get("bittorrent")
         .and_then(|b| b.get("info"))
@@ -8311,6 +8692,26 @@ fn start_watcher() {
                         }
                         let url = url_of_task(t);
                         if !url.starts_with("http") {
+                            continue;
+                        }
+                        let error_message =
+                            t.get("errorMessage").and_then(Value::as_str).unwrap_or("");
+                        if retryable_media_transport_error(error_message)
+                            && let Some(options) = direct_media_retry_options(&gid, t)
+                            && let Ok(new_gid) = start_site_download_with_fallbacks(
+                                url.clone(),
+                                options,
+                                Vec::new(),
+                                true,
+                                false,
+                                None,
+                            )
+                        {
+                            transfer_job_metadata(&gid, &new_gid);
+                            let _ = tauri::async_runtime::block_on(c.remove(&gid));
+                            if let Ok(mut attempts) = retries().lock() {
+                                attempts.remove(&url);
+                            }
                             continue;
                         }
                         let n = {
@@ -10028,6 +10429,148 @@ mod tests {
         assert!(!is_direct_file_url("https://youtube.com/watch?v=xyz"));
         assert!(!is_direct_file_url("https://cdn.example.com/master.m3u8"));
         assert!(!is_direct_file_url("https://example.com/file"));
+    }
+
+    #[test]
+    fn manifest_evidence_overrides_a_misleading_mp4_extension() {
+        let candidate = MediaCandidate {
+            url: "https://cdn.example.com/vid.mp4".into(),
+            kind: "manifest".into(),
+            content_type: Some("application/vnd.apple.mpegurl".into()),
+        };
+        assert_eq!(
+            route_from_media_evidence(&candidate.kind, candidate.content_type.as_deref()),
+            Some(Route::Ytdlp)
+        );
+        assert!(is_direct_file_url(&candidate.url));
+        assert!(!should_shortcut_site_to_direct(&candidate.url, true));
+        assert!(should_shortcut_site_to_direct(&candidate.url, false));
+    }
+
+    #[test]
+    fn media_transport_retry_is_limited_to_tls_and_connection_resets() {
+        assert!(retryable_media_transport_error(
+            "curl: (35) Recv failure: Connection reset by peer"
+        ));
+        assert!(retryable_media_transport_error(
+            "SSL/TLS handshake failure: Error in the pull function"
+        ));
+        assert!(!retryable_media_transport_error(
+            "HTTP Error 404: Not Found"
+        ));
+        assert!(!retryable_media_transport_error(
+            "Requested format is not available"
+        ));
+    }
+
+    #[test]
+    fn ffmpeg_progress_records_publish_bytes_elapsed_time_and_processing_speed() {
+        let mut record = FfmpegProgressRecord::default();
+        assert_eq!(
+            consume_ffmpeg_progress_line(&mut record, "total_size=262192"),
+            Some(false)
+        );
+        assert_eq!(
+            consume_ffmpeg_progress_line(&mut record, "out_time_us=3669333"),
+            Some(false)
+        );
+        assert_eq!(
+            consume_ffmpeg_progress_line(&mut record, "speed=3.67x"),
+            Some(false)
+        );
+        assert_eq!(
+            consume_ffmpeg_progress_line(&mut record, "progress=continue"),
+            Some(true)
+        );
+        assert_eq!(record.total_size, 262_192);
+        assert_eq!(record.out_time_us, 3_669_333);
+        assert_eq!(record.processing_speed, "3.67x");
+        assert_eq!(
+            consume_ffmpeg_progress_line(&mut record, "not_progress=ignored"),
+            None
+        );
+    }
+
+    #[test]
+    fn ytdlp_estimates_can_shrink_without_being_max_clamped() {
+        let mut state = YtdlpProgressState::default();
+        let first =
+            accumulate_ytdlp_progress(&mut state, 40 * 1024 * 1024, None, Some(1100 * 1024 * 1024));
+        let revised =
+            accumulate_ytdlp_progress(&mut state, 50 * 1024 * 1024, None, Some(650 * 1024 * 1024));
+        assert_eq!(first.total, Some(1100 * 1024 * 1024));
+        assert_eq!(revised.total, Some(650 * 1024 * 1024));
+        assert_eq!(revised.completed, 50 * 1024 * 1024);
+        assert!(revised.total_is_estimate);
+    }
+
+    #[test]
+    fn ytdlp_phase_reset_accumulates_actual_bytes_not_the_previous_estimate() {
+        let mut state = YtdlpProgressState::default();
+        let video = accumulate_ytdlp_progress(&mut state, 100, None, Some(1000));
+        let audio = accumulate_ytdlp_progress(&mut state, 10, None, Some(100));
+        assert_eq!(video.completed, 100);
+        assert_eq!(video.total, Some(1000));
+        assert_eq!(audio.completed, 110);
+        assert_eq!(audio.total, Some(200));
+        assert!(audio.total_is_estimate);
+
+        let exact = accumulate_ytdlp_progress(&mut state, 20, Some(120), Some(500));
+        assert_eq!(exact.total, Some(220));
+        assert!(!exact.total_is_estimate);
+    }
+
+    #[test]
+    fn media_title_precedes_the_temporary_source_url() {
+        let task = json!({
+            "dmTitle": "Resolved title",
+            "files": [{ "path": "https://example.test/watch/opaque" }]
+        });
+        assert_eq!(task_name(&task), "Resolved title");
+    }
+
+    #[test]
+    fn downloaded_media_rejects_stream_metadata_masquerading_as_video() {
+        assert_eq!(
+            media_payload_issue_from_prefix(b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n"),
+            Some(MediaPayloadIssue::HlsManifest)
+        );
+        assert_eq!(
+            media_payload_issue_from_prefix(b"<?xml version=\"1.0\"?><MPD></MPD>"),
+            Some(MediaPayloadIssue::DashManifest)
+        );
+        assert_eq!(
+            media_payload_issue_from_prefix(b"<!doctype html><html></html>"),
+            Some(MediaPayloadIssue::Html)
+        );
+        assert_eq!(
+            media_payload_issue_from_prefix(br#"{"stream":"master"}"#),
+            Some(MediaPayloadIssue::Json)
+        );
+        assert_eq!(
+            media_payload_issue_from_prefix(b"\0\0\0\x18ftypisom\0\0\0\0isom"),
+            None
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "downman-manifest-output-{}-{}.mp4",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::write(&path, b"#EXTM3U\n#EXT-X-VERSION:3\n").unwrap();
+        assert_eq!(
+            downloaded_media_payload_issue(&path),
+            Some(MediaPayloadIssue::HlsManifest)
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn old_download_metadata_deserializes_without_direct_media_retry_context() {
+        let metadata: DlMeta =
+            serde_json::from_str(r#"{"profile_id":"best","source_edits":[]}"#).unwrap();
+        assert_eq!(metadata.profile_id, "best");
+        assert!(metadata.direct_media_retry.is_none());
     }
 
     #[test]

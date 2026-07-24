@@ -22,6 +22,11 @@ export interface Aria2Task {
   completedAt?: number;
   errorMessage?: string;
   dmKind?: string;
+  dmTitle?: string;
+  dmElapsedSeconds?: number;
+  dmDurationSeconds?: number;
+  dmProcessingSpeed?: string;
+  dmTotalEstimated?: boolean;
   dmChecksum?: string;   // expected checksum stored in DL_META
   dmVerify?: string;    // "" | "pending" | "ok" | "fail"
   dmOnComplete?: string;
@@ -579,6 +584,7 @@ export const api = {
 
 export function taskName(t: Aria2Task): string {
   if (t.bittorrent?.info?.name) return t.bittorrent.info.name;
+  if (t.dmTitle?.trim()) return t.dmTitle.trim();
   const p = t.files?.[0]?.path || t.files?.[0]?.uris?.[0]?.uri || "";
   return p.split("/").pop() || "Unknown";
 }

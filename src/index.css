@@ -180,6 +180,16 @@ select option {
   );
 }
 
+.dm-progress-indeterminate {
+  width: 38%;
+  animation: dm-progress-indeterminate 1.5s ease-in-out infinite;
+}
+
+@keyframes dm-progress-indeterminate {
+  from { transform: translateX(-105%); }
+  to { transform: translateX(275%); }
+}
+
 .shiny-text {
   color: var(--dm-accent);
   -webkit-text-fill-color: currentColor;
@@ -302,7 +312,8 @@ select option {
   .dm-stagger > *,
   .dm-scan-line,
   .dm-data-lane,
-  .progress-shimmer::after {
+  .progress-shimmer::after,
+  .dm-progress-indeterminate {
     animation: none !important;
   }
 }

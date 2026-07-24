@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Aria2Task, api } from "../lib/api";
-import { fmtBytes, fmtSpeed, eta } from "../lib/format";
+import { fmtBytes, fmtSpeed, fmtEta, eta } from "../lib/format";
 import { metaOf, useStore } from "../store";
 import { toast } from "../lib/toast";
 import { I } from "./icons";
@@ -22,8 +22,17 @@ export default function DownloadCard({ t }: { t: Aria2Task }) {
   const total = +t.totalLength || 0;
   const done = +t.completedLength || 0;
   const speed = +t.downloadSpeed || 0;
-  const pct = total ? Math.min(100, (done / total) * 100) : 0;
+  const mediaElapsed = +t.dmElapsedSeconds! || 0;
+  const mediaDuration = +t.dmDurationSeconds! || 0;
+  const totalEstimated = !!t.dmTotalEstimated && t.status !== "complete";
+  const determinate = total > 0 || mediaDuration > 0;
+  const pct = total
+    ? Math.min(100, (done / total) * 100)
+    : mediaDuration
+      ? Math.min(100, (mediaElapsed / mediaDuration) * 100)
+      : 0;
   const active = t.status === "active";
+  const indeterminate = active && !determinate;
   const paused = t.status === "paused" || t.status === "waiting";
   const isSite = t.gid.startsWith("site-");
   const canControl = !isSite && t.status !== "complete" && t.status !== "error";
@@ -52,6 +61,16 @@ export default function DownloadCard({ t }: { t: Aria2Task }) {
   const path = t.files?.[0]?.path || "";
   const hasPath = path.startsWith("/");
   const srcUrl = t.files?.[0]?.uris?.[0]?.uri || "";
+  const activeDetail = total
+    ? `${fmtSpeed(speed)} · ${totalEstimated ? "~" : ""}${eta(total, done, speed)}`
+    : [speed > 0 ? fmtSpeed(speed) : "", mediaElapsed > 0 ? fmtEta(mediaElapsed) : "", t.dmProcessingSpeed || ""]
+      .filter(Boolean)
+      .join(" · ") || "Starting…";
+  const progressSummary = total
+    ? `${fmtBytes(done)} / ${totalEstimated ? "~" : ""}${fmtBytes(total)} · ${totalEstimated ? "~" : ""}${pct.toFixed(0)}%`
+    : [done > 0 ? fmtBytes(done) : active ? "Preparing stream" : "0 B", mediaElapsed > 0 ? fmtEta(mediaElapsed) : ""]
+      .filter(Boolean)
+      .join(" · ");
 
   async function act(fn: () => unknown) {
     try { await fn(); } catch { /* ignore */ }
@@ -128,11 +147,14 @@ export default function DownloadCard({ t }: { t: Aria2Task }) {
           document.body
         )}
       <div className="dm-progress-track relative mt-3 h-2 overflow-hidden">
-        <div className={`absolute inset-y-0 left-0 ${t.status === "complete" ? "bg-lime-500" : "dm-progress-active"} ${active && "progress-shimmer"}`} style={{ width: `${pct}%` }} />
+        <div
+          className={`absolute inset-y-0 left-0 ${t.status === "complete" ? "bg-lime-500" : "dm-progress-active"} ${active ? "progress-shimmer" : ""} ${indeterminate ? "dm-progress-indeterminate" : ""}`}
+          style={indeterminate ? undefined : { width: `${pct}%` }}
+        />
       </div>
       <div className="flex items-center justify-between mt-2 text-xs text-slate-500">
-        <span>{fmtBytes(done)} / {fmtBytes(total)} · {pct.toFixed(0)}%</span>
-        <span className="flex items-center gap-1">{active ? `${fmtSpeed(speed)} · ${eta(total, done, speed)}` : t.status}{completed && (t.dmMissing ? <MissingBadge /> : <VerifyBadge status={t.dmVerify} />)}{!completed && t.dmRetry ? <RetryBadge n={t.dmRetry} /> : null}</span>
+        <span>{progressSummary}</span>
+        <span className="flex items-center gap-1">{active ? activeDetail : t.status}{completed && (t.dmMissing ? <MissingBadge /> : <VerifyBadge status={t.dmVerify} />)}{!completed && t.dmRetry ? <RetryBadge n={t.dmRetry} /> : null}</span>
       </div>
       {t.status === "error" && t.errorMessage && (
         <div className="mt-2 text-xs text-rose-400/90 break-words" title={t.errorMessage}>
@@ -191,7 +213,7 @@ export default function DownloadCard({ t }: { t: Aria2Task }) {
             <div className="card w-[540px] max-w-[94vw] p-5" onClick={(e) => e.stopPropagation()}>
               <h3 className="font-semibold mb-3">Properties</h3>
               <PropRow label="Name" value={name} />
-              <PropRow label="Size" value={fmtBytes(total)} />
+              <PropRow label="Size" value={`${totalEstimated ? "~" : ""}${fmtBytes(total)}`} />
               <PropRow label="Category" value={category} />
               <PropRow label="Status" value={t.status} />
               {hasPath && <PropRow label="Saved to" value={path} copy />}

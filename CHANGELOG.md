@@ -34,6 +34,17 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 - Keep login startup in the tray/background and automatically repair enabled 1.1 autostart entries
   that omitted `--hidden`, while preserving entries the desktop session has explicitly disabled.
+- Retry transient media TLS/curl connection failures once and hand browser-resolved direct media
+  from aria2 to yt-dlp when aria2's GnuTLS transport cannot establish the connection.
+- Detect HLS, DASH, HTML, or JSON responses masquerading as completed audio/video files. HLS/DASH
+  responses retry once through ffmpeg with the matching forced demuxer instead of leaving a tiny
+  playlist file marked as a successful download.
+- Preserve manifest/page routing evidence even when a stream URL has a misleading direct-media
+  suffix such as `.mp4`.
+- Show the resolved media title before transfer and report live bytes, elapsed media time, and
+  processing speed while ffmpeg recovers a stream whose total size is unknown.
+- Mark yt-dlp size estimates as approximate, allow revised estimates to move down as well as up,
+  and accumulate only bytes actually downloaded when video/audio progress counters restart.
 
 ### Security
 

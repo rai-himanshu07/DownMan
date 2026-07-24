@@ -29,6 +29,18 @@ safer state migration, and quieter background operation.
 
 See [CHANGELOG.md](../../CHANGELOG.md) for the full list.
 
+## Maintenance Refresh
+
+The Linux packages were refreshed in place on 2026-07-24 with additional media reliability fixes:
+
+- Retry transient TLS/curl failures and switch browser-resolved media from aria2 to yt-dlp when
+  aria2's TLS transport cannot establish the stream connection.
+- Detect playlists or webpage metadata saved under a media extension and recover HLS/DASH through
+  ffmpeg instead of reporting a tiny non-video file as complete.
+- Show resolved titles and live ffmpeg progress for recovered streams whose total size is unknown.
+- Label yt-dlp totals as approximate, accept downward estimate revisions, and avoid adding an
+  estimated total when video/audio byte counters restart.
+
 ## Downloads
 
 | File                            | Platform                                             |

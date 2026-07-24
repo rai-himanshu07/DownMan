@@ -247,7 +247,7 @@ export function RowMenu({ t, name, category, total, detailsOpen, onToggleDetails
           <div className="card w-[560px] max-w-[94vw] p-5" onClick={(e) => e.stopPropagation()}>
             <h3 className="font-semibold mb-3">Properties</h3>
             <PropRow label="Name" value={name} />
-            <PropRow label="Size" value={total ? fmtBytes(total) : "—"} />
+            <PropRow label="Size" value={total ? `${t.dmTotalEstimated && !completed ? "~" : ""}${fmtBytes(total)}` : "—"} />
             <PropRow label="Category" value={category} />
             <PropRow label="Status" value={t.status} />
             {taskUrl(t) && (

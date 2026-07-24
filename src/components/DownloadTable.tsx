@@ -1,7 +1,7 @@
 import { Fragment, useMemo, useState } from "react";
 import clsx from "clsx";
 import { Aria2Task, CategoryDef } from "../lib/api";
-import { fmtBytes, fmtSpeed, eta } from "../lib/format";
+import { fmtBytes, fmtSpeed, fmtEta, eta } from "../lib/format";
 import { useStore, metaOf, categoryNameOf } from "../store";
 import { I } from "./icons";
 import { RowMenu, DetailsPanel, VerifyBadge, MissingBadge, RetryBadge } from "./downloadShared";
@@ -33,9 +33,9 @@ function taskDate(t: Aria2Task): string {
   });
 }
 
-function statusLabel(t: Aria2Task, pct: number): string {
+function statusLabel(t: Aria2Task, pct: number, determinate: boolean, estimated: boolean): string {
   switch (t.status) {
-    case "active": return `${pct.toFixed(0)}%`;
+    case "active": return determinate ? `${estimated ? "~" : ""}${pct.toFixed(0)}%` : "Downloading";
     case "complete": return "Done";
     case "paused": return "Paused";
     case "waiting": return "Queued";
@@ -120,13 +120,26 @@ export default function DownloadTable({ rows }: { rows: Aria2Task[] }) {
             const total = +t.totalLength || 0;
             const done = +t.completedLength || 0;
             const speed = +t.downloadSpeed || 0;
-            const pct = total ? Math.min(100, (done / total) * 100) : 0;
-            const active = t.status === "active";
+            const mediaElapsed = +t.dmElapsedSeconds! || 0;
+            const mediaDuration = +t.dmDurationSeconds! || 0;
             const completed = t.status === "complete";
+            const totalEstimated = !!t.dmTotalEstimated && !completed;
+            const determinate = total > 0 || mediaDuration > 0;
+            const pct = total
+              ? Math.min(100, (done / total) * 100)
+              : mediaDuration
+                ? Math.min(100, (mediaElapsed / mediaDuration) * 100)
+                : 0;
+            const active = t.status === "active";
             const canControl = !t.gid.startsWith("site-") && !completed && t.status !== "error";
             const isTorrent = !!t.bittorrent;
             const canExpand = canControl || isTorrent;
             const expanded = open === t.gid;
+            const activeDetail = total
+              ? `${fmtSpeed(speed)} · ${totalEstimated ? "~" : ""}${eta(total, done, speed)}`
+              : [speed > 0 ? fmtSpeed(speed) : "", mediaElapsed > 0 ? fmtEta(mediaElapsed) : "", t.dmProcessingSpeed || ""]
+                .filter(Boolean)
+                .join(" · ") || "Starting…";
             return (
               <Fragment key={t.gid}>
                 <tr
@@ -146,11 +159,11 @@ export default function DownloadTable({ rows }: { rows: Aria2Task[] }) {
                       <span className="truncate block pl-[22px]" title={name}>{name}</span>
                     )}
                   </td>
-                  <td className="px-3 py-2 whitespace-nowrap text-slate-400 tabular-nums">{total ? fmtBytes(total) : "—"}</td>
+                  <td className="px-3 py-2 whitespace-nowrap text-slate-400 tabular-nums">{total ? `${totalEstimated ? "~" : ""}${fmtBytes(total)}` : done ? `${fmtBytes(done)}+` : "—"}</td>
                   <td className="px-3 py-2 whitespace-nowrap">
                     <div className="min-w-0">
-                      <span className={clsx("text-xs tabular-nums", completed ? "text-lime-400" : t.status === "error" ? "text-rose-400" : t.status === "paused" ? "text-amber-300" : "text-slate-300")}>{statusLabel(t, pct)}</span>
-                      {active && <div className="mt-0.5 text-[10px] text-slate-500 tabular-nums truncate" title={`${fmtSpeed(speed)} · ${eta(total, done, speed)}`}>{fmtSpeed(speed)} · {eta(total, done, speed)}</div>}
+                      <span className={clsx("text-xs tabular-nums", completed ? "text-lime-400" : t.status === "error" ? "text-rose-400" : t.status === "paused" ? "text-amber-300" : "text-slate-300")}>{statusLabel(t, pct, determinate, totalEstimated)}</span>
+                      {active && <div className="mt-0.5 text-[10px] text-slate-500 tabular-nums truncate" title={activeDetail}>{activeDetail}</div>}
                       {completed && (t.dmMissing ? <MissingBadge /> : <VerifyBadge status={t.dmVerify} />)}
                       {!completed && t.dmRetry ? <RetryBadge n={t.dmRetry} /> : null}
                     </div>
